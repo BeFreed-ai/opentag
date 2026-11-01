@@ -106,6 +106,85 @@ describe("SessionMessageInbox", () => {
     inbox.stop();
   });
 
+  describe("provider launch configuration of a scheduled Run", () => {
+    async function runScheduled(
+      prepared: Record<string, unknown>,
+      providerId: string,
+      logger?: { info: unknown; warn: unknown },
+    ) {
+      const runtime = {
+        waitForIdle: vi.fn(async () => undefined),
+        prompt: vi.fn(async (_request: { configuration?: { provider?: Record<string, unknown> } }) => ({
+          runId: "run",
+          status: "completed" as const,
+          output: [],
+        })),
+      };
+      const inbox = new SessionMessageInbox({
+        admission: new AdmissionController(),
+        credentialEnvironment: {
+          prepare: vi.fn(async () => ({
+            path: "/tmp/provider-env.sh",
+            provider: "feishu" as const,
+            outboxContext: { provider: "feishu" as const, sessionKind: "channel" as const, chatId: "oc_visible" },
+            ...prepared,
+          })),
+          cleanup: vi.fn(async () => undefined),
+        } as never,
+        imCredentialGrantVersion: () => 2,
+        sessionCollaborationVersion: () => 3,
+        reconciler: inboxReconciler(),
+        runtimeManager: {
+          ensureRuntime: vi.fn(async () => runtime as never),
+          sessionKind: () => "visible" as const,
+          providerId: () => providerId,
+        } as never,
+        ...(logger ? { logger: logger as never } : {}),
+      });
+      await expect(inbox.accept(scheduledDelivery({ text: "scheduled work" }))).resolves.toMatchObject({
+        status: "accepted",
+      });
+      await vi.waitFor(() => expect(runtime.prompt).toHaveBeenCalledOnce());
+      await inbox.settled();
+      inbox.stop();
+      return runtime.prompt.mock.calls[0]?.[0];
+    }
+
+    it("hands the granted MCP gateway to a provider that can mount it", async () => {
+      const info = vi.fn();
+      const warn = vi.fn();
+      const request = await runScheduled({ mcp: { url: "http://127.0.0.1:1/mcp", token: "t-1" } }, "claude-code", {
+        info,
+        warn,
+      });
+      expect(request?.configuration?.provider?.mcpGateway).toEqual({ url: "http://127.0.0.1:1/mcp", token: "t-1" });
+      expect(info).toHaveBeenCalledWith(
+        expect.objectContaining({ providerId: "claude-code" }),
+        "MCP gateway delivered to the provider",
+      );
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it("does not hand the gateway to a provider that cannot mount it, and says so", async () => {
+      const info = vi.fn();
+      const warn = vi.fn();
+      const request = await runScheduled({ mcp: { url: "http://127.0.0.1:1/mcp", token: "t-1" } }, "no-mcp-provider", {
+        info,
+        warn,
+      });
+      expect(request?.configuration).toBeUndefined();
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ code: "mcp_gateway_unsupported_provider" }),
+        expect.stringContaining("MCP tools are unavailable"),
+      );
+    });
+
+    it("adds no configuration when the Server granted no MCP gateway", async () => {
+      const request = await runScheduled({}, "claude-code");
+      expect(request?.configuration).toBeUndefined();
+    });
+  });
+
   it("rejects new messages while quiesced but drains messages accepted before the pause", async () => {
     const admission = new AdmissionController();
     const targetSessionId = randomUUID();
