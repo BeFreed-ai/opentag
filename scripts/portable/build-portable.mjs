@@ -78,8 +78,13 @@ export function getPortableChannelConfig(channel) {
  * Portable versions follow the npm channel coordinates exactly, so a portable release can never
  * describe a version the npm release path would reject.
  */
+// BeFreed fork only: a fork build is `<upstream stable>-befreed.<n>` on the prod channel (same package
+// identity and binary name as upstream, so it drops into an existing prod install root).
+export const BEFREED_FORK_VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-befreed\.[1-9]\d*$/;
+
 export function validateChannelVersion(channel, version) {
   if (channel === "prod") {
+    if (BEFREED_FORK_VERSION_PATTERN.test(version)) return;
     parseStableVersion(version, "production portable version");
     return;
   }
