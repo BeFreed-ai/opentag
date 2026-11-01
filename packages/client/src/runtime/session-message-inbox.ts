@@ -8,10 +8,11 @@ import {
   SessionMessageDeliveryRequestV3Schema,
   type SessionMessageDeliveryResult,
 } from "@opentag/shared";
-import type { AgentInput } from "../agent-runtime/types.js";
+import type { AgentInput, AgentRunConfiguration } from "../agent-runtime/types.js";
 import { type ClientLogger, createLogger } from "../observability/logger.js";
 import type { AdmissionController } from "./admission-controller.js";
 import type { ProviderCliTurnPlanPrepareInput } from "./provider-cli/turn-plan-manager.js";
+import { providerLaunchConfiguration, providerSupportsMcpGateway } from "./provider-launch-configuration.js";
 import { buildProviderOutboxInstructions } from "./provider-outbox-instructions.js";
 import type {
   PreparedRuntimeCredentialEnvironment,
@@ -59,7 +60,7 @@ export interface SessionMessageInboxOptions {
     prepare(input: ProviderCliTurnPlanPrepareInput, signal?: AbortSignal): Promise<unknown>;
   };
   imCredentialGrantVersion(): number | undefined;
-  logger?: Pick<ClientLogger, "warn">;
+  logger?: Pick<ClientLogger, "warn"> & Partial<Pick<ClientLogger, "info">>;
   maxQueuedPerSession?: number;
   maxQueuedTotal?: number;
   maxRememberedMessages?: number;
@@ -81,7 +82,8 @@ export interface SessionMessageInboxOptions {
     SessionReconciler,
     "checkSessionMessageDelivery" | "clearActivity" | "setActivity" | "withAgentLock"
   >;
-  runtimeManager: Pick<SessionRuntimeManager, "ensureRuntime" | "sessionKind">;
+  runtimeManager: Pick<SessionRuntimeManager, "ensureRuntime" | "sessionKind"> &
+    Partial<Pick<SessionRuntimeManager, "providerId">>;
 }
 
 export class SessionMessageInbox {
@@ -90,7 +92,7 @@ export class SessionMessageInbox {
   readonly #credentialEnvironment: SessionMessageInboxOptions["credentialEnvironment"];
   readonly #turnPlan: SessionMessageInboxOptions["turnPlan"];
   readonly #imCredentialGrantVersion: SessionMessageInboxOptions["imCredentialGrantVersion"];
-  readonly #logger: Pick<ClientLogger, "warn">;
+  readonly #logger: Pick<ClientLogger, "warn"> & Partial<Pick<ClientLogger, "info">>;
   readonly #maxQueuedPerSession: number;
   readonly #maxQueuedTotal: number;
   readonly #maxRememberedMessages: number;
@@ -347,6 +349,7 @@ export class SessionMessageInbox {
       const sessionKind = this.#runtimeManager.sessionKind(sessionId);
       let outboxContext: RuntimeImOutboxContext | undefined;
       let allowedUnixSockets: readonly string[] | undefined;
+      let launchConfiguration: { configuration?: AgentRunConfiguration } = {};
       if (sessionKind === "visible") {
         phase = "credential";
         const prepared = await this.#prepareCredentials(sessionId, next.request);
@@ -363,6 +366,12 @@ export class SessionMessageInbox {
         }
         outboxContext = prepared.outboxContext;
         turnPlanInput = await this.#prepareTurnPlan(sessionId, runId, prepared, ensureRunSignal());
+        /*
+         * A scheduled (session-message) Run gets the same MCP gateway and web tools a delivered Turn gets:
+         * the Server already granted them in `prepared`, so dropping them here left every schedule-started
+         * Run without connector tools.
+         */
+        launchConfiguration = this.#launchConfiguration(sessionId, runId, prepared);
       }
       phase = "runtime";
       const runtimeSignal = sessionKind === "visible" ? ensureRunSignal() : this.#abort.signal;
@@ -389,6 +398,7 @@ export class SessionMessageInbox {
           new Date(this.#now()),
         ),
         signal: ensureRunSignal(),
+        ...launchConfiguration,
       });
       if (result.status !== "completed") {
         throw new Error(result.error?.message ?? `Session message Run ended with status ${result.status}`);
@@ -410,6 +420,37 @@ export class SessionMessageInbox {
         reservation.release();
       });
     }
+  }
+
+  /**
+   * A scheduled (session-message) Run gets the same MCP gateway and web tools a delivered Turn gets: the
+   * Server already granted them in `prepared`, so dropping them left every schedule-started Run without
+   * connector tools.
+   */
+  #launchConfiguration(
+    sessionId: string,
+    runId: string,
+    prepared: PreparedRuntimeCredentialEnvironment,
+  ): { configuration?: AgentRunConfiguration } {
+    if (!prepared.web && !prepared.mcp) return {};
+    const providerId = this.#runtimeManager.providerId?.(sessionId);
+    if (prepared.mcp) {
+      if (providerSupportsMcpGateway(providerId)) {
+        this.#logger.info?.({ sessionId, runId, providerId }, "MCP gateway delivered to the provider");
+      } else {
+        this.#logger.warn(
+          { sessionId, runId, providerId, code: "mcp_gateway_unsupported_provider" },
+          "MCP gateway was granted but the provider cannot mount it; MCP tools are unavailable this Run",
+        );
+      }
+    }
+    return providerLaunchConfiguration(
+      {
+        ...(prepared.web ? { webTools: prepared.web } : {}),
+        ...(prepared.mcp ? { mcpGateway: prepared.mcp } : {}),
+      },
+      providerId,
+    );
   }
 
   async #prepareCredentials(sessionId: string, request: SessionMessageDeliveryRequestV3) {
