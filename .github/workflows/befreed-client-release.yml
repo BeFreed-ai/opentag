@@ -83,6 +83,10 @@ jobs:
       # Tests first, for the area the fork changes (scheduled session-message turns) plus the fork's own
       # packaging scripts. The whole upstream suite runs in upstream's CI; the nightly sync workflow runs the
       # client suite after every merge from upstream.
+      # The tests and the type-check import the workspace packages (@opentag/shared ...) from their built output.
+      - name: Build the client's workspace dependencies
+        run: pnpm exec turbo run build --filter='@opentag/client^...'
+
       - name: Client tests for the changed area
         run: pnpm --filter @opentag/client exec vitest run --maxWorkers=1 src/__tests__/session-message-inbox.test.ts src/__tests__/agent-turn-runner.test.ts
 
