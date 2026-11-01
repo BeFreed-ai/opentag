@@ -126,15 +126,25 @@ jobs:
               --tarball "$dir/open-tag-$LABEL-$platform.tar.gz"
           done
 
-      # The marker the operator's `client_release.py check` greps for in the shipped bundle.
-      - name: Check the fix is in the bundle
+      # Same marker the operator's `client_release.py check` looks for: inside SessionMessageInbox.#runMessage the
+      # bundle declares `let launchConfiguration = {}` and spreads `...launchConfiguration` into runtime.prompt.
+      # The tarball is flat (VERSION, INSTALL.json, app/, node/, bin/ at its root).
+      - name: Check the fix is in the bundle and the CLI reports the label
         env:
           LABEL: ${{ steps.label.outputs.label }}
         run: |
-          mkdir -p "$RUNNER_TEMP/x" && tar -xzf ".portable-release/prod/$LABEL/open-tag-$LABEL-linux-x64.tar.gz" -C "$RUNNER_TEMP/x"
-          f="$(ls "$RUNNER_TEMP"/x/*/app/program-*.mjs | head -1)"
-          grep -q "providerLaunchConfiguration\|launchConfiguration" "$f"
-          "$RUNNER_TEMP"/x/*/node/bin/node "$RUNNER_TEMP"/x/*/app/cli/index.mjs --version | grep -Fx "$LABEL"
+          x="$RUNNER_TEMP/x"; mkdir -p "$x"
+          tar -xzf ".portable-release/prod/$LABEL/open-tag-$LABEL-linux-x64.tar.gz" -C "$x"
+          python3 - "$x" <<'PY'
+          import glob, sys
+          f = glob.glob(sys.argv[1] + "/app/program-*.mjs")[0]
+          s = open(f, encoding="utf-8").read()
+          w = s[s.index("async #runMessage("):][:8000]
+          assert "let launchConfiguration = {}" in w and "...launchConfiguration" in w, "fix marker missing in #runMessage"
+          print("fix marker present in", f)
+          PY
+          test "$(cat "$x/VERSION")" = "$LABEL"
+          "$x/node/bin/node" "$x/app/cli/index.mjs" --version | grep -Fx "$LABEL"
 
       - name: Write sha256 files
         env:
