@@ -3,8 +3,8 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { validateChannelVersion } from "../portable/build-portable.mjs";
 import { setForkVersion } from "../befreed/set-fork-version.mjs";
+import { validateChannelVersion } from "../portable/build-portable.mjs";
 
 test("prod channel accepts a -befreed.<n> label, still rejects other prereleases", () => {
   validateChannelVersion("prod", "0.1.4-befreed.1");
