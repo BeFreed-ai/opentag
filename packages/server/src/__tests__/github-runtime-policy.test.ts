@@ -110,6 +110,24 @@ describe("GitHub user-task authority", () => {
     f.getOverview.mockRejectedValue(new Error("database unavailable"));
     await expect(f.policy.admit(f.input())).rejects.toThrow("database unavailable");
   });
+  it("authorizes GitHub only for the context-tree purpose; ordinary execution and validation are denied", async () => {
+    const f = fixture();
+    const request = (purpose: "execution" | "context-tree" | "validation") => ({
+      accountId: ACCOUNT,
+      agentId: AGENT,
+      sessionId: SESSION,
+      provider: "github" as const,
+      bindingId: BINDING_ID,
+      sessionBindingId: randomUUID(),
+      source: f.execution.source,
+      purpose,
+    });
+    expect(await f.policy.authorize(request("context-tree"))).toBe("permit");
+    expect(await f.policy.authorize(request("execution"))).toBe("deny");
+    expect(await f.policy.authorize(request("validation"))).toBe("deny");
+    // A context-tree request naming some other binding is still refused.
+    expect(await f.policy.authorize({ ...request("context-tree"), bindingId: randomUUID() })).toBe("deny");
+  });
   it("admits an accepted human task without discovering or recording any repositories", async () => {
     const f = fixture();
     expect(await f.policy.admit(f.input())).toEqual({
