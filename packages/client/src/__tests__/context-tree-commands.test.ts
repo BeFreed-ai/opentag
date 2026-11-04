@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -12,7 +13,7 @@ import {
   requestContextTreeCommand,
 } from "../runtime/context-tree-commands.js";
 import { configureContextTrees } from "../runtime/context-tree-connections.js";
-import type { RuntimeCredentialRelay } from "../runtime/runtime-credential-relay.js";
+import { type RuntimeCredentialRelay, RuntimeCredentialRelayError } from "../runtime/runtime-credential-relay.js";
 
 const executeFile = promisify(execFile);
 const cleanups: (() => Promise<unknown>)[] = [];
@@ -430,4 +431,209 @@ describe("Context Tree command boundary", () => {
     },
     60_000,
   );
+});
+
+describe("Context Tree gateway failure diagnostics", () => {
+  const TOKEN = "ghs_AbCdEf0123456789SECRETTOKEN";
+  const UNAVAILABLE = "Context Tree operation unavailable; retained work has not been discarded.\n";
+  type Execute = ConstructorParameters<typeof ContextTreeCommandGateway>[0]["execute"];
+
+  async function gatewayWith(options: {
+    sources?: (typeof source)[];
+    openContextTree?: () => Promise<unknown>;
+    localHandleFor?: () => string;
+    execute?: Execute;
+    logger?: { warn: (...a: unknown[]) => void };
+  }) {
+    const root = await directory();
+    const warn = vi.fn();
+    const logger = options.logger ?? { warn };
+    const controller = new AbortController();
+    const child = {
+      localHandleFor: options.localHandleFor ?? (() => "tree-local-handle"),
+      close: vi.fn(async () => undefined),
+    };
+    const relay = {
+      signal: controller.signal,
+      openContextTree: options.openContextTree ?? (async () => child),
+    } as unknown as RuntimeCredentialRelay;
+    const gateway = new ContextTreeCommandGateway({
+      parent: relay,
+      sources: options.sources ?? [source],
+      workspace: root,
+      stateDirectory: join(root, "state"),
+      environment: () => ({}),
+      logger: { child: vi.fn(), debug: vi.fn(), error: vi.fn(), info: vi.fn(), ...logger } as never,
+      execute: options.execute ?? (async () => ({ code: 0, stdout: '{"connections":[]}', stderr: "" })),
+    });
+    await gateway.listen("tcp");
+    cleanups.push(() => gateway.close());
+    return { gateway, warn, child, root };
+  }
+  function post(port: number | undefined, body: string): Promise<{ status: number; body: string }> {
+    return new Promise((done, reject) => {
+      const request = http.request(
+        {
+          hostname: "127.0.0.1",
+          port,
+          path: "/command",
+          method: "POST",
+          headers: { "content-type": "application/json" },
+        },
+        (response) => {
+          const chunks: Buffer[] = [];
+          response.on("data", (chunk: Buffer) => chunks.push(chunk));
+          response.on("end", () => done({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString() }));
+        },
+      );
+      request.on("error", reject);
+      request.end(body);
+    });
+  }
+  async function failing(options: Parameters<typeof gatewayWith>[0], body: unknown) {
+    const { gateway, warn, root } = await gatewayWith(options);
+    const response = await post(gateway.port, typeof body === "string" ? body : JSON.stringify(body));
+    expect(response.status).toBe(409);
+    expect(JSON.parse(response.body)).toEqual({ code: 1, stdout: "", stderr: UNAVAILABLE });
+    expect(warn).toHaveBeenCalledOnce();
+    const fields = warn.mock.calls[0]?.[0] as Record<string, unknown>;
+    return { fields, serialized: JSON.stringify(warn.mock.calls), root };
+  }
+
+  it("logs request_parse without echoing the request body", async () => {
+    const { fields, serialized } = await failing({}, `{"args": ["sync", "${TOKEN}"`);
+    expect(fields).toMatchObject({ stage: "request_parse", errorName: "SyntaxError", sourcesCount: 1 });
+    expect(serialized).not.toContain(TOKEN);
+    expect(fields).not.toHaveProperty("argKinds");
+  });
+
+  it("logs args_validate with argument kinds but no values", async () => {
+    const { fields, serialized } = await failing({}, { args: ["sync", "--bogus", TOKEN, "--tree", "acme/project"] });
+    expect(fields).toMatchObject({ stage: "args_validate", argKinds: ["sync", "--bogus", "<positional>", "--tree"] });
+    expect(fields.treeSelectorMatched).toBe(true);
+    expect(serialized).not.toContain(TOKEN);
+    expect(serialized).not.toContain("acme/project");
+  });
+
+  it("logs project_path without the foreign path", async () => {
+    const { fields, serialized } = await failing({}, { args: ["sync", "--project-path", "/foreign/secret-dir"] });
+    expect(fields).toMatchObject({ stage: "project_path", hasProject: true, argKinds: ["sync", "--project-path"] });
+    expect(serialized).not.toContain("secret-dir");
+  });
+
+  it.each([
+    ["no configured sources", [] as (typeof source)[]],
+    ["a selector that matches nothing", [source]],
+  ])("logs tree_select for %s", async (_name, sources) => {
+    const { fields, serialized } = await failing({ sources }, { args: ["sync", "--tree", "nobody/repo"] });
+    expect(fields).toMatchObject({
+      stage: "tree_select",
+      sourcesCount: sources.length,
+      treeSelectorMatched: false,
+      hasProject: false,
+    });
+    expect(serialized).not.toContain("nobody/repo");
+  });
+
+  it("logs an unmatched session id as tree_select/session_hint without mixing in values", async () => {
+    const id = "6f1c1d9e-0b6e-4a7c-9a52-1c1a3c2f9b10";
+    const { fields } = await failing({}, { args: ["write", "abort", id] });
+    expect(fields).toMatchObject({
+      stage: "session_hint",
+      sessionId: id,
+      argKinds: ["write", "abort", "<positional>"],
+    });
+  });
+
+  it("logs open_child with the server rejection code and redacts credential-like text", async () => {
+    const { fields, serialized } = await failing(
+      {
+        openContextTree: async () => {
+          throw new RuntimeCredentialRelayError(
+            "execution_rejected",
+            `rejected: tree_forbidden Bearer abc.def ${TOKEN} https://user:pw@github.com/x`,
+            "tree_forbidden",
+          );
+        },
+      },
+      { args: ["sync"] },
+    );
+    expect(fields).toMatchObject({ stage: "open_child", code: "execution_rejected", serverCode: "tree_forbidden" });
+    expect(String(fields.errorMessage)).toContain("<redacted>");
+    for (const leaked of [TOKEN, "abc.def", "user:pw"]) expect(serialized).not.toContain(leaked);
+  });
+
+  it.each([
+    ["acquire_failed", "acquire_provider"],
+    ["ticket_failed", "ticket"],
+    ["data_connect_failed", "connect_data"],
+  ])("maps relay open failure %s to stage %s", async (code, stage) => {
+    const { fields } = await failing(
+      {
+        openContextTree: async () => {
+          throw new RuntimeCredentialRelayError(code as never, "rejected", "binding_revoked");
+        },
+      },
+      { args: ["sync"] },
+    );
+    expect(fields).toMatchObject({ stage, serverCode: "binding_revoked" });
+  });
+
+  it("logs provider_unavailable and still closes the child", async () => {
+    const { fields } = await failing(
+      {
+        localHandleFor: () => {
+          throw new RuntimeCredentialRelayError("provider_unavailable", "Provider is not open: github");
+        },
+      },
+      { args: ["sync"] },
+    );
+    expect(fields).toMatchObject({ stage: "provider_unavailable", code: "provider_unavailable" });
+  });
+
+  it("logs output_limit when the CLI result exceeds 1 MiB", async () => {
+    const { fields, serialized } = await failing(
+      { execute: async () => ({ code: 0, stdout: "x".repeat(1024 * 1024 + 1), stderr: "" }) },
+      { args: ["sync"] },
+    );
+    expect(fields).toMatchObject({ stage: "output_limit", argKinds: ["sync"] });
+    expect(serialized.length).toBeLessThan(2000);
+  });
+
+  it("logs execute for a failing CLI child and post_process for unparsable prepare output", async () => {
+    const run = await failing(
+      {
+        execute: async () => {
+          throw new Error("interrupted");
+        },
+      },
+      { args: ["sync"] },
+    );
+    expect(run.fields).toMatchObject({ stage: "execute", errorMessage: "interrupted" });
+    const parsed = await failing(
+      { execute: async () => ({ code: 0, stdout: "not json", stderr: "" }) },
+      { args: ["write", "prepare", "--tree", "acme/project"] },
+    );
+    expect(parsed.fields).toMatchObject({ stage: "post_process" });
+  });
+
+  it("keeps the 409 response when the logger itself throws", async () => {
+    const { gateway } = await gatewayWith({
+      logger: {
+        warn: () => {
+          throw new Error("log sink broken");
+        },
+      },
+    });
+    const response = await post(gateway.port, JSON.stringify({ args: ["git", "push"] }));
+    expect(response.status).toBe(409);
+    expect(JSON.parse(response.body)).toEqual({ code: 1, stdout: "", stderr: UNAVAILABLE });
+  });
+
+  it("does not log a successful request", async () => {
+    const { gateway, warn } = await gatewayWith({});
+    const response = await post(gateway.port, JSON.stringify({ args: ["sync"] }));
+    expect(response.status).toBe(200);
+    expect(warn).not.toHaveBeenCalled();
+  });
 });
