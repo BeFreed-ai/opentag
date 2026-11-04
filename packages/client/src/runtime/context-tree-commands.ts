@@ -11,9 +11,12 @@ import {
   contextTreeSelector,
 } from "@opentag/shared";
 import { z } from "zod";
+import { type ClientLogger, createLogger } from "../observability/logger.js";
+import { failureFields, inStage, rawArgs, tagStage } from "./context-tree-command-diagnostics.js";
 import type { RuntimeCredentialRelay } from "./runtime-credential-relay.js";
 
 const LIMIT = 1024 * 1024;
+const logger = createLogger("context-tree-command-gateway");
 const RequestSchema = z.object({ args: z.array(z.string().max(4096)).min(1).max(16) }).strict();
 const SessionHintSchema = z.object({ id: z.string().uuid(), source: ContextTreeConnectionSchema }).strict();
 export interface ContextTreeCommandResult {
@@ -27,6 +30,8 @@ export interface ContextTreeCommandOptions {
   workspace: string;
   stateDirectory: string;
   environment: () => Record<string, string | undefined>;
+  /** Diagnostic logger for failed gateway requests; defaults to the module logger. */
+  logger?: ClientLogger;
   execute: (
     args: readonly string[],
     environment: Readonly<Record<string, string | undefined>>,
@@ -70,6 +75,7 @@ export class ContextTreeCommandGateway {
 
   async listen(kind: "socket" | "tcp"): Promise<void> {
     const server = http.createServer((request, response) => {
+      let requestArgs: readonly string[] | undefined;
       void (async () => {
         if (
           request.method !== "POST" ||
@@ -90,11 +96,16 @@ export class ContextTreeCommandGateway {
           }
           chunks.push(Buffer.from(chunk));
         }
-        const input = RequestSchema.parse(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+        const input = inStage("request_parse", () => {
+          const body: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          requestArgs = rawArgs(body);
+          return RequestSchema.parse(body);
+        });
         const abort = await this.#prepareHttpRun(request, response);
         const result = await this.run(input.args, abort.signal);
         response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(result));
-      })().catch(() => {
+      })().catch((error: unknown) => {
+        this.#logFailure(error, requestArgs);
         if (!response.headersSent) response.writeHead(409);
         response.end(
           JSON.stringify({
@@ -129,9 +140,9 @@ export class ContextTreeCommandGateway {
 
   async run(raw: readonly string[], callerSignal?: AbortSignal): Promise<ContextTreeCommandResult> {
     if (this.#closed || this.#busy || this.#options.parent.signal.aborted || callerSignal?.aborted)
-      throw new Error("Context Tree execution unavailable");
-    const args = RequestSchema.parse({ args: raw }).args;
-    const command = this.#command(args);
+      throw tagStage(new Error("Context Tree execution unavailable"), "gateway_unavailable");
+    const args = inStage("args_validate", () => RequestSchema.parse({ args: raw }).args);
+    const command = inStage("args_validate", () => this.#command(args));
     this.#busy = true;
     this.#settled = new Promise<void>((done) => {
       this.#settle = done;
@@ -170,12 +181,14 @@ export class ContextTreeCommandGateway {
   async #runCommand(command: ManagedCommand, signal: AbortSignal): Promise<ContextTreeCommandResult> {
     if (command.operation === "sync" && !command.source) return this.#syncAll(command.offline === true, signal);
     const source = command.source ?? (command.id ? await this.#sessionSource(command.id) : undefined);
-    if (!source) throw new Error("Choose a configured Context Tree");
+    if (!source) throw tagStage(new Error("Choose a configured Context Tree"), "tree_select");
     const result = await this.#execute(source, command.argv, signal);
     if (result.code !== 0) return result;
-    if (command.operation === "prepare") await this.#rememberSession(result.stdout, source);
-    if (command.id && (command.operation === "abort" || JSON.parse(result.stdout || "{}").outcome === "published"))
-      await rm(this.#hint(command.id), { force: true });
+    await inStage("post_process", async () => {
+      if (command.operation === "prepare") await this.#rememberSession(result.stdout, source);
+      if (command.id && (command.operation === "abort" || JSON.parse(result.stdout || "{}").outcome === "published"))
+        await rm(this.#hint(command.id), { force: true });
+    });
     return result;
   }
 
@@ -195,7 +208,9 @@ export class ContextTreeCommandGateway {
         signal,
       );
       if (result.code !== 0) return result;
-      results.push(...(JSON.parse(result.stdout) as { connections: unknown[] }).connections);
+      results.push(
+        ...inStage("post_process", () => (JSON.parse(result.stdout) as { connections: unknown[] }).connections),
+      );
     }
     return { code: 0, stdout: JSON.stringify({ schemaVersion: 3, connections: results }), stderr: "" };
   }
@@ -227,20 +242,35 @@ export class ContextTreeCommandGateway {
     }
   }
 
+  /** Diagnostic-only: records why a request became a 409. Never throws and never alters the response. */
+  #logFailure(error: unknown, args: readonly string[] | undefined): void {
+    try {
+      (this.#options.logger ?? logger).warn(
+        failureFields(error, args, this.#options.sources),
+        "Context Tree gateway request failed",
+      );
+    } catch {
+      // Logging must never change the gateway's behaviour.
+    }
+  }
+
   #project(): string {
     return join(this.#options.workspace, ".opentag", "context-tree", "project");
   }
   #hint(id: string): string {
     return join(this.#options.stateDirectory, `${z.string().uuid().parse(id)}.json`);
   }
-  async #sessionSource(id: string): Promise<ContextTreeConnection> {
+  #sessionSource(id: string): Promise<ContextTreeConnection> {
+    return inStage("session_hint", () => this.#readSessionSource(id));
+  }
+  async #readSessionSource(id: string): Promise<ContextTreeConnection> {
     const bytes = await readFile(this.#hint(id));
     if (bytes.length > 4096) throw new Error("Invalid Context Tree routing hint");
     const hint = SessionHintSchema.parse(JSON.parse(bytes.toString("utf8")));
     const source = this.#options.sources.find(
       (candidate) => contextTreeIdentity(candidate) === contextTreeIdentity(hint.source),
     );
-    if (hint.id !== id || !source) throw new Error("Context Tree no longer configured");
+    if (hint.id !== id || !source) throw tagStage(new Error("Context Tree no longer configured"), "tree_select");
     return source;
   }
 
@@ -249,8 +279,8 @@ export class ContextTreeCommandGateway {
     const { options, positional } = commandOptions(args.slice(args[0] === "sync" ? 1 : 2), OPERATION_FLAGS[operation]);
     const project = options.get("--project-path");
     if (project !== undefined && resolve(project) !== this.#project())
-      throw new Error("Unmanaged Context Tree project");
-    const source = selectSource(options.get("--tree"), this.#options.sources);
+      throw tagStage(new Error("Unmanaged Context Tree project"), "project_path");
+    const source = inStage("tree_select", () => selectSource(options.get("--tree"), this.#options.sources));
     if (operation === "sync") {
       if (positional.length) throw new Error("Unexpected Context Tree argument");
       const offline = options.has("--offline");
@@ -269,7 +299,7 @@ export class ContextTreeCommandGateway {
       };
     }
     if (operation === "prepare") {
-      if (!source || positional.length) throw new Error("Choose a configured Context Tree");
+      if (!source || positional.length) throw tagStage(new Error("Choose a configured Context Tree"), "tree_select");
       return {
         operation,
         source,
@@ -284,12 +314,12 @@ export class ContextTreeCommandGateway {
     args: readonly string[],
     signal: AbortSignal,
   ): Promise<ContextTreeCommandResult> {
-    const relay = await this.#options.parent.openContextTree(source, signal);
+    const relay = await inStage("open_child", () => this.#options.parent.openContextTree(source, signal));
     this.#relay = relay;
     try {
       const environment = {
         ...this.#options.environment(),
-        GH_TOKEN: relay.localHandleFor("github"),
+        GH_TOKEN: inStage("provider_unavailable", () => relay.localHandleFor("github")),
         GITHUB_TOKEN: undefined,
         GH_ENTERPRISE_TOKEN: undefined,
         GITHUB_ENTERPRISE_TOKEN: undefined,
@@ -317,12 +347,13 @@ export class ContextTreeCommandGateway {
         OPENTAG_CONTEXT_TREE_SOCKET: undefined,
         OPENTAG_CONTEXT_TREE_URL: undefined,
       };
-      const result = await this.#options.execute(args, environment, signal);
-      if (Buffer.byteLength(JSON.stringify(result)) > LIMIT) throw new Error("Context Tree output exceeded its limit");
+      const result = await inStage("execute", () => this.#options.execute(args, environment, signal));
+      if (Buffer.byteLength(JSON.stringify(result)) > LIMIT)
+        throw tagStage(new Error("Context Tree output exceeded its limit"), "output_limit");
       return result;
     } finally {
       this.#relay = undefined;
-      await relay.close("context_tree_complete");
+      await inStage("relay_close", () => relay.close("context_tree_complete"));
     }
   }
 }
