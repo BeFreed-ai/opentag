@@ -50,6 +50,7 @@ const allowedUntranslatedValues = new Set([
   "Token",
   "Tokens",
   "Context Tree",
+  "Context Tree GitHub",
   "Soul",
   "MCP",
   "refs/heads/master",
@@ -127,5 +128,21 @@ describe("i18n catalog", () => {
   it("uses the generated English base locale and locale list", () => {
     expect(baseLocale).toBe("en");
     expect([...locales]).toEqual(["en", "zh"]);
+  });
+
+  it("uses one idiomatic resource noun for Context Tree settings", () => {
+    const catalogs = Object.fromEntries(
+      localeCodes.map((locale) => [
+        locale,
+        JSON.parse(readFileSync(resolve(messagesRoot, "agent-settings", `${locale}.json`), "utf8")),
+      ]),
+    ) as Record<(typeof localeCodes)[number], Record<string, unknown>>;
+    const contextTreeMessages = (locale: (typeof localeCodes)[number]) =>
+      Object.entries(catalogs[locale])
+        .filter(([key]) => key.startsWith("agent_settings_context_tree_"))
+        .flatMap(([, value]) => messageTexts(value));
+
+    expect(contextTreeMessages("en").every((message) => !/\bsources?\b/iu.test(message))).toBe(true);
+    expect(contextTreeMessages("zh").every((message) => !/知识来源| 知识树|知识树 /u.test(message))).toBe(true);
   });
 });

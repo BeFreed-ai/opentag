@@ -9,7 +9,7 @@ Context Tree stores durable knowledge in Markdown. OpenTag supplies Agent settin
 GitHub authorization, and runtime preparation. The packaged Context Tree CLI owns
 content validation, read snapshots, and isolated write sessions.
 
-Memory is optional. An unavailable tree is reported to the Agent without stopping its task.
+Memory is optional. An unavailable tree is reported to the Agent without stopping its task. Its navigation entry stays visible without GitHub authorization; users resolve authorization in the current Agent’s Connectors. Account settings has no independent GitHub authorization.
 
 ## Connections
 
@@ -26,24 +26,42 @@ case-insensitive; directory and branch names are case-sensitive. Names shown in
 settings come from the directory or repository. Multiple directories or branches
 in one repository are allowed. Array order gives no tree precedence.
 
-Memory shows each connected tree in its own card, with its repository, directory,
-branch, and a direct link to the GitHub folder. Disconnect is in the card's action menu.
-With no trees connected, the page offers **Connect Context Tree** and
-**Create Context Tree**. After the first connection, **Add tree** offers those
-choices. Each choice opens a focused dialog; the collection does not show an inline form.
+Memory uses the same page header and collection layout as other Agent resources, without a primary
+header action or capacity counter. The centered empty state offers a short sentence with blue inline
+**Connect an existing tree** and **create a new one** actions for both Local and Cloud Agents.
+Each complete action phrase stays together when wrapping. Private repository creation is explained
+in the creation dialog. Connected Context Trees appear as divided rows in one
+surface, with repository/directory, branch, and a direct GitHub-folder link. A trailing secondary
+**Connect another Context Tree** action keeps additional connections available inside the collection.
+The trailing action is absent at the connection limit rather than presenting an unexplained disabled control.
+These are saved selections, not runtime-ready indicators. Each choice opens a focused dialog; the
+collection does not show an inline form. Disconnect lives in the Context Tree action menu and confirms
+the exact Context Tree and preservation impact.
+Cancel receives initial focus, pending requests block dismissal and repeated submissions, and failures
+stay inside the confirmation. A confirmed removal returns focus to a surviving neighbour or the empty-state
+connection shortcut. Successful first connections return focus to the collection's trailing connection action
+and leave visible, concise feedback.
+
 Connect accepts a GitHub repository link and an optional relative directory; an empty
 directory means the repository root. GitHub’s default branch is resolved during verification
 and saved with the connection. Both Local and Cloud can connect existing trees.
 Create accepts an owner and repository name and uses GitHub's default branch.
 Neither dialog asks for a branch.
-Local Computers can also create private repositories: OpenTag creates the repository,
+Both Local and Cloud Computers can create private repositories: OpenTag creates the repository,
 generates the initial page with the pinned `context-tree init`, and commits it through
-GitHub's contents API. Connection verification and creation run exclusively on the Server with the Account's current GitHub
+GitHub's contents API. Connection verification and creation run exclusively on the Server with the current Agent's GitHub MCP OAuth
 credential; it does not require Computer-side GitHub credentials. The OAuth authorization must allow private repositories, and the connected user
 and organization policy must permit creation and content writes. Permission failures
 ask the user to check access; only missing or invalid authorization asks them to reconnect.
 
-Failed settings operations display an error banner. When the server has no GitHub OAuth App
+Initial settings read failures retain the page identity and offer explicit retry for transient failures.
+A transient refresh failure retains the existing collection and form draft, marks the data unconfirmed,
+and disables writes until a successful read. Connector and restriction-recovery links open a new tab so
+an in-progress form stays available in the original tab. Terminal authorization/resource failures hide stale settings.
+Invalid directories associate their error with the field. Restriction notices describe pause and offline
+requirements together and link to existing Agent/Computer settings without automatically pausing an Agent.
+
+Failed settings operations display an error banner and the current Agent's Connector or repository destination. When the server has no GitHub MCP OAuth client
 configured, the message asks the server administrator to configure it; this does not
 mean the bound Computer needs an update.
 
@@ -55,7 +73,14 @@ Repository creation never adopts or overwrites an existing repository. Remote wr
 not retried automatically. Rejected repository names prompt the user to choose another name or
 connect an existing tree. An uncertain creation asks the user to inspect GitHub: connect a valid
 tree, initialize and push the files if the repository is empty, or delete the empty repository
-before retrying creation. Retrying an already connected tree is idempotent.
+before retrying creation. Every unresolved creation is retained by case-insensitive repository identity.
+While an outcome remains uncertain, creation of that repository is disabled, including after trying another
+repository or closing and reopening the dialog. A successful connection clears only the matching unresolved
+repository. Open repository and Connect existing are explicit recovery actions; the latter prefills the matching
+repository without issuing a request and moves focus to its input. Recovery guidance is secondary to those actions.
+An uncertain create response is recorded even if a background config refresh changes the revision while the request
+is pending; other stale response state is still discarded.
+Retrying an already connected tree is idempotent.
 
 ## Preparation
 
@@ -64,7 +89,9 @@ OpenTag writes authorized selections to its own configuration at
 Repository-owned `.context-tree.json` files are left alone. Those files can describe
 local directory trees used through the normal repository workflow.
 
-Preparation uses `context-tree sync --project-path PROJECT`. Responses are parsed
+Managed synchronization and write commands route through a per-execution Context Tree command gateway in the trusted Local Daemon or Cloud Runner. Only its pinned CLI child receives a GitHub handle; the Agent receives a Unix socket or fixed Cloud loopback endpoint. The Server separately admits each command against the live parent, current Agent GitHub MCP authorization and exact selected tree. See [GitHub platform integration](github-platform-integration.md#context-tree-command-boundary).
+
+Preparation uses `context-tree sync --project-path PROJECT` through this gateway. Responses are parsed
 with the package's public contracts; OpenTag never reads the package's internal registry.
 The path returned by the current sync is the read snapshot. A failed refresh can use
 `sync --offline` to recover cached context, explicitly marked stale. Modified snapshots
@@ -86,7 +113,7 @@ Credentials come from the current execution and are never stored there.
 ## Authorization and writes
 
 Server-side connection verification checks the selected directory and branch at an exact
-remote commit, using the Account's current GitHub authorization. It rechecks authorization
+remote commit, using the current Agent's GitHub MCP authorization. It rechecks authorization
 and remote state before accepting the connection. Unrelated repository infrastructure does
 not affect subtree validation. Selected content cannot traverse symlinks or submodules.
 
@@ -105,7 +132,11 @@ transport's URL rewrite does not change the selected repository's identity.
 
 ## Distribution
 
-OpenTag pins `@first-tree-ai/context-tree` to `1.0.1`. Portable builds and Cloud images
+OpenTag pins `@first-tree-ai/context-tree` to `1.0.2-alpha.202611020650`. New managed
+Git subtree snapshots and write sessions use cone-mode sparse checkout with a full
+Git index, requiring Git 2.36 or newer. Snapshot identity includes the selected
+directory and commit; repository-root sources use full checkouts. Existing snapshots
+and unpublished write sessions are preserved. Portable builds and Cloud images
 include its CLI, public contracts, and six skills: init, connect, read, write, cleanup,
 and schedule-cleanup. Native cleanup schedules belong on persistent supported hosts,
 not ephemeral Cloud sandboxes. Server, Local runtimes, and Cloud images use the same
@@ -125,3 +156,13 @@ an unresolved Turn must settle first.
 Local Sessions prepend the bundled Context Tree CLI at the final Provider launch boundary,
 after executable discovery and per-execution environment composition. This applies to
 visible and internal Sessions, so an older global CLI cannot take precedence.
+The shared Local/Cloud proxy environment sets `OPENTAG_CONTEXT_TREE_MANAGED=1`.
+Codex shell commands retain this non-secret marker and the execution's Context Tree manifest path.
+The Codex adapter pins shell inheritance to `all` to retain Session routing metadata across native
+default changes, without replacing the operator's filter table.
+Custom environment policies must retain this routing metadata for managed commands.
+When either identifies a proxy-managed execution, sync and write commands without a usable gateway
+route are rejected rather than running the standalone CLI, including when the manifest is missing.
+Local legacy mode does not set this marker or publish a manifest; its sync and write commands
+retain their existing pinned-CLI behavior. General Session variables such as `OPENTAG_HOME` do not
+identify proxy mode. Read and verification commands remain local even when routing is unavailable.

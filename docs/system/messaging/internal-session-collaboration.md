@@ -19,6 +19,17 @@ the current Session, placement generation, Computer connection, and Client conne
 reuse the same proof, including retries after a timeout or lost response. Placement, connection, Agent, or IM-binding
 changes invalidate the old proof.
 
+On Local Computers, managed command instructions use an absolute invocation from the installation running the daemon.
+Portable installs use that installation's stable channel launcher; npm installs use the running Node executable and CLI
+entry script. A stable Node alias is preferred when it resolves to that same executable, including Homebrew's `opt`
+path; a different Node on `PATH` cannot replace it. Service installation and refresh use the same selection, independent
+of same-name CLI commands on ambient `PATH`. Paths and arguments are quoted separately. Claude Code Bash allowances
+and Codex command-prefix rules receive these same invocation tokens, including the npm entry script, rather than
+allowing every script run by Node. A missing or inconsistent local entry is a local configuration error; daemon logs
+include its path, reason, running version, and the installed Portable version when available.
+Visible Session create/send commands read the current execution marker on each invocation, including when the Provider
+process persists across Turns; they do not reuse an earlier Turn's inherited execution ID.
+
 For Local Computers, all Provider processes launched by one daemon OS user currently form one trust domain. File permissions protect proof
 files from other OS users and accidental exposure, but do not isolate sibling Sessions running as that same user. Until
 openTag introduces per-Session OS or container isolation, the proof lets the Server validate a live Runtime binding and
@@ -39,7 +50,9 @@ the later message lock and input-conflict checks remain authoritative. There is 
 
 `session list` returns direct children by default, ordered by recent message activity. Pages default to 20 items and
 are capped at 100; `--cursor` continues a page, `--recursive` includes descendants, `--since` filters recent activity,
-and `--json` returns `{ items, nextCursor }`. There is no unbounded `--all` mode.
+and `--json` returns `{ items, nextCursor }`. There is no unbounded `--all` mode. The page returns active children
+only: the closure row carries `descendant_active`, which mirrors the descendant's `ended_at`, and the activity indexes
+are partial on it, so a page never reads the ordering index to discover ended descendants and discard them.
 
 Recent activity is the latest message in which the listed Session is the source or target. Creating
 an internal child therefore also updates the creator's activity projection. It does not raise the
@@ -78,7 +91,8 @@ The Server stores authorized logical messages and their latest observed delivery
 detection. The managed Local Runtime uses its existing bounded inbox and durable-work store, including its recovery and
 retry policy; acceptance does not mean completion or exactly-once external side effects. Cloud uses the allocation and
 execution boundaries described in [Cloud Context](../cloud/cloud-context.md). Agent-facing Session operations intentionally
-provide no `end`; administrative lifecycle invalidation may still set the existing `sessions.ended_at` field.
+provide no `end`; administrative lifecycle invalidation may still set the existing `sessions.ended_at` field, and it
+marks the matching closure rows inactive in the same transaction through `services/sessions/session-closure.ts`.
 
 The Local CLI transport requires `runtime.sessionCollaboration` capability version 2. Visible callback delivery also requires
 `runtime.imCredentialGrant` version 2. A new Server reports `outbox_unavailable` before delivery when the target Client is

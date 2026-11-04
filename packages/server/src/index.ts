@@ -5,7 +5,7 @@ import type {
   ProviderReadinessStatus,
   RuntimeCredentialServerFrame,
 } from "@opentag/shared";
-import { RUNTIME_CAPABILITY } from "@opentag/shared";
+import { MCP_OAUTH_CALLBACK_PATH, RUNTIME_CAPABILITY, redactForLog } from "@opentag/shared";
 import { eq } from "drizzle-orm";
 import { createApp } from "./app.js";
 import { createBetterAuth } from "./auth/better-auth.js";
@@ -26,14 +26,23 @@ import {
 import { isHostedEnvironment, parseServerConfig, type ServerConfig, serverEnvironmentSummary } from "./config.js";
 import { createDatabaseClient, type DatabaseClient } from "./db/client.js";
 import { migrateDatabase, verifyDatabaseMigrations } from "./db/migrate.js";
-import { createDedicatedDatabaseReadinessProbe, DATABASE_READINESS_TIMEOUT_MS } from "./db/readiness-probe.js";
+import {
+  createApplicationDatabaseReadinessProbe,
+  createDedicatedDatabaseReadinessProbe,
+  DATABASE_READINESS_TIMEOUT_MS,
+} from "./db/readiness-probe.js";
 import { agents, computers } from "./db/schema/index.js";
+import { DATABASE_CLOSE_TIMEOUT_SECONDS } from "./db/timeouts.js";
 import {
   createBackgroundFailureSupervisor,
   createErrorReporter,
+  createInstrumentedFetch,
+  createPerformanceLogger,
   createServerDiagnosticReporter,
   createServiceLoggerPort,
   initTelemetry,
+  instrumentServerWorkers,
+  type PerformanceLogger,
   type ServiceLogger,
   shutdownTelemetry,
 } from "./observability/index.js";
@@ -44,6 +53,7 @@ import { type AgentSessionStopDependencies, stopAgentSessions } from "./runtime/
 import { loadApprovalAuthority } from "./runtime/approval-authority.js";
 import { ApprovalMessenger } from "./runtime/approval-messenger.js";
 import { PostgresApprovalStore } from "./runtime/approval-store.js";
+import { CloudSlackAutoSetupOwner } from "./runtime/cloud-slack-auto-setup-owner.js";
 import { COMPUTER_DELETED_CLOSE, ConnectionRegistry } from "./runtime/connection-registry.js";
 import { handleFeishuApprovalAction } from "./runtime/feishu-approval-action.js";
 import { ImDeliveryWorker } from "./runtime/im-delivery-worker.js";
@@ -84,8 +94,8 @@ import { createRunnerImagePrewarmWorker } from "./services/cloud-run/runner-imag
 import { CloudUsageService } from "./services/cloud-usage.js";
 import { ComputerService, MachineAuthService } from "./services/computers/index.js";
 import { ApplicationCipher } from "./services/crypto.js";
-import { createGitHubIntegration } from "./services/github/index.js";
-import { GitHubCredentialCipher } from "./services/github-credential-material.js";
+import { AgentGitHubCredentialService } from "./services/github/agent-github-credential-service.js";
+import { GitHubApiClient } from "./services/github/github-api-client.js";
 import { GitHubExecutionCredentials } from "./services/github-proxy/execution-credentials.js";
 import { ExternalCallPolicy } from "./services/im/external-call-policy.js";
 import { ImFailureReactions } from "./services/im/im-failure-reactions.js";
@@ -141,6 +151,7 @@ import { AccountSetupService } from "./services/setup/index.js";
 import { S3SkillObjectStore, SkillObjectGc, SkillPresetService, SkillService } from "./services/skills/index.js";
 import { RemoteSkillService } from "./services/skills/source/remote-skill-service.js";
 import { TaskService } from "./services/tasks/index.js";
+import { closeServerResources } from "./shutdown.js";
 import { defaultWebAppRoot } from "./web-app.js";
 
 export { bootstrapInitialAdmin } from "./admin/bootstrap.js";
@@ -236,6 +247,15 @@ function cloudPlatformRuntimeOptions(
   return { cloudRuntimeFence: fence, cloudRevocationSender: sender };
 }
 
+function serverPerformanceLogger(
+  config: ServerConfig,
+  getLogger: () => ReturnType<typeof createApp>["log"] | undefined,
+): PerformanceLogger | undefined {
+  const perfConfig = config.observability?.performance;
+  if (perfConfig?.enabled === false) return undefined;
+  return createPerformanceLogger(getLogger, perfConfig);
+}
+
 /** One model catalog shared by settings, dispatch and diagnostics. */
 async function createCloudModelRuntime(
   config: ServerConfig,
@@ -244,14 +264,17 @@ async function createCloudModelRuntime(
   calls: CloudCallStore,
   database: DatabaseClient,
   onError: NonNullable<CloudModelServiceOptions["onError"]>,
+  perfLogger?: PerformanceLogger,
 ) {
   const model = config.cloudModel;
   if (!runner || !model.enabled) return undefined;
+  const routerFetch = createInstrumentedFetch(perfLogger, { provider: "cloud-router" });
   const catalog = new RouterCloudModelCatalog({
     upstreamBaseUrl: model.upstreamBaseUrl,
     masterKey: model.masterKey,
+    fetchImpl: routerFetch,
   });
-  const service = new CloudModelService(model, { calls, billing, onError });
+  const service = new CloudModelService(model, { calls, billing, onError, fetchImpl: routerFetch });
   try {
     await service.initialize();
   } catch (error) {
@@ -386,7 +409,7 @@ function cloudSessionAuthorityOptions(
 }
 
 function createContextTreeServices(
-  github: ReturnType<typeof createGitHubIntegration> | undefined,
+  github: { api: GitHubApiClient; management: AgentGitHubCredentialService } | undefined,
   imBindings: ImBindingService,
   agents: AgentService,
   registry: ConnectionRegistry,
@@ -405,7 +428,8 @@ function createContextTreeServices(
     contextTreeOperationService: new ContextTreeOperationService(agents, registry, {
       computerKind,
       run: (input) =>
-        githubContextTreeOperations?.run(input) ?? Promise.resolve({ status: "failed", code: "github_not_configured" }),
+        githubContextTreeOperations?.run(input) ??
+        Promise.resolve({ result: { status: "failed", code: "github_not_configured" } }),
     }),
   };
 }
@@ -434,13 +458,14 @@ function createSkillRuntime(
   config: ServerConfig,
   database: DatabaseClient,
   logger: ServiceLogger,
+  perfLogger?: PerformanceLogger,
 ): { service: SkillService; remote: RemoteSkillService; preset: SkillPresetService; gc?: SkillObjectGc } {
   const storage = config.skillStorage;
   if (!storage.enabled) {
     const service = new SkillService({ database, keyPrefix: "skills", logger });
     return {
       service,
-      remote: new RemoteSkillService({ skills: service, logger }),
+      remote: new RemoteSkillService({ skills: service, logger, performanceLogger: perfLogger }),
       preset: new SkillPresetService({ skills: service, logger }),
     };
   }
@@ -454,9 +479,10 @@ function createSkillRuntime(
       forcePathStyle: storage.forcePathStyle,
     },
     logger,
+    fetch: createInstrumentedFetch(perfLogger, { provider: "s3-skills" }),
   });
   const service = new SkillService({ database, store, keyPrefix: storage.prefix, logger });
-  const remote = new RemoteSkillService({ skills: service, logger });
+  const remote = new RemoteSkillService({ skills: service, logger, performanceLogger: perfLogger });
   const preset = new SkillPresetService({ skills: service, logger });
   if (storage.gcIntervalSeconds <= 0) return { service, remote, preset };
   const gc = new SkillObjectGc({
@@ -495,20 +521,117 @@ function reportIgnoredCloudBilling(config: ServerConfig, log: { warn(payload: ob
   );
 }
 
-function reportIgnoredGitHubAppConfiguration(log: { warn(payload: object, message: string): void }) {
+function reportIgnoredGitHubConfiguration(log: { warn(payload: object, message: string): void }) {
   const variables = Object.keys(process.env)
-    .filter((name) => name.startsWith("OPENTAG_GITHUB_APP_") && process.env[name]?.trim())
+    .filter(
+      (name) =>
+        (name.startsWith("OPENTAG_GITHUB_APP_") || name.startsWith("OPENTAG_GITHUB_OAUTH_")) &&
+        process.env[name]?.trim(),
+    )
     .sort();
   if (variables.length === 0) return;
   log.warn(
     { event: "github_app_configuration_ignored", variables },
-    "OPENTAG_GITHUB_APP_* is ignored; configure OPENTAG_GITHUB_OAUTH_* to enable GitHub connections",
+    "Legacy GitHub Account/App configuration is ignored; configure OPENTAG_MCP_GITHUB_CLIENT_ID and OPENTAG_MCP_GITHUB_CLIENT_SECRET for Agent connectors",
   );
+}
+
+function formatStartupFailure(error: unknown, knownSecrets: string[]): string {
+  const pending = [error];
+  const seen = new Set<unknown>();
+  const details: string[] = [];
+  for (const failure of pending) {
+    if (seen.has(failure)) continue;
+    seen.add(failure);
+    details.push(formatStartupError(failure, knownSecrets));
+    if (failure instanceof AggregateError) pending.push(...failure.errors);
+    if (failure instanceof Error && failure.cause !== undefined) pending.push(failure.cause);
+  }
+  return details.join("\n");
+}
+
+const MAX_FATAL_RECORD_LENGTH = 8_192;
+
+function redactFatalString(value: string): string {
+  const redacted = redactForLog(value);
+  return (typeof redacted === "string" ? redacted : String(redacted)).slice(0, MAX_FATAL_RECORD_LENGTH);
+}
+
+function formatFatalErrorPayload(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    return {
+      type: redactFatalString(error.name),
+      message: redactFatalString(error.message),
+      stack: redactFatalString(error.stack ?? `${error.name}: ${error.message}`),
+    };
+  }
+  const summary = redactFatalString(String(error));
+  return {
+    type: typeof error,
+    message: summary,
+    stack: summary,
+  };
+}
+
+export function installProcessFatalHandlers(
+  getLogger: () => { fatal(bindings: Record<string, unknown>, message?: string): void } | undefined,
+  exit: (code: number) => void = (code) => process.exit(code),
+): () => void {
+  const handleFatal = (error: unknown, origin: string) => {
+    try {
+      const errPayload = formatFatalErrorPayload(error);
+      const payload = {
+        origin: redactFatalString(origin),
+        module: "process",
+        operation: "server.fatal",
+        outcome: "failed",
+        code: "SERVER_PROCESS_FATAL",
+        errorCode: "SERVER_PROCESS_FATAL",
+        err: errPayload,
+      };
+
+      const logger = getLogger();
+      if (logger && typeof logger.fatal === "function") {
+        logger.fatal(payload, "Server process fatal crash");
+      } else {
+        const fallback = {
+          level: 60,
+          time: Date.now(),
+          pid: process.pid,
+          ...payload,
+          msg: "Server process fatal crash",
+        };
+        process.stderr.write(`${JSON.stringify(fallback)}\n`);
+      }
+    } catch {
+      // Best-effort fatal logging must never block process termination.
+    } finally {
+      exit(1);
+    }
+  };
+
+  const onUncaughtException = (error: Error, origin: string) => {
+    handleFatal(error, origin || "uncaughtException");
+  };
+
+  const onUnhandledRejection = (reason: unknown) => {
+    handleFatal(reason, "unhandledRejection");
+  };
+
+  process.on("uncaughtException", onUncaughtException);
+  process.on("unhandledRejection", onUnhandledRejection);
+
+  return () => {
+    process.off("uncaughtException", onUncaughtException);
+    process.off("unhandledRejection", onUnhandledRejection);
+  };
 }
 
 export async function startServer(): Promise<void> {
   const readiness = new BootstrapReadiness();
   let app: ReturnType<typeof createApp> | undefined;
+  const uninstallFatalHandlers = installProcessFatalHandlers(() => app?.log);
+  let databaseSql: ReturnType<typeof createDatabaseClient>["sql"] | undefined;
   let cloudBilling: CloudBilling | undefined;
   let cloudModelService: CloudModelService | undefined;
   const knownSecrets: string[] = collectKnownSecrets(process.env);
@@ -523,6 +646,7 @@ export async function startServer(): Promise<void> {
   try {
     const config = parseServerConfig(process.env);
     knownSecrets.push(...cipherKeySecrets(config));
+    const perfLogger = serverPerformanceLogger(config, () => app?.log);
     const instanceId = randomUUID();
     await initTelemetry(config.observability.tracing, instanceId);
     readiness.complete("configuration");
@@ -535,9 +659,11 @@ export async function startServer(): Promise<void> {
 
     const { database, sql } = createDatabaseClient(config.databaseUrl, {
       ...config.databaseTimeouts,
+      performanceLogger: perfLogger,
       onQueryTimeout: ({ timeoutMs }) =>
         app?.log.warn({ check: "database", timeoutMs }, "Database query exceeded client deadline"),
     });
+    databaseSql = sql;
     const databaseReadinessProbe = createDedicatedDatabaseReadinessProbe(config.databaseUrl, {
       deadlineMs: DATABASE_READINESS_TIMEOUT_MS,
       log: { debug: (fields, message) => app?.log.debug(fields, message) },
@@ -546,6 +672,7 @@ export async function startServer(): Promise<void> {
     const imCallPolicy = new ExternalCallPolicy({
       allowedHosts: ["slack.com", "files.slack.com", "open.feishu.cn", "open.larksuite.com"],
       maxConcurrency: 16,
+      performanceLogger: perfLogger,
       onMetric: (metric) => app?.log.info({ metric }, "IM provider call metric"),
     });
     /*
@@ -563,6 +690,7 @@ export async function startServer(): Promise<void> {
     const feishuRegistrationPolicy = new ExternalCallPolicy({
       allowedHosts: ["open.feishu.cn", "open.larksuite.com"],
       maxConcurrency: 64,
+      performanceLogger: perfLogger,
       onMetric: (metric) => app?.log.info({ metric }, "Feishu registration call metric"),
     });
     const dev = config.devAuth ? new DevBrowserAuthService(database, config.devAuth.email) : undefined;
@@ -585,6 +713,7 @@ export async function startServer(): Promise<void> {
       channel: config.environment,
       downloadBaseUrl: config.channelTarget.downloadBaseUrl,
       intervalMs: config.channelTarget.pollIntervalMs,
+      fetchImpl: createInstrumentedFetch(perfLogger, { provider: "channel-target" }),
       logger: {
         info: (bindings: Record<string, unknown>, message: string) => app?.log.info(bindings, message),
         warn: (bindings: Record<string, unknown>, message: string) => app?.log.warn(bindings, message),
@@ -599,27 +728,12 @@ export async function startServer(): Promise<void> {
     const cloudIdentities = config.cloudIdentities;
 
     const applicationCipher = createApplicationCipher(config);
-    /*
-     * The GitHub management plane exists only when the deployment App is coherently configured;
-     * the routes are registered either way so the UI reads explicit availability instead of a 404.
-     */
-    const github = config.githubOAuth
-      ? createGitHubIntegration({
-          database,
-          config: config.githubOAuth,
-          cipher: new GitHubCredentialCipher(applicationCipher),
-          worker: {
-            logger: {
-              info: (bindings, message) => app?.log.info(bindings, message),
-              warn: (bindings, message) => app?.log.warn(bindings, message),
-              error: (bindings, message) => app?.log.error(bindings, message),
-            },
-          },
-        })
-      : undefined;
     let imFailureReactions: ImFailureReactions | undefined;
     const onDeliverySettled = (deliveryId: string) => imFailureReactions?.notify(deliveryId);
-    const custody = new PostgresRuntimeCustodyStore(database, { onDeliverySettled });
+    const custody = new PostgresRuntimeCustodyStore(database, {
+      onDeliverySettled,
+      logger: serviceLogger("runtime-custody"),
+    });
     let cloudSessionOwner: CloudSessionCollaborationOwner | undefined;
     let imDeliveryWorker: ImDeliveryWorker | undefined;
     const cloudSessionWork = new CloudSessionWorkTracker();
@@ -632,6 +746,7 @@ export async function startServer(): Promise<void> {
         },
         supervisor: backgroundFailureSupervisor,
       },
+      performanceLogger: perfLogger,
     });
     const runnerImagePrewarmWorker = createRunnerImagePrewarmWorker({
       environment: config.environment,
@@ -639,6 +754,7 @@ export async function startServer(): Promise<void> {
       databaseUrl: config.databaseUrl,
       logger: serviceLogger("runner-image-prewarm"),
       supervisor: backgroundFailureSupervisor,
+      performanceLogger: perfLogger,
     });
     /*
      * E7 idle reclamation runs on the existing Server lifecycle: one fixed 15s cadence, one idle
@@ -681,6 +797,7 @@ export async function startServer(): Promise<void> {
       cloudCalls,
       database,
       (event, details) => app?.log.error({ event, ...details }),
+      perfLogger,
     );
     cloudModelService = cloudModelRuntime?.service;
     const modelCatalogOptions = optionalCloudModelCatalog(cloudModelRuntime);
@@ -694,7 +811,77 @@ export async function startServer(): Promise<void> {
      * service is stateless over the database, so constructing it early costs nothing and keeps one
      * instance shared by the management routes and the runtime gateway.
      */
-    const mcpServers = new McpServerService({ database });
+    const mcpCipher = new McpCredentialCipher(applicationCipher);
+    const mcpServers = new McpServerService({ database, cipher: mcpCipher, reuseOAuth: config.mcpOAuthReuse });
+    const mcpFetcher = new McpOutboundFetcher({
+      allowLoopback: config.mcpAllowLoopback,
+      performanceLogger: perfLogger,
+    });
+    /*
+     * A second fetcher for runtime tool calls. It enforces the same URL policy — the gate, the
+     * redirect refusal, the response bound are all properties of the class — but carries its own
+     * deadline and its own per-Account concurrency counter, because a tool call is not a probe: it
+     * runs as long as the tool does, and a background probe must never be able to starve a live turn.
+     */
+    const mcpRuntimeFetcher = new McpOutboundFetcher({
+      allowLoopback: config.mcpAllowLoopback,
+      timeoutMs: MCP_RUNTIME_TIMEOUT_MS,
+      maxConcurrentPerAccount: MCP_RUNTIME_MAX_CONCURRENT_PER_ACCOUNT,
+      performanceLogger: perfLogger,
+    });
+    const mcpOAuth = new McpOAuthClient({ fetcher: mcpFetcher, publicUrl: config.publicUrl });
+    const mcpProbe = new McpProbe({ fetcher: mcpFetcher, logger: serviceLogger("mcp-probe") });
+    const mcpFlows = new McpOAuthFlowService({
+      logger: serviceLogger("mcp-oauth"),
+      database,
+      cipher: mcpCipher,
+      oauth: mcpOAuth,
+      servers: mcpServers,
+      /*
+       * The deployment's pre-registered Google Workspace client, present only when the
+       * OPENTAG_MCP_GOOGLE_CLIENT_* pair is configured. The flow itself re-checks the Server's
+       * origin and the resolved issuer before it uses this client, so wiring it here grants it no
+       * reach beyond the Google-hosted endpoints.
+       */
+      googleMcpClient: config.mcpGoogleOAuth,
+      /*
+       * The deployment's static clients for providers without DCR or CIMD (Canva, HubSpot, Asana,
+       * Zoom), present per brand only when its OPENTAG_MCP_<BRAND>_CLIENT_* pair is configured. The
+       * flow offers each only to that provider's own endpoints and issuer, and Canva's also makes the
+       * catalog's Canva card create its Server on the Developer Portal endpoint.
+       */
+      staticMcpClients: config.mcpStaticOAuth,
+    });
+    const mcpAuthorization = new McpAuthorizationService({
+      logger: serviceLogger("mcp-authorization"),
+      database,
+      cipher: mcpCipher,
+      probe: mcpProbe,
+      reusableClient: (url, issuer, clientId, registrationId) =>
+        mcpFlows.reusableClient(url, issuer, clientId, registrationId),
+      servers: mcpServers,
+    });
+    const githubClient = config.mcpStaticOAuth?.github;
+    const github = githubClient
+      ? (() => {
+          const api = new GitHubApiClient({
+            ...githubClient,
+            redirectUri: `${config.publicUrl}${MCP_OAUTH_CALLBACK_PATH}`,
+            fetch: createInstrumentedFetch(perfLogger, { provider: "github" }),
+          });
+          return {
+            api,
+            management: new AgentGitHubCredentialService({
+              database,
+              authorization: mcpAuthorization,
+              api,
+              configured: true,
+              trustedClient: (url, issuer, clientId, registrationId) =>
+                mcpFlows.reusableClient(url, issuer, clientId, registrationId),
+            }),
+          };
+        })()
+      : undefined;
     const platformRuntime = await createPlatformRuntime({
       slackWorkingStatus: true,
       config,
@@ -709,6 +896,7 @@ export async function startServer(): Promise<void> {
         cloudDeliveryOwnerRef?.sendRevocationToInstance(computerId, instanceId, frame);
       }),
       logger: serviceLogger("platform-runtime"),
+      performanceLogger: perfLogger,
     });
     const computerService = new ComputerService(database, authService, {
       providerReadiness: registry,
@@ -794,7 +982,10 @@ export async function startServer(): Promise<void> {
       logger: serviceLogger("im-binding"),
     });
     const accountSetupService = new AccountSetupService(database);
-    const imMessageInbox = new ImMessageInbox(database, { logger: serviceLogger("im-inbox") });
+    const imMessageInbox = new ImMessageInbox(database, {
+      logger: serviceLogger("im-inbox"),
+      onDeliveryChanged: onDeliverySettled,
+    });
     const feishuInboundReceipts = new FeishuInboundReceiptStore(database, {
       onMetric: (metric) => app?.log.info({ metric }, "Feishu inbound receipt metric"),
     });
@@ -812,7 +1003,7 @@ export async function startServer(): Promise<void> {
       executions: platformRuntime.credentials.owner.executionRegistry,
       executionLive: (id) => platformRuntime.credentials.owner.isExecutionLive(id),
     });
-    const skillRuntime = createSkillRuntime(config, database, serviceLogger("skills"));
+    const skillRuntime = createSkillRuntime(config, database, serviceLogger("skills"), perfLogger);
     const slackWorkingStore = new SlackWorkingStore(database);
     const domainOwner = new RuntimeDomainOwner(registry, custody, {
       onTurnActivity: (frame, context) => slackWorkingStore.record(frame, context),
@@ -826,8 +1017,9 @@ export async function startServer(): Promise<void> {
       registry,
       serverInstanceId: instanceId,
       authority: (request, context) => loadApprovalAuthority(database, request, context),
-      messenger: new ApprovalMessenger(imBindingService, imCallPolicy),
+      messenger: new ApprovalMessenger(imBindingService, imCallPolicy, config.publicUrl),
       onError: () => reportDiagnostic("RUNTIME_APPROVAL_FAILED"),
+      logger: serviceLogger("runtime-approval"),
     });
     const durableWorkStore = new PostgresRuntimeDurableWorkStore(database);
     providerCliReconcileOwner = new ProviderCliReconcileOwner(registry, {
@@ -841,7 +1033,9 @@ export async function startServer(): Promise<void> {
     const agentRuntimeOptionsOwner = new AgentRuntimeOptionsOwner(registry);
     const agentRuntimeTestOwner = new AgentRuntimeTestOwner(registry);
     const slackAutoSetupOwner = new SlackAutoSetupOwner(registry);
+    const cloudSlackAutoSetupOwner = new CloudSlackAutoSetupOwner();
     const agentService = new AgentService(database, {
+      mcpCredentialCipher: mcpCipher,
       ...optionalCloudUsage(config, cloudUsage),
       cloudIdentitiesEnabled: cloudIdentities.enabled,
       ...modelCatalogOptions,
@@ -920,7 +1114,7 @@ export async function startServer(): Promise<void> {
       onDiagnostic: reportDiagnostic,
       supervisor: backgroundFailureSupervisor,
     });
-    const agentSetupService = new AgentSetupService(database, agentService, imBindingService, feishuSetupService, {
+    const agentSetupService = new AgentSetupService(database, agentService, feishuSetupService, {
       prepareComputer: async (input) => {
         const owner = providerCliReconcileOwner;
         if (!owner) throw new Error("Provider CLI preparation owner is unavailable");
@@ -930,7 +1124,11 @@ export async function startServer(): Promise<void> {
       slackOAuthAvailable: config.slackOAuth !== undefined,
       cloudAvailability: (now) => cloudAvailability(config, now),
     });
-    const slackApi = new DefaultSlackApiClient(undefined, undefined, imCallPolicy);
+    const slackApi = new DefaultSlackApiClient(
+      undefined,
+      createInstrumentedFetch(perfLogger, { provider: "slack" }),
+      imCallPolicy,
+    );
     const slackWorkingWorker = new SlackWorkingWorker({
       store: slackWorkingStore,
       api: slackApi,
@@ -1020,27 +1218,6 @@ export async function startServer(): Promise<void> {
      * URL policy, so the discovery chain cannot be used to reach an internal address; loopback plain
      * HTTP is permitted only on a development deployment that explicitly opted in.
      */
-    const mcpFetcher = new McpOutboundFetcher({ allowLoopback: config.mcpAllowLoopback });
-    /*
-     * A second fetcher for runtime tool calls. It enforces the same URL policy — the gate, the
-     * redirect refusal, the response bound are all properties of the class — but carries its own
-     * deadline and its own per-Account concurrency counter, because a tool call is not a probe: it
-     * runs as long as the tool does, and a background probe must never be able to starve a live turn.
-     */
-    const mcpRuntimeFetcher = new McpOutboundFetcher({
-      allowLoopback: config.mcpAllowLoopback,
-      timeoutMs: MCP_RUNTIME_TIMEOUT_MS,
-      maxConcurrentPerAccount: MCP_RUNTIME_MAX_CONCURRENT_PER_ACCOUNT,
-    });
-    const mcpCipher = new McpCredentialCipher(applicationCipher);
-    const mcpOAuth = new McpOAuthClient({ fetcher: mcpFetcher, publicUrl: config.publicUrl });
-    const mcpProbe = new McpProbe({ fetcher: mcpFetcher, logger: serviceLogger("mcp-probe") });
-    const mcpAuthorization = new McpAuthorizationService({
-      database,
-      cipher: mcpCipher,
-      probe: mcpProbe,
-      servers: mcpServers,
-    });
     /*
      * The runtime gateway. It shares the one outbound fetcher with the management plane, so a
      * runtime tool call is bound by the same URL policy, per-Account concurrency limit, redirect
@@ -1050,26 +1227,6 @@ export async function startServer(): Promise<void> {
       servers: mcpServers,
       authorizations: mcpAuthorization,
       upstream: new McpUpstreamCaller({ fetcher: mcpRuntimeFetcher }),
-    });
-    const mcpFlows = new McpOAuthFlowService({
-      database,
-      cipher: mcpCipher,
-      oauth: mcpOAuth,
-      servers: mcpServers,
-      /*
-       * The deployment's pre-registered Google Workspace client, present only when the
-       * OPENTAG_MCP_GOOGLE_CLIENT_* pair is configured. The flow itself re-checks the Server's
-       * origin and the resolved issuer before it uses this client, so wiring it here grants it no
-       * reach beyond the Google-hosted endpoints.
-       */
-      googleMcpClient: config.mcpGoogleOAuth,
-      /*
-       * The deployment's static clients for providers without DCR or CIMD (Canva, HubSpot, Asana,
-       * Zoom), present per brand only when its OPENTAG_MCP_<BRAND>_CLIENT_* pair is configured. The
-       * flow offers each only to that provider's own endpoints and issuer, and Canva's also makes the
-       * catalog's Canva card create its Server on the Developer Portal endpoint.
-       */
-      staticMcpClients: config.mcpStaticOAuth,
     });
     const mcpRefreshWorker = new McpRefreshWorker({
       authorization: mcpAuthorization,
@@ -1120,15 +1277,19 @@ export async function startServer(): Promise<void> {
       sessions: sessionService,
     });
     app = createApp({
-      databaseReadinessProbe: databaseReadinessProbe.run,
+      environment: config.environment,
+      revision: config.buildRevision,
+      databaseReadinessProbe: createApplicationDatabaseReadinessProbe(sql, databaseReadinessProbe),
       deployment: deploymentProof(config),
       loggerLevel: config.logLevel,
+      performanceLogger: perfLogger,
       trustProxy: config.trustProxy,
       errorReporting: {
         reporter: createErrorReporter({
           projectId: config.observability.errorReporting.projectId,
           credentials: config.observability.errorReporting.credentials,
           logger: () => app?.log,
+          performanceLogger: perfLogger,
         }),
       },
       betterAuth: { instance: betterAuth, publicUrl: config.publicUrl },
@@ -1178,6 +1339,8 @@ export async function startServer(): Promise<void> {
           agents: agentService,
           slack: slackConfigurationService,
           owner: slackAutoSetupOwner,
+          cloud: cloudSlackAutoSetupOwner,
+          computerKind: (computerId) => imBindingService.computerKind(computerId),
           publicOrigin: config.publicUrl,
           officialSigningSecret: config.slackOAuth?.signingSecret,
         }),
@@ -1235,16 +1398,24 @@ export async function startServer(): Promise<void> {
         slackAutoSetupOwner,
         agentRuntimeOptionsOwner,
         providerCliReconcileOwner,
+        // A Computer that just became usable makes its offline-parked retries due again, so an
+        // offline backoff can never delay work behind a live runtime.
+        onRegistered: async ({ computerId }) => {
+          await imDeliveryWorker?.notifyComputerReady(computerId);
+        },
         channelTarget: () => channelTargetPoller.get(),
       },
       runtimeDurableWork: { machineAuth: platformRuntime.auth, store: durableWorkStore },
       runtimeAgent: {
         service: new AgentSelfService({
           agents: agentService,
+          authorization: mcpAuthorization,
+          flows: mcpFlows,
           logger: serviceLogger("agent-self"),
           mcp: mcpServers,
           owners: new DatabaseAgentOwnerResolver(database),
           proofs: sessionCliProofService,
+          publicOrigin: config.publicUrl,
         }),
       },
       runtimeAgentSlackProvision: {
@@ -1285,17 +1456,22 @@ export async function startServer(): Promise<void> {
             botId: binding.botId,
           }),
       },
-      githubIntegrations: {
-        availability: config.githubOAuth
-          ? ({ available: true, githubHost: "github.com", oauthClientId: config.githubOAuth.clientId } as const)
-          : ({ available: false, githubHost: "github.com", oauthClientId: null } as const),
-        publicOrigin: config.publicUrl,
-        secureCookies: isHostedEnvironment(config.environment),
-        ...(github ? { management: github.management } : {}),
-      },
       ...(setupResetService ? { internalNavigationService, setupResetService } : {}),
       accountSetupService,
     });
+    instrumentServerWorkers(
+      [
+        ["ImDeliveryWorker", imDeliveryWorker],
+        ["SlackWorkingWorker", slackWorkingWorker],
+        ["ScheduleScheduler", scheduleScheduler],
+        ["SandboxIdleReclaimer", sandboxIdleReclaimer],
+        ["McpRefreshWorker", mcpRefreshWorker],
+        ["SkillObjectGc", skillRuntime.gc],
+        ["RunnerImagePrewarmWorker", runnerImagePrewarmWorker],
+        ["ChannelTargetPoller", channelTargetPoller],
+      ],
+      perfLogger,
+    );
     feishuSetupService.start();
     feishuConnections.start();
     approvalOwner.start();
@@ -1303,59 +1479,81 @@ export async function startServer(): Promise<void> {
     slackWorkingWorker.start();
     scheduleScheduler.start();
     sandboxIdleReclaimer?.start();
-    github?.worker.start();
     mcpRefreshWorker.start();
     skillRuntime.gc?.start();
     channelTargetPoller.start();
     const closeForSignal = () => {
-      void app?.close();
+      void app?.close().catch((error) => {
+        const failures = (error instanceof AggregateError ? error.errors : [error]).map((failure) => ({
+          detail: formatStartupError(failure, knownSecrets),
+          cause:
+            failure instanceof Error && failure.cause !== undefined
+              ? formatStartupError(failure.cause, knownSecrets)
+              : undefined,
+        }));
+        app?.log.error({ failures }, "Failed to close OpenTag server");
+        process.exitCode = 1;
+      });
     };
     process.once("SIGINT", closeForSignal);
     process.once("SIGTERM", closeForSignal);
     app.addHook("preClose", async () => {
       cloudModelRuntime?.tester.close();
+      cloudSlackAutoSetupOwner.close();
     });
     app.addHook("onClose", async () => {
+      uninstallFatalHandlers();
       process.off("SIGINT", closeForSignal);
       process.off("SIGTERM", closeForSignal);
       const imagePrewarmStopped = runnerImagePrewarmWorker?.stop();
-      await scheduleScheduler.stop();
-      channelTargetPoller.stop();
-      await sandboxIdleReclaimer?.stop();
-      imDeliveryWorker.stop();
-      await slackWorkingWorker.stop();
-      await imFailureReactions?.close();
-      mcpRefreshWorker.stop();
-      skillRuntime.gc?.stop();
-      if (github) await github.worker.stop();
-      await githubContextTreeOperations?.close();
-      await platformRuntime.close();
-      await feishuSetupService.stop();
-      await feishuConnections.stop();
-      await imagePrewarmStopped;
-      await databaseReadinessProbe.close();
-      await sql.end();
-      await shutdownTelemetry();
+      void imagePrewarmStopped?.catch(() => undefined);
+      await closeServerResources([
+        ["schedule scheduler", () => scheduleScheduler.stop()],
+        ["channel target poller", () => channelTargetPoller.stop()],
+        ["sandbox idle reclaimer", () => sandboxIdleReclaimer?.stop()],
+        ["IM delivery worker", () => imDeliveryWorker.stop()],
+        ["Slack working worker", () => slackWorkingWorker.stop()],
+        ["IM failure reactions", () => imFailureReactions?.close()],
+        ["MCP refresh worker", () => mcpRefreshWorker.stop()],
+        ["skill garbage collector", () => skillRuntime.gc?.stop()],
+        ["GitHub Context Tree operations", () => githubContextTreeOperations?.close()],
+        ["platform runtime", () => platformRuntime.close()],
+        ["Feishu setup service", () => feishuSetupService.stop()],
+        ["Feishu connections", () => feishuConnections.stop()],
+        ["runner image prewarm worker", () => imagePrewarmStopped],
+        ["database readiness probe", () => databaseReadinessProbe.close()],
+        ["database pool", () => sql.end({ timeout: DATABASE_CLOSE_TIMEOUT_SECONDS })],
+        ["telemetry", () => shutdownTelemetry()],
+      ]);
     });
     app.log.info(serverEnvironmentSummary(config), "Resolved OpenTag environment");
     app.log.info({ databaseTimeouts: config.databaseTimeouts }, "Resolved database timeouts");
     reportIgnoredCloudBilling(config, app.log);
-    reportIgnoredGitHubAppConfiguration(app.log);
+    reportIgnoredGitHubConfiguration(app.log);
     readiness.complete("application");
     await app.listen({ host: config.host, port: config.port });
     readiness.complete("listen");
     runnerImagePrewarmWorker?.start();
   } catch (error) {
-    if (app) {
-      app.log.error({ detail: formatStartupError(error, knownSecrets) }, "Failed to start OpenTag server");
-      await app.close();
-    } else {
-      process.stderr.write(`Failed to start OpenTag server: ${formatStartupError(error, knownSecrets)}\n`);
-    }
-    await cloudModelService?.close();
-    await cloudBilling?.close();
-    await shutdownTelemetry();
+    uninstallFatalHandlers();
+    const failure = await closeServerResources([
+      ["application", () => app?.close()],
+      ["cloud model service", () => cloudModelService?.close()],
+      ["cloud billing", () => cloudBilling?.close()],
+      ["database pool", () => databaseSql?.end({ timeout: DATABASE_CLOSE_TIMEOUT_SECONDS })],
+      ["telemetry", () => shutdownTelemetry()],
+    ]).then(
+      () => error,
+      (cleanupError) =>
+        new AggregateError([error, cleanupError], "Server startup and resource cleanup failed", { cause: error }),
+    );
     process.exitCode = 1;
+    const detail = formatStartupFailure(failure, knownSecrets);
+    if (app) {
+      app.log.error({ detail }, "Failed to start OpenTag server");
+    } else {
+      process.stderr.write(`Failed to start OpenTag server: ${detail}\n`);
+    }
   }
 }
 

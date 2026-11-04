@@ -26,14 +26,22 @@ describe("ClaudeCodeAgentRuntime", () => {
       });
       const run = runtime.prompt({ runId: "local-run", input: input("work") });
       await vi.waitFor(() => expect(events.some((event) => event.type === "interaction_requested")).toBe(true));
-      expect(argumentAfter(processes[0]?.args ?? [], "--permission-mode")).toBe("auto");
+      expect(events).toContainEqual({
+        type: "interaction_requested",
+        runId: "local-run",
+        request: {
+          requestId: "permission-1",
+          kind: "approval",
+          title: "Approve Bash",
+          details: { command: "git push" },
+        },
+      });
+      expect(argumentAfter(processes[0]?.args ?? [], "--permission-mode")).toBe("acceptEdits");
       expect(argumentAfter(processes[0]?.args ?? [], "--permission-prompt-tool")).toBe("stdio");
-      expect(argumentAfter(processes[0]?.args ?? [], "--setting-sources")).toBe("");
+      expect(argumentAfter(processes[0]?.args ?? [], "--setting-sources")).toBe("user,project,local");
       expect(argumentAfter(processes[0]?.args ?? [], "--plugin-dir")).toMatch(/opentag$/);
       expect(processes[0]?.args).not.toContain("--bare");
       expect(JSON.parse(argumentAfter(processes[0]?.args ?? [], "--settings") as string)).toEqual({
-        disableAllHooks: true,
-        disableSkillShellExecution: true,
         permissions: {
           allow: expect.arrayContaining([
             "Bash(lark-cli im +messages-reply *)",
@@ -66,6 +74,22 @@ describe("ClaudeCodeAgentRuntime", () => {
       await runtime.close();
     },
   );
+
+  it("passes the quoted managed CLI command into native Bash permissions", async () => {
+    const processes: ScriptedClaudeCodeProcess[] = [];
+    const request = createRequest(() => undefined);
+    const runtime = await claudeFactory(processes, "complete").create({
+      ...request,
+      policy: { ...request.policy, approvals: "on-request", managedCli: ["/opt/app's bin/opentag-staging"] },
+    });
+    try {
+      await runtime.prompt({ runId: "managed-cli", input: input("continue") });
+      const settings = JSON.parse(argumentAfter(processes[0]?.args ?? [], "--settings") as string);
+      expect(settings.permissions.allow).toContain(`Bash('/opt/app'"'"'s bin/opentag-staging' *)`);
+    } finally {
+      await runtime.close();
+    }
+  });
 
   it("cancels native permission requests and rejects stale native replies", async () => {
     const processes: ScriptedClaudeCodeProcess[] = [];
@@ -160,19 +184,18 @@ describe("ClaudeCodeAgentRuntime", () => {
     expect(processes[0]?.args).toContain(SESSION_ID);
     expect(argumentAfter(processes[0]?.args ?? [], "--permission-mode")).toBe("bypassPermissions");
     expect(argumentAfter(processes[0]?.args ?? [], "--append-system-prompt")).toBe("OpenTag managed system prompt");
-    expect(processes[0]?.args).toContain("--strict-mcp-config");
+    expect(processes[0]?.args).not.toContain("--strict-mcp-config");
+    expect(processes[0]?.args).toContain("--mcp-config");
+    expect(processes[0]?.args).not.toContain("--no-chrome");
     const mcpConfig = argumentAfter(processes[0]?.args ?? [], "--mcp-config");
     expect(mcpConfig).toContain("opentag-claude-mcp-");
     await expect(readFile(mcpConfig ?? "", "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     expect(processes[0]?.args).not.toContain("--allowedTools");
-    expect(JSON.parse(argumentAfter(processes[0]?.args ?? [], "--settings") as string)).toEqual({
-      disableAllHooks: true,
-      disableSkillShellExecution: true,
-    });
+    expect(JSON.parse(argumentAfter(processes[0]?.args ?? [], "--settings") as string)).toEqual({});
     await runtime.close();
   });
 
-  it("allows only the exact OpenTag hosted tools through the strict MCP bridge", async () => {
+  it("pre-approves only namespaced OpenTag hosted tools alongside native configuration", async () => {
     const processes: ScriptedClaudeCodeProcess[] = [];
     const request = createRequest(() => undefined);
     const runtime = await claudeFactory(processes, "complete").create({
@@ -185,8 +208,8 @@ describe("ClaudeCodeAgentRuntime", () => {
 
     await runtime.prompt({ runId: "run-hosted", input: input("reply") });
     expect(processes[0]?.args).toContain("--allowedTools");
-    expect(processes[0]?.args).toContain("mcp__opentag__example_tool");
-    expect(processes[0]?.args).not.toContain("mcp__opentag__Read");
+    expect(processes[0]?.args).toContainEqual(expect.stringMatching(/^mcp__h[a-f0-9]{10}__example_tool$/));
+    expect(processes[0]?.args).not.toContainEqual(expect.stringMatching(/^mcp__h[a-f0-9]{10}__Read$/));
     expect(argumentAfter(processes[0]?.args ?? [], "--permission-mode")).toBe("bypassPermissions");
     expect(processes[0]?.args).not.toContain("--disallowedTools");
     await runtime.close();
@@ -282,39 +305,21 @@ describe("ClaudeCodeAgentRuntime", () => {
     await expect(hanging).rejects.toThrow("stop Claude probe");
   });
 
-  it("passes only system and Claude provider environment variables", () => {
-    expect(
-      claudeCodeAgentRuntimeEnvironment({
-        HOME: "/home/provider",
-        PATH: "/bin",
-        HTTPS_PROXY: "https://proxy.example",
-        NO_PROXY: "localhost",
-        no_proxy: "localhost",
-        NODE_EXTRA_CA_CERTS: "/certificate.pem",
-        ANTHROPIC_API_KEY: "provider-key",
-        CLAUDE_CODE_OAUTH_TOKEN: "oauth-token",
-        CLAUDE_CONFIG_DIR: "/home/provider/.claude",
-        CLAUDE_CODE_SKIP_PROMPT_HISTORY: "1",
-        CLAUDE_CODE_USE_BEDROCK: "1",
-        AWS_PROFILE: "provider",
-        GOOGLE_APPLICATION_CREDENTIALS: "/credential.json",
-        OPENTAG_ACCESS_TOKEN: "opentag-secret",
-        RANDOM_SECRET: "other-secret",
-      }),
-    ).toEqual({
+  it("preserves native plugin environment variables without mutating their source", () => {
+    const source = {
       HOME: "/home/provider",
       PATH: "/bin",
-      HTTPS_PROXY: "https://proxy.example",
-      NO_PROXY: "localhost",
-      no_proxy: "localhost",
-      NODE_EXTRA_CA_CERTS: "/certificate.pem",
       ANTHROPIC_API_KEY: "provider-key",
-      CLAUDE_CODE_OAUTH_TOKEN: "oauth-token",
-      CLAUDE_CONFIG_DIR: "/home/provider/.claude",
-      CLAUDE_CODE_USE_BEDROCK: "1",
-      AWS_PROFILE: "provider",
-      GOOGLE_APPLICATION_CREDENTIALS: "/credential.json",
-    });
+      CLAUDE_CODE_SKIP_PROMPT_HISTORY: "1",
+      PLUGIN_API_KEY: "plugin-key",
+      CUSTOM_PLUGIN_OPTION: "custom-value",
+    };
+    const environment = claudeCodeAgentRuntimeEnvironment(source);
+    expect(environment).toEqual(source);
+    expect(environment).not.toBe(source);
+    environment.PLUGIN_API_KEY = "replacement";
+    expect(source.PLUGIN_API_KEY).toBe("plugin-key");
+    expect(claudeCodeAgentRuntimeEnvironment()).toEqual(process.env);
   });
 });
 

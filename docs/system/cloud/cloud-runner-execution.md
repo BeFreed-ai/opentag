@@ -142,14 +142,58 @@ queued on the old connection cannot authorize a new start after reconnect.
 A queued Turn cancelled before it starts reports `not_started` and immediately advances the
 remaining FIFO queue; it does not require a new message or availability signal.
 
-Undispatched Cloud inputs use the existing ingress TTL and per-Session queue capacities (100
-direct, 500 ambient). Expiry/overflow records an explicit terminal reason. Dispatched Cloud
+Undispatched Cloud inputs use the existing ingress TTL and share a 99-input per-Session queue
+capacity across direct and ambient attention. Claimed inputs are protected from capacity eviction.
+Expiry/overflow records an explicit terminal reason. Dispatched Cloud
 inputs retain their frozen dispatch window; accepted-but-unreported custody is never pruned as
-pending input. Without E5 persistence, `restore_required` rejects replacement explicitly. With E5,
-replacement allocation is permitted but cannot execute before verified restoration. A stopped
+pending input. The Server settles accepted work as `unknown` once it can no longer accept a report
+for it: a superseded allocation, a proven physical absence, or the end of the frozen execution
+window (without one, the maximum runtime from acceptance) plus a one-hour grace with no recorded
+report. That last point is a report ACCEPTANCE cutoff, not proof that no authentic report exists: an
+authenticated late report is answered `conflict`, the `unknown` outcome stays terminal, and steered
+children returned to the queue by that settlement are not re-absorbed into the turn. A live Runner
+that answers `reported` is never settled that way, because it replays the journaled report on the
+same socket; an overdue replay is logged as `CLOUD_DELIVERY_REPORT_REPLAY_OVERDUE` for the report
+path to explain. The first overdue recovery warns immediately with the delivery, Turn, connection
+and query phase; repeats on that connection warn at most once per hour while queries and report
+replays continue normally. A replacement connection gets a fresh warning. This process-local
+throttle retains at most 1,024 deliveries, evicting the oldest warning when full; an evicted
+delivery or a Server restart can warn again sooner. Recording a report or detaching its connection
+clears the corresponding warning state. Without E5 persistence, `restore_required` rejects replacement
+explicitly. With E5, replacement allocation is permitted but cannot execute before verified restoration. A stopped
 environment rejects input explicitly. Transient model/Runner unavailability remains retryable within the input
 deadline, with exponential delays from two seconds to a thirty-second cap using the existing
-attempt counter. Cloud follow-ups wait for the current Turn and never enter the Local steering path.
+attempt counter.
+
+Cloud follow-ups negotiate `imInputVersion: 1` and use `delivery:steer` on the same authenticated
+control connection. The Server freezes the existing delivery rows before sending. The Runner fsyncs
+the exact steer input and target Turn before a single native injection, fsyncs journaled results before
+`delivery:steer:result`, and retires it only after the exact `delivery:steer:ack`. Report-only
+connections may settle receipts but cannot submit new execution. A reopened `received` intent
+requires fresh authority; a reopened `started` intent reports uncertainty and never injects again.
+After an uncertainty receipt is acknowledged, the Server retains the exact frozen unknown state and
+does not resubmit it while its Root Turn is running. A later negative receipt cannot erase that
+uncertainty; an exact successful receipt can settle it. Existing child journal evidence is checked
+before the Root journal. A previously unseen input whose Root journal has retired receives a
+repeatable no-effect response without launching work or inventing a Root runtime snapshot. If failed
+Root recovery assigns an input to another Turn while its older receipt still awaits acknowledgement,
+the Runner replays that older evidence and returns a known no-effect retry for the untouched new
+attempt. This also applies when the recovered input becomes the next Turn's initial delivery:
+known unexecuted steer intents can be replaced atomically, while older effect evidence must be
+acknowledged before the new direct input is admitted.
+That old receipt can also retire after the child moves to a replacement Session: authenticated old
+scope and exact retired-parent evidence authorize only its old journal acknowledgement, not a
+mutation of the recovered child.
+
+The native worker exposes a bounded private Unix socket during its active Prompt. A per-execution
+token travels only through trusted Runner memory and Worker stdin. The Runner invokes a single
+bounded native relay; the Worker checks the Session, Agent, placement and expected Turn before
+using the active Pi runtime's steer API. The existing model, credential execution and Turn remain in
+use. Steering is optional: a control-socket startup failure is recorded diagnostically while the Prompt
+continues, and Pi/process cleanup still runs. A stale socket path is removed before listening. Socket
+cleanup failure cannot mask the completed Turn or skip runtime/process cleanup. No host listener, extra
+model grant, database schema or independent retry loop is introduced.
+Ordered batching and message budgets follow [IM content delivery](../messaging/im-content-delivery.md).
 
 Once the current Runner connection and its verified allocation are both ready, the allocation
 service publishes a composition-injected notification. The IM worker wakes already-due initial inputs
@@ -182,6 +226,52 @@ message-count cap. These bounds are not an aggregate spend quota.
 Assistant history preserves Pi's `reasoning_content`, `reasoning`, and `reasoning_text` echoes,
 plus bounded encrypted `reasoning_details` for signed tool calls. These history fields do not
 relax the top-level routing or credential allowlist.
+
+### Model retry ownership
+
+The model proxy is the sole automatic retry owner for each managed Cloud model call, including
+compaction summaries. It retries only a confirmed HTTP 429 rate-limit rejection, at most three
+times after the initial attempt. Pi session, summarization and provider retries are explicitly
+zero; the underlying OpenAI SDK also performs no retries. The Router, LiteLLM Router and
+provider SDK configuration must keep retries at zero so forwarding never multiplies the budget.
+
+New managed Pi settings disable all retry loops and the generated provider sends
+`x-opentag-model-retry-owner: proxy`. Only requests declaring that ownership receive proxy
+retries. Requests from older Runners are forwarded once, preserving their retry boundary during
+rolling upgrades. An older proxy ignores the declaration and forwards once; a new Runner does
+not compensate with a second retry owner.
+
+A confirmed rate-limit response preserves a validated `Retry-After` hint. Integer seconds are
+accepted and canonical HTTP-dates are rounded up to seconds. Arbitrary upstream headers and
+error text remain hidden; permanent quota errors expose no hint. A requested wait above 60
+seconds terminates the call instead of retrying early. Without a usable hint, the proxy uses
+jittered exponential delays based on 500 ms, 1 second and 2 seconds. One request timeout covers
+all attempts and waits. Cancellation, grant revocation and the existing absolute Turn deadline
+interrupt the work; a retry never extends permission lifetime or resets its deadline.
+
+HTTP 408/409/5xx, statusless transport failures, unusable successful responses and uncertain
+stream errors are not automatically replayed. This includes a lost Pi-to-proxy connection and a
+lost Router response after dispatch. The conservative policy also leaves provably undispatched
+503 responses terminal. A missing response is not evidence that the model did not execute.
+Each confirmed rejected attempt keeps the existing model-service usage settlement; accounting
+and idempotency semantics are unchanged.
+
+Compaction remains enabled. Native context-overflow recovery can compact history and make one
+bounded recovery with changed context; partial tool calls from a failed response are not
+executed. This differs from replaying an identical failed call. No model failure triggers a
+whole-Turn, delivery or scheduled-occurrence replay. `CLOUD_MODEL_RATE_LIMIT` records the attempt,
+planned wait and ownership declaration without logging upstream content or credentials.
+
+The Router can report a definite pre-output Provider rate limit inside HTTP 200 SSE. The model
+proxy inspects at most 8 KiB before the first complete data event, including heartbeat comments,
+and normalizes an initial `rate_limit_exceeded` envelope only when the Router sets
+`error.pre_stream_rejection` to boolean `true`. The Router emits that marker only after observing
+an upstream HTTP 429 rejection; it does not imply a ledger release committed. A validated string
+`error.retry_after` supplies the wait hint. The same proxy retry budget covers this shape.
+Unmarked or uncertain complete errors, events after model data and prefixes exceeding the cap
+retain their original stream behavior without replay. An accepted stream that fails, times out
+or reaches clean EOF before its first complete data event returns terminal HTTP 400
+`CLOUD_MODEL_UPSTREAM_UNCERTAIN`. Explicit permission revocation and shutdown return HTTP 401.
 
 The grant registry's 4,096-entry bound protects Server state, including concurrent issuance. It
 is not a per-Account execution quota or a model-spend budget. Account-level admission and fairness

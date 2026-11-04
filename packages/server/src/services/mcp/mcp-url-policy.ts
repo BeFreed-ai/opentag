@@ -1,4 +1,7 @@
 import { checkOutboundUrl, isLoopbackHostname, MCP_ERROR_CODES } from "@opentag/shared";
+import { sanitizeExternalUrl, traceExternalCall } from "../../observability/external-call-logger.js";
+import type { PerformanceLogger } from "../../observability/performance-logger.js";
+import { withOutboundDeadline } from "../outbound/deadline.js";
 import { classifyOutboundDestination, resolveAllAddresses } from "../outbound/destination-policy.js";
 import { McpServiceError } from "./errors.js";
 
@@ -16,6 +19,11 @@ import { McpServiceError } from "./errors.js";
  * `mcp-transport.ts`, `mcp-oauth.ts`, and `mcp-probe.ts` must not call `fetch` themselves; they take
  * `fetchOutbound` from here, which keeps the gate unavoidable by construction. A regression test
  * scans those three files for a direct `fetch(` call.
+ *
+ * Invariant of one call: it settles within `timeoutMs` of entry, its connection is closed however it
+ * ends, and it holds one concurrency slot for exactly as long as it runs. The deadline therefore
+ * covers the address check as well as the request — see `#request` — and every rejection path
+ * releases the body it refuses rather than leaving the peer writing into a socket nobody reads.
  *
  * Deliberately not attempted: pinning the validated address at the socket layer, which would also
  * close DNS rebinding (a name that resolves to a public address during validation and a private one
@@ -42,7 +50,7 @@ export interface McpOutboundPolicy {
    * would hand every Account an internal port scanner.
    */
   allowLoopback: boolean;
-  /** Per-request deadline. */
+  /** Per-operation deadline, covering the address check and the request it authorizes. */
   timeoutMs?: number;
   /** Maximum response body size, enforced while reading so a huge body cannot exhaust memory. */
   maxResponseBytes?: number;
@@ -91,6 +99,14 @@ function invalid(message: string, detail?: Record<string, unknown>): McpServiceE
 }
 
 /**
+ * "No usable answer" — a missing peer, an expired deadline, or a cancelled call. The detail says
+ * which, because the three are the same code and a different operator fix.
+ */
+function unreachable(detail?: Record<string, unknown>): McpServiceError {
+  return new McpServiceError(MCP_ERROR_CODES.UPSTREAM_UNAVAILABLE, "The MCP endpoint could not be reached", detail);
+}
+
+/**
  * Whether a hostname names the local machine.
  *
  * Exported so a module that must accept loopback plain HTTP for the local fixture — without adopting
@@ -120,6 +136,7 @@ export function assertOutboundUrl(rawUrl: string, policy: McpOutboundPolicy): UR
 
 export interface McpOutboundFetchOptions extends McpOutboundPolicy {
   fetch?: typeof globalThis.fetch;
+  performanceLogger?: PerformanceLogger;
   /**
    * Resolves a hostname to every address it holds. Injectable so a test can assert the policy
    * without a network, and so a deployment can supply a resolver with different search domains.
@@ -138,6 +155,7 @@ export class McpOutboundFetcher {
   readonly #inFlight = new Map<string, number>();
   readonly #maxConcurrentPerAccount: number;
   readonly #maxResponseBytes: number;
+  readonly #perfLogger: PerformanceLogger | undefined;
   readonly #policy: McpOutboundPolicy;
   readonly #resolveAddresses: (hostname: string) => Promise<string[]>;
   readonly #timeoutMs: number;
@@ -146,6 +164,7 @@ export class McpOutboundFetcher {
     this.#fetch = options.fetch ?? globalThis.fetch;
     this.#maxConcurrentPerAccount = options.maxConcurrentPerAccount ?? MCP_DEFAULT_MAX_CONCURRENT_PER_ACCOUNT;
     this.#maxResponseBytes = options.maxResponseBytes ?? MCP_DEFAULT_MAX_RESPONSE_BYTES;
+    this.#perfLogger = options.performanceLogger;
     this.#policy = { allowLoopback: options.allowLoopback };
     this.#resolveAddresses = options.resolveAddresses ?? resolveAllAddresses;
     this.#timeoutMs = options.timeoutMs ?? MCP_DEFAULT_TIMEOUT_MS;
@@ -157,7 +176,35 @@ export class McpOutboundFetcher {
   }
 
   async fetchOutbound(accountId: string, rawUrl: string, init: McpFetchInit = {}): Promise<McpFetchResponse> {
+    const httpMethod = (init.method ?? "GET").toUpperCase();
+    const urlMeta = sanitizeExternalUrl(rawUrl);
+    return traceExternalCall(
+      this.#perfLogger,
+      {
+        provider: "mcp",
+        operation: "external.mcp.http",
+        accountId,
+        attributes: {
+          httpMethod,
+          ...urlMeta,
+        },
+      },
+      () => this.#executeFetchOutbound(accountId, rawUrl, init),
+      {
+        statusFromResult: (response) => response.status,
+        fallbackErrorCode: MCP_ERROR_CODES.UPSTREAM_UNAVAILABLE,
+      },
+    );
+  }
+
+  async #executeFetchOutbound(accountId: string, rawUrl: string, init: McpFetchInit): Promise<McpFetchResponse> {
     const url = assertOutboundUrl(rawUrl, this.#policy);
+    /*
+     * A call the caller cancelled before entry is refused here. `fetch` would refuse to start it
+     * too, but only after a body was assembled and a slot taken, and the answer would say the peer
+     * was unreachable when nothing was ever sent.
+     */
+    if (init.signal?.aborted === true) throw unreachable({ cause: "aborted" });
     /*
      * The counter is taken before resolving, not after. A DNS lookup is a network round trip the
      * Account asked for, so a hostile Server answering with many distinct names could otherwise spend
@@ -171,13 +218,37 @@ export class McpOutboundFetcher {
     }
     this.#inFlight.set(accountId, (this.#inFlight.get(accountId) ?? 0) + 1);
     try {
-      await this.#assertPublicDestination(url);
-      return await this.#perform(url, init);
+      return await this.#request(url, init);
     } finally {
       const remaining = (this.#inFlight.get(accountId) ?? 1) - 1;
       if (remaining <= 0) this.#inFlight.delete(accountId);
       else this.#inFlight.set(accountId, remaining);
     }
+  }
+
+  /**
+   * The address check and the request, under one deadline and one cancellation.
+   *
+   * The budget covers the resolver too, which is the whole point: a lookup the Account asked for is
+   * part of the call, so it cannot be free of the deadline that bounds it, and a held resolver must
+   * not keep a concurrency slot for the transport's whole budget. The slot is released by
+   * `fetchOutbound` when this settles, which is at the deadline rather than after the resolver.
+   */
+  #request(url: URL, init: McpFetchInit): Promise<McpFetchResponse> {
+    return withOutboundDeadline(
+      {
+        timeoutMs: this.#timeoutMs,
+        ...(init.signal === undefined ? {} : { signal: init.signal }),
+        failure: (reason) => unreachable({ cause: reason }),
+      },
+      async (deadline) => {
+        await this.#assertPublicDestination(url);
+        // The resolver cannot be interrupted, so it may answer after this call already failed. No
+        // request may follow it: that would spend the Account's slot on a call nobody is waiting for.
+        deadline.throwIfEnded();
+        return this.#perform(url, init, deadline.signal);
+      },
+    );
   }
 
   /**
@@ -208,7 +279,7 @@ export class McpOutboundFetcher {
     const verdict = await classifyOutboundDestination(url, this.#resolveAddresses);
     if (verdict.ok) return;
     if (verdict.failure.kind === "unreachable") {
-      throw new McpServiceError(MCP_ERROR_CODES.UPSTREAM_UNAVAILABLE, "The MCP endpoint could not be reached", {
+      throw unreachable({
         ...(verdict.failure.cause === undefined ? {} : { cause: verdict.failure.cause }),
         host: verdict.failure.host,
       });
@@ -216,45 +287,55 @@ export class McpOutboundFetcher {
     throw blocked("The outbound URL resolves to a non-public address", { host: verdict.failure.host });
   }
 
-  async #perform(url: URL, init: McpFetchInit): Promise<McpFetchResponse> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
-    const externalAbort = () => controller.abort();
-    init.signal?.addEventListener("abort", externalAbort, { once: true });
+  async #perform(url: URL, init: McpFetchInit, signal: AbortSignal): Promise<McpFetchResponse> {
     try {
       const response = await this.#fetch(url, {
         method: init.method ?? "GET",
         headers: init.headers,
         body: init.body,
         redirect: REDIRECT_MODE,
-        signal: controller.signal,
+        signal,
       });
       if (response.status >= 300 && response.status < 400) {
         // Never read or dial `Location`: the gate cannot approve a destination the peer chose.
+        await discardBody(response);
         throw blocked("The MCP endpoint returned a redirect");
       }
       const text = await readBoundedBody(response, this.#maxResponseBytes);
       return { status: response.status, headers: response.headers, text };
     } catch (error) {
       if (error instanceof McpServiceError) throw error;
-      throw new McpServiceError(MCP_ERROR_CODES.UPSTREAM_UNAVAILABLE, "The MCP endpoint could not be reached", {
-        cause: error instanceof Error ? error.name : typeof error,
-      });
-    } finally {
-      clearTimeout(timer);
-      init.signal?.removeEventListener("abort", externalAbort);
+      throw unreachable({ cause: error instanceof Error ? error.name : typeof error });
     }
+  }
+}
+
+/**
+ * Close a response body this call will not read.
+ *
+ * An unread body keeps the connection — and everything the peer is still sending — alive until the
+ * peer stops or the process does. The caller has already refused the answer, so there is nothing to
+ * wait for: cancelling the stream closes the socket, while draining it would bill this deployment
+ * for the bytes of a body it decided not to use.
+ */
+async function discardBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Already closed or errored: nothing is left to release.
   }
 }
 
 /**
  * Read at most `limit` bytes. The declared `Content-Length` is checked first so an oversized body is
  * refused without buffering it, and the stream is abandoned once the running total exceeds the bound
- * in case the declaration lied.
+ * in case the declaration lied. Both refusals close the body rather than read it, for the reason in
+ * {@link discardBody}.
  */
 async function readBoundedBody(response: Response, limit: number): Promise<string> {
   const declared = Number(response.headers.get("content-length") ?? "");
   if (Number.isFinite(declared) && declared > limit) {
+    await discardBody(response);
     throw new McpServiceError(MCP_ERROR_CODES.UPSTREAM_ERROR, "The MCP response body is too large");
   }
   const body = response.body;

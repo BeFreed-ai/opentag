@@ -1,6 +1,6 @@
 ---
 title: "Database read/write standards"
-description: "Requirements for database design, atomic writes, authorization, read snapshots, locks, external effects, retries, and concurrency verification."
+description: "Requirements for database design, migrations, atomic writes, authorization, read snapshots, locks, external effects, retries, and concurrency verification."
 soft_links:
   - /system/agent-session-computer-model.md
   - /system/server-client-boundary.md
@@ -61,6 +61,24 @@ Finding a deviation does not authorize its implementation.
   [Observability](../operations/observability.md). A statement deadline,
   transaction idle timeout, transport deadline, and whole-operation budget
   cover different waits; document which component owns each applicable bound.
+
+## Migrations
+
+Run commands from the repository root; see the [migration policy](https://github.com/first-tree-ai/opentag/blob/main/packages/server/drizzle/README.md) for schema drift and rollback guidance.
+
+1. Generate SQL with `pnpm --filter @opentag/server db:generate`; add `--custom --name=describe_change` for custom SQL.
+2. Keep SQL, `meta/_journal.json`, and generated snapshots under `packages/server/drizzle/` together.
+   Journal tags must match SQL filenames without `.sql`; keep indexes and filename prefixes contiguous and timestamps increasing.
+3. Finalize SQL, then run `node scripts/check-migration-drift.mjs --update` to append `migration-hashes.json` entries.
+   Preserve merged history; reconcile only new migrations and metadata when concurrent changes collide.
+4. Match every `CURRENT_MIGRATION_COUNT` under `packages/server/src/__tests__/integration/` to the journal length.
+   Before opening a PR, run `pnpm check` and `pnpm --filter @opentag/server test:integration`
+   (requires Docker). The count check is covered by integration tests, not `pnpm check`.
+
+Startup migrations use a [short operation budget](../operations/observability.md).
+Large index builds and bulk backfills need a separate execution and compatibility design;
+measure their duration and lock impact before choosing an operation-specific limit.
+Do not widen the routine startup budget or rewrite merged migration history to accommodate them.
 
 ## 1. Atomic commit
 

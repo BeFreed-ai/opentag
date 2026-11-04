@@ -27,9 +27,14 @@ import {
   type PiDiagnosticSink,
   piDiagnosticError,
 } from "../observability/pi-diagnostics.js";
-import { PiAgentRuntimeFactory } from "../providers/pi/agent-runtime.js";
+import { PiAgentRuntimeFactory, piCloudAgentRuntimeEnvironment } from "../providers/pi/agent-runtime.js";
 import type { PiRpcProcessSpawnOptions } from "../providers/pi/rpc-wire.js";
-import { completionForError, completionForResult, type TurnCompletion } from "../runtime/agent-turn-runner.js";
+import {
+  buildAgentInput,
+  completionForError,
+  completionForResult,
+  type TurnCompletion,
+} from "../runtime/agent-turn-runner.js";
 import { serializeEnvironment } from "../runtime/im-credential-environment-manager.js";
 import {
   type ManagedSessionContext,
@@ -45,6 +50,7 @@ import {
   type CloudContextTreeStatus,
   prepareCloudContextTree,
 } from "./cloud-context-tree.js";
+import { cloudSteerResult, openCloudSteerControl } from "./cloud-steer-control.js";
 import {
   cloudSessionCliEnvironment,
   cloudWorkerInput,
@@ -103,7 +109,7 @@ const CLOUD_PI_IMAGE_INPUT_MODELS = new Set([
   "claude-opus-5.5",
 ]);
 /** The locked adapter lives with the Cloud image's Pi installation. */
-const CLOUD_PI_MCP_ADAPTER_ENTRY = "/opt/opentag/pi/node_modules/pi-mcp-adapter/index.ts";
+const CLOUD_PI_MCP_ADAPTER_ENTRY = "/opt/opentag/pi/node_modules/pi-mcp-adapter/opentag-runtime.mjs";
 
 const TURN_POLICY = {
   approvals: "never" as const,
@@ -208,6 +214,7 @@ export function cloudTurnPiDocuments(request: RunnerCloudWorkerRequest): {
         [CLOUD_MODEL_PI_PROVIDER]: {
           api: "openai-completions",
           baseUrl: model.baseUrl,
+          headers: { "x-opentag-model-retry-owner": "proxy" },
           // The Server-selected window and output budget travel with the grant verbatim: Pi's
           // native compaction works against this real contextWindow instead of Pi's 128K
           // custom-model default, and the output budget is the issued capability (never a
@@ -233,6 +240,8 @@ export function cloudTurnPiDocuments(request: RunnerCloudWorkerRequest): {
       // Pi native auto-compaction is explicitly enabled with its pinned defaults
       // (reserveTokens 16,384 / keepRecentTokens 20,000 stay untouched).
       compaction: { enabled: true },
+      // The model proxy owns retries; Pi must never replay an ambiguous or exhausted call.
+      retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } },
       defaultModel: `${CLOUD_MODEL_PI_PROVIDER}/${model.model}`,
       defaultProvider: CLOUD_MODEL_PI_PROVIDER,
     },
@@ -292,6 +301,7 @@ export interface CloudTurnPiFactory {
 }
 
 export interface CloudTurnPiRuntime {
+  steer?(request: import("../agent-runtime/types.js").AgentSteerRequest): Promise<void>;
   prompt(request: AgentPromptRequest): Promise<AgentRunResult>;
   close(): Promise<void>;
 }
@@ -537,7 +547,7 @@ export async function runCloudTurnWorker(
         process: {
           args: skillArgsOf(skillPaths),
           command: "pi",
-          env: environment,
+          env: piCloudAgentRuntimeEnvironment(environment),
           sessionDirectory,
           // E3 measured native Cloud Pi startup above the Local 5s default; keep the verified budget.
           probeTimeoutMs: 30_000,
@@ -572,7 +582,12 @@ export async function runCloudTurnWorker(
     const onAbort = () => terminateTrackedProcesses(pids);
     execution.signal.addEventListener("abort", onAbort, { once: true });
     let completion: TurnCompletion;
+    let steering: Awaited<ReturnType<typeof openWorkerSteering>>;
     try {
+      steering = await openWorkerSteering(request, activeRuntime, options).catch((error: unknown) => {
+        diagnostics.failure(error);
+        return undefined;
+      });
       const result = await activeRuntime.prompt({
         runId: randomTurnRunId(request),
         configuration,
@@ -589,6 +604,7 @@ export async function runCloudTurnWorker(
       completion = completionForError(error, execution.stopReason());
     } finally {
       execution.signal.removeEventListener("abort", onAbort);
+      await steering?.close().catch((error: unknown) => diagnostics.failure(error));
       await activeRuntime.close().catch(() => undefined);
       terminateTrackedProcesses(pids);
     }
@@ -771,4 +787,44 @@ async function prepareCliDirectories(environment: Record<string, string>, scratc
     await mkdir(directory, { mode: 0o700 });
     environment.LARKSUITE_CLI_CONFIG_DIR = directory;
   }
+}
+
+async function openWorkerSteering(
+  request: RunnerCloudWorkerRequest,
+  activeRuntime: CloudTurnPiRuntime,
+  options: CloudTurnWorkerRunOptions,
+) {
+  return request.kind === "turn" && request.steering
+    ? await openCloudSteerControl({
+        deliveryId: request.delivery.deliveryId,
+        token: request.steering.token,
+        steer: async (input) => {
+          if (
+            request.kind !== "turn" ||
+            !request.steering ||
+            input.rootDeliveryId !== request.delivery.deliveryId ||
+            input.expectedTurnId !== request.steering.turnId ||
+            input.sessionId !== request.delivery.sessionId ||
+            input.agentId !== request.delivery.agentId ||
+            input.placementGeneration !== request.delivery.placementGeneration
+          )
+            return cloudSteerResult(input, "rejected", "target_mismatch");
+          if (!activeRuntime.steer) return cloudSteerResult(input, "deferred", "steer_unsupported");
+          try {
+            await activeRuntime.steer({
+              expectedRunId: randomTurnRunId(request),
+              input: buildAgentInput(
+                input,
+                undefined,
+                request.delivery.runtime,
+                new Date(options.now?.() ?? Date.now()),
+              ),
+            });
+            return cloudSteerResult(input, "steered");
+          } catch {
+            return cloudSteerResult(input, "deferred", "steer_state_unknown");
+          }
+        },
+      })
+    : undefined;
 }

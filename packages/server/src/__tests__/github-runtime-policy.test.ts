@@ -3,6 +3,7 @@ import type { GitHubConnectionStatus, RuntimeExecutionSource } from "@opentag/sh
 import { describe, expect, it, vi } from "vitest";
 import type { DatabaseClient } from "../db/client.js";
 import type { RuntimeExecutionRecord } from "../runtime-credentials/types.js";
+import { AgentGitHubAuthorizationError } from "../services/github/agent-github-credential-service.js";
 import type { GitHubManagementService } from "../services/github/github-management-service.js";
 import { GitHubRuntimePolicy } from "../services/github-proxy/runtime-policy.js";
 
@@ -59,7 +60,10 @@ function fixture() {
       return chain;
     },
   } as unknown as DatabaseClient;
-  const getOverview = vi.fn(async () => ({ connection }));
+  const getOverview = vi.fn(async () => ({
+    connection:
+      connection.status === "active" && Date.parse(connection.accessExpiresAt ?? "") > Date.now() ? connection : null,
+  }));
   const resolveRepository = vi.fn(async () => ({
     installationId: "100",
     repositoryId: "200",
@@ -79,6 +83,7 @@ function fixture() {
     connection,
     execution,
     resolveRepository,
+    getOverview,
     setDelivery: (value: boolean) => {
       delivery = value;
     },
@@ -92,6 +97,37 @@ function fixture() {
 }
 const target = { fullName: "acme/explicit", access: "read" as const };
 describe("GitHub user-task authority", () => {
+  it.each(["github_connector_disabled", "github_connector_unsupported"] as const)(
+    "denies %s without reporting a retryable owner failure",
+    async (code) => {
+      const f = fixture();
+      f.getOverview.mockRejectedValue(new AgentGitHubAuthorizationError(code));
+      expect(await f.policy.admit(f.input())).toBeUndefined();
+    },
+  );
+  it("preserves infrastructure failures instead of misclassifying them as missing authorization", async () => {
+    const f = fixture();
+    f.getOverview.mockRejectedValue(new Error("database unavailable"));
+    await expect(f.policy.admit(f.input())).rejects.toThrow("database unavailable");
+  });
+  it("authorizes GitHub only for the context-tree purpose; ordinary execution and validation are denied", async () => {
+    const f = fixture();
+    const request = (purpose: "execution" | "context-tree" | "validation") => ({
+      accountId: ACCOUNT,
+      agentId: AGENT,
+      sessionId: SESSION,
+      provider: "github" as const,
+      bindingId: BINDING_ID,
+      sessionBindingId: randomUUID(),
+      source: f.execution.source,
+      purpose,
+    });
+    expect(await f.policy.authorize(request("context-tree"))).toBe("permit");
+    expect(await f.policy.authorize(request("execution"))).toBe("deny");
+    expect(await f.policy.authorize(request("validation"))).toBe("deny");
+    // A context-tree request naming some other binding is still refused.
+    expect(await f.policy.authorize({ ...request("context-tree"), bindingId: randomUUID() })).toBe("deny");
+  });
   it("admits an accepted human task without discovering or recording any repositories", async () => {
     const f = fixture();
     expect(await f.policy.admit(f.input())).toEqual({

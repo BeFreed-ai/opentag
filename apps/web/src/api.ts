@@ -2,6 +2,9 @@ import {
   type AccountCloudComputerEnsureResponse,
   AccountCloudComputerEnsureResponseSchema,
   type AccountComputerConnectCodeIssueRequest,
+  type AccountSandboxRunnerStatusResponse,
+  AccountSandboxRunnerStatusResponseSchema,
+  type AccountSandboxRunnerStopRequest,
   type AccountSetupCompletion,
   AccountSetupCompletionSchema,
   type AccountSetupResetMode,
@@ -31,6 +34,8 @@ import {
   accountComputerByIdPath,
   accountComputerConnectCodePath,
   accountComputerDisconnectPath,
+  accountSandboxRunnerPath,
+  accountSandboxRunnerStopPath,
   agentByIdPath,
   agentCloudPath,
   agentComputerRebindPath,
@@ -86,6 +91,7 @@ import {
   ComputerConnectCodeIssueResponseSchema,
   type ComputerConnectCodeStatus,
   ComputerConnectCodeStatusSchema,
+  ConnectMCPOAuthResponseSchema,
   type ContextTreeOperationRequest,
   type ContextTreeOperationResponse,
   ContextTreeOperationResponseSchema,
@@ -170,6 +176,7 @@ import {
   type RemoteSkillSelection,
   type ResolveRemoteSkillsResponse,
   ResolveRemoteSkillsResponseSchema,
+  ReusableMCPInstallationResponseSchema,
   type SaveSlackConfigurationRequest,
   type SetMCPAuthorizationRequest,
   SKILL_FORMAT_HEADER,
@@ -197,12 +204,22 @@ import {
   type StartSlackOAuthResponse,
   StartSlackOAuthResponseSchema,
   TaskCancelResponseSchema,
+  type TaskCollaborationMessagePage,
+  TaskCollaborationMessagePageSchema,
   type TaskDetail,
-  TaskDetailSchema,
+  type TaskDetailPage,
+  TaskDetailPageSchema,
+  type TaskDetailSection,
+  type TaskInternalSessionPage,
+  TaskInternalSessionPageSchema,
   type TaskTitleUpdateRequest,
   TaskTitleUpdateResponseSchema,
+  type TaskTurnPage,
+  TaskTurnPageSchema,
   taskByIdPath,
   taskCancelPath,
+  taskDetailPath,
+  taskDetailSectionPath,
   taskRepliesPath,
   type UnbindAgentMessagingRequest,
   type UpdateAgentRequest,
@@ -252,34 +269,46 @@ export class CancelledRequestError extends Error {
 
 /** Covers one Agent setup snapshot read: fetch, body, and diagnostic clones. */
 export const AGENT_SETUP_READ_TIMEOUT_MS = 10_000;
+/** Covers the Server's 480-second seal wait and the final response. */
+export const CLOUD_WORKSPACE_RELEASE_TIMEOUT_MS = 510_000;
 
 /**
  * Bounds `run` in elapsed time even when the AbortSignal is ignored. Fetch cancellation is
  * best-effort; the deadline itself always rejects, including while a response body is hanging.
+ * An optional observer signal cancels through baseline abort events, with listener cleanup.
  */
-export async function withDeadline<T>(timeoutMs: number, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+export async function withDeadline<T>(
+  timeoutMs: number,
+  run: (signal: AbortSignal) => Promise<T>,
+  externalSignal?: AbortSignal,
+): Promise<T> {
+  if (externalSignal?.aborted) throw new CancelledRequestError(externalSignal.reason);
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
-  let timedOut = false;
-  const timeoutError = (): CancelledRequestError => {
-    const cause = new Error("The operation timed out.");
-    cause.name = "TimeoutError";
-    return new CancelledRequestError(cause);
-  };
-  const operation = Promise.resolve().then(() => run(controller.signal));
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      timedOut = true;
-      const error = timeoutError();
+  let onAbort: (() => void) | undefined;
+  const cancellation = new Promise<never>((_, reject) => {
+    const cancel = (error: CancelledRequestError) => {
       controller.abort(error);
       reject(error);
+    };
+    onAbort = () => cancel(new CancelledRequestError(externalSignal?.reason));
+    externalSignal?.addEventListener("abort", onAbort, { once: true });
+    timer = setTimeout(() => {
+      const cause = new Error("The operation timed out.");
+      cause.name = "TimeoutError";
+      cancel(new CancelledRequestError(cause));
     }, timeoutMs);
   });
+  const operation = Promise.resolve().then(() => {
+    // The observer can disappear before this microtask starts the transport.
+    if (controller.signal.aborted) throw controller.signal.reason;
+    return run(controller.signal);
+  });
   try {
-    return await Promise.race([operation, timeout]);
+    return await Promise.race([operation, cancellation]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
-    if (timedOut) void operation.catch(() => undefined);
+    if (onAbort) externalSignal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -297,6 +326,64 @@ export class ApiError extends Error {
     super(message);
     this.name = "ApiError";
   }
+}
+
+function generateRequestId(): string {
+  return globalThis.crypto?.randomUUID
+    ? globalThis.crypto.randomUUID()
+    : `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function extractTraceId(headers: Headers): string | undefined {
+  return headers.get("x-trace-id") ?? headers.get("traceparent")?.split("-")[1] ?? undefined;
+}
+
+async function reportHttpFailure(
+  reporter: DiagnosticReporter,
+  apiError: (response: Response, body: unknown) => ApiError,
+  path: string,
+  response: Response,
+  requestId: string,
+): Promise<void> {
+  const body = await response
+    .clone()
+    .json()
+    .catch(() => undefined);
+  const error = apiError(response, body);
+  const level = response.status >= 500 ? "error" : "warn";
+  const traceId = extractTraceId(response.headers);
+  reporter.report(
+    {
+      source: "api",
+      code: error.code ?? `http_${response.status}`,
+      routeTemplate: routeTemplate(path),
+      status: response.status,
+      category: error.category,
+      requestId: error.requestId ?? requestId,
+      ...(traceId ? { traceId } : {}),
+      retryAfterSeconds: error.retryAfterSeconds,
+    },
+    level,
+  );
+}
+
+function handleFetchException(
+  reporter: DiagnosticReporter,
+  cause: unknown,
+  signal: AbortSignal | null | undefined,
+  path: string,
+): never {
+  if (signal?.aborted || (cause instanceof Error && cause.name === "AbortError")) {
+    throw new CancelledRequestError(cause);
+  }
+  const normalized = normalizeError(cause, "network_error");
+  reporter.report({
+    source: "api",
+    code: normalized.code,
+    routeTemplate: routeTemplate(path),
+    error: { name: normalized.error.name },
+  });
+  throw cause;
 }
 
 export class BrowserApi {
@@ -366,9 +453,37 @@ export class BrowserApi {
     return this.request(`${HTTP_PATHS.accountTasks}${suffix}`, ListTasksResponseSchema);
   }
 
-  task(sessionId: string, cursor?: string): Promise<TaskDetail> {
+  /**
+   * The bounded Task detail: one page of the named sections — all of them when none is named — each
+   * with its own cursor. Naming a subset is what keeps a view from paying for a section it discards;
+   * the legacy complete answer at `taskByIdPath` is not read here, so no view can depend on an
+   * unbounded section.
+   */
+  taskDetail(sessionId: string, sections?: readonly TaskDetailSection[]): Promise<TaskDetailPage> {
+    const query = sections ? `?${new URLSearchParams({ sections: sections.join(",") }).toString()}` : "";
+    return this.request(`${taskDetailPath(sessionId)}${query}`, TaskDetailPageSchema);
+  }
+
+  taskTurns(sessionId: string, cursor?: string): Promise<TaskTurnPage> {
+    return this.#taskSection(sessionId, "turns", cursor, TaskTurnPageSchema);
+  }
+
+  taskInternalSessions(sessionId: string, cursor?: string): Promise<TaskInternalSessionPage> {
+    return this.#taskSection(sessionId, "internal-sessions", cursor, TaskInternalSessionPageSchema);
+  }
+
+  taskCollaborationMessages(sessionId: string, cursor?: string): Promise<TaskCollaborationMessagePage> {
+    return this.#taskSection(sessionId, "collaboration-messages", cursor, TaskCollaborationMessagePageSchema);
+  }
+
+  #taskSection<T>(
+    sessionId: string,
+    section: "turns" | "internal-sessions" | "collaboration-messages",
+    cursor: string | undefined,
+    schema: RuntimeSchema<T>,
+  ): Promise<T> {
     const query = cursor ? `?${new URLSearchParams({ cursor }).toString()}` : "";
-    return this.request(`${taskByIdPath(sessionId)}${query}`, TaskDetailSchema);
+    return this.request(`${taskDetailSectionPath(sessionId, section)}${query}`, schema);
   }
 
   /** The Task's platform-confirmed outbound replies, paged independently of its Turns. */
@@ -627,8 +742,10 @@ export class BrowserApi {
     });
   }
 
-  slackConfiguration(agentId: string): Promise<SlackConfigurationView> {
-    return this.request(agentSlackConfigurationPath(agentId), SlackConfigurationViewSchema);
+  slackConfiguration(agentId: string, signal?: AbortSignal): Promise<SlackConfigurationView> {
+    return this.request(agentSlackConfigurationPath(agentId), SlackConfigurationViewSchema, {
+      ...(signal ? { signal } : {}),
+    });
   }
 
   saveSlackConfiguration(agentId: string, input: SaveSlackConfigurationRequest): Promise<SlackConfigurationResult> {
@@ -687,6 +804,26 @@ export class BrowserApi {
   agentCloudOverview(agentId: string, options: { cursor?: string; limit?: number } = {}): Promise<AgentCloudOverview> {
     return withDeadline(AGENT_SETUP_READ_TIMEOUT_MS, (signal) =>
       this.request(agentCloudPath(agentId, options), AgentCloudOverviewSchema, { signal }),
+    );
+  }
+
+  cloudWorkspaceStatus(sandboxId: string): Promise<AccountSandboxRunnerStatusResponse> {
+    return withDeadline(AGENT_SETUP_READ_TIMEOUT_MS, (signal) =>
+      this.request(accountSandboxRunnerPath(sandboxId), AccountSandboxRunnerStatusResponseSchema, { signal }),
+    );
+  }
+
+  releaseCloudWorkspace(
+    sandboxId: string,
+    input: AccountSandboxRunnerStopRequest,
+  ): Promise<AccountSandboxRunnerStatusResponse> {
+    return withDeadline(CLOUD_WORKSPACE_RELEASE_TIMEOUT_MS, (signal) =>
+      this.request(accountSandboxRunnerStopPath(sandboxId), AccountSandboxRunnerStatusResponseSchema, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...this.csrfHeaders() },
+        body: JSON.stringify(input),
+        signal,
+      }),
     );
   }
 
@@ -789,6 +926,18 @@ export class BrowserApi {
     return this.request(mcpServerPath(mcpServerId), MCPServerDetailSchema);
   }
 
+  reusableMcpInstallation(agentId: string, input: CreateMCPServerRequest, scopes: readonly string[] = []) {
+    return this.request(
+      `${agentMcpServersPath(agentId)}/reusable-installation`,
+      ReusableMCPInstallationResponseSchema,
+      {
+        method: "POST",
+        body: JSON.stringify({ ...input, scopes }),
+        headers: { "content-type": "application/json", ...this.csrfHeaders() },
+      },
+    );
+  }
+
   createMcpServer(input: CreateMCPServerRequest): Promise<MCPServer> {
     return this.request(mcpServersPath(), MCPServerSchema, {
       method: "POST",
@@ -814,6 +963,14 @@ export class BrowserApi {
 
   agentMcpServers(agentId: string): Promise<ListAgentMCPServersResponse> {
     return this.request(agentMcpServersPath(agentId), ListAgentMCPServersResponseSchema);
+  }
+
+  connectMcpOAuth(agentId: string, mcpServerId: string, scopes: readonly string[] = []) {
+    return this.request(`${agentMcpAuthorizationPath(agentId, mcpServerId)}/connect`, ConnectMCPOAuthResponseSchema, {
+      method: "POST",
+      body: JSON.stringify({ scopes }),
+      headers: { "content-type": "application/json", ...this.csrfHeaders() },
+    });
   }
 
   availableMcpServers(agentId: string): Promise<ListAvailableMCPServersResponse> {
@@ -1060,7 +1217,7 @@ export class BrowserApi {
     const response = await this.fetchWithRefresh(path, init);
     const body = await response.json().catch(() => undefined);
     if (!response.ok) throw this.apiError(response, body);
-    return this.parseResponse(path, schema, body);
+    return this.parseResponse(path, schema, body, response);
   }
 
   private async requestOptional<T>(
@@ -1072,7 +1229,7 @@ export class BrowserApi {
     if (response.status === 204) return undefined;
     const body = await response.json().catch(() => undefined);
     if (!response.ok) throw this.apiError(response, body);
-    return this.parseResponse(path, schema, body);
+    return this.parseResponse(path, schema, body, response);
   }
 
   private async requestNoContent(path: string, init: RequestInit): Promise<void> {
@@ -1085,8 +1242,13 @@ export class BrowserApi {
    * is genuinely gone, and the retry this used to make could only ever have failed a second time.
    */
   private async fetchWithRefresh(path: string, init: RequestInit = {}): Promise<Response> {
+    const requestId = generateRequestId();
+    const headers = new Headers(init.headers);
+    if (!headers.has("x-request-id")) {
+      headers.set("x-request-id", requestId);
+    }
     const method = (init.method ?? "GET").toString().toUpperCase();
-    if (!init.signal?.aborted && !isSafeMethod(method) && !isTokenMintingPath(path) && !hasCsrfHeader(init.headers)) {
+    if (!init.signal?.aborted && !isSafeMethod(method) && !isTokenMintingPath(path) && !hasCsrfHeader(headers)) {
       this.diagnosticReporter.report({
         source: "api",
         code: "csrf_token_missing",
@@ -1096,36 +1258,13 @@ export class BrowserApi {
     }
 
     try {
-      const response = await this.fetchImpl(path, { ...init, credentials: "same-origin" });
+      const response = await this.fetchImpl(path, { ...init, headers, credentials: "same-origin" });
       if (!response.ok) {
-        const body = await response
-          .clone()
-          .json()
-          .catch(() => undefined);
-        const error = this.apiError(response, body);
-        this.diagnosticReporter.report({
-          source: "api",
-          code: error.code ?? `http_${response.status}`,
-          routeTemplate: routeTemplate(path),
-          status: response.status,
-          category: error.category,
-          requestId: error.requestId,
-          retryAfterSeconds: error.retryAfterSeconds,
-        });
+        await reportHttpFailure(this.diagnosticReporter, (res, b) => this.apiError(res, b), path, response, requestId);
       }
       return response;
     } catch (cause) {
-      if (init.signal?.aborted || (cause instanceof Error && cause.name === "AbortError")) {
-        throw new CancelledRequestError(cause);
-      }
-      const normalized = normalizeError(cause, "network_error");
-      this.diagnosticReporter.report({
-        source: "api",
-        code: normalized.code,
-        routeTemplate: routeTemplate(path),
-        error: { name: normalized.error.name },
-      });
-      throw cause;
+      handleFetchException(this.diagnosticReporter, cause, init.signal, path);
     }
   }
 
@@ -1147,19 +1286,26 @@ export class BrowserApi {
     );
   }
 
-  private parseResponse<T>(path: string, schema: RuntimeSchema<T>, body: unknown): T {
+  private parseResponse<T>(path: string, schema: RuntimeSchema<T>, body: unknown, response?: Response): T {
     const parsed = schema.safeParse(body);
     if (parsed.success) return parsed.data;
     const issues = parsed.error.issues.map(({ path: issuePath, code }) => ({
       path: issuePath.map((segment) => (typeof segment === "symbol" ? segment.toString() : segment)),
       code,
     }));
-    this.diagnosticReporter.report({
-      source: "api",
-      code: "invalid_response_schema",
-      routeTemplate: routeTemplate(path),
-      issues: issues.map(({ path: issuePath, code }) => ({ path: issuePath, code })),
-    });
+    const requestId = response?.headers.get("x-request-id") ?? undefined;
+    const traceId = response ? extractTraceId(response.headers) : undefined;
+    this.diagnosticReporter.report(
+      {
+        source: "api",
+        code: "invalid_response_schema",
+        routeTemplate: routeTemplate(path),
+        ...(requestId ? { requestId } : {}),
+        ...(traceId ? { traceId } : {}),
+        issues: issues.map(({ path: issuePath, code }) => ({ path: issuePath, code })),
+      },
+      "error",
+    );
     throw new ResponseSchemaError(routeTemplate(path), issues);
   }
 

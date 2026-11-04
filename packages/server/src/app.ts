@@ -1,15 +1,24 @@
 import { createHash, randomUUID } from "node:crypto";
+import os from "node:os";
 import fastifyOpenTelemetry from "@autotelic/fastify-opentelemetry";
 import type { ChannelName } from "@opentag/shared";
 import {
   ErrorEnvelopeSchema,
   HTTP_PATHS,
+  RUNTIME_PROVIDER_PROXY_PATH,
   redactForLog,
   ServerDeepHealthSchema,
   ServerHealthSchema,
+  StructuredErrorCodeSchema,
 } from "@opentag/shared";
 import { DrizzleQueryError, sql } from "drizzle-orm";
-import Fastify, { type FastifyInstance, type FastifyLoggerOptions, type FastifyRequest, LogController } from "fastify";
+import Fastify, {
+  type FastifyInstance,
+  type FastifyLoggerOptions,
+  type FastifyRequest,
+  type FastifyServerOptions,
+  LogController,
+} from "fastify";
 import {
   type AccountRoutesOptions,
   type InternalNavigationVisibilityService,
@@ -38,7 +47,7 @@ import { registerComputerSkillRoutes } from "./api/computer-skills.js";
 import { registerComputerRoutes } from "./api/computers.js";
 import { type ErrorReportRoutesOptions, registerErrorReportRoutes } from "./api/error-reports.js";
 import { registerExecutionWebSocketRoutes } from "./api/execution-websockets.js";
-import { type GitHubIntegrationsRouteOptions, registerGitHubIntegrationsRoutes } from "./api/github-integrations.js";
+import { registerGitHubIntegrationsRoutes } from "./api/github-integrations.js";
 import { registerImBindingRoutes } from "./api/im-bindings.js";
 import { registerImResourceRoute } from "./api/im-resources.js";
 import { type McpGatewayRoutesOptions, registerMcpGatewayRoutes } from "./api/mcp-gateway.js";
@@ -71,7 +80,13 @@ import { BootstrapReadiness } from "./bootstrap-readiness.js";
 import type { CloudBilling } from "./cloud-billing.js";
 import type { DatabaseClient } from "./db/client.js";
 import { DATABASE_READINESS_TIMEOUT_MS } from "./db/readiness-probe.js";
-import { currentTraceId } from "./observability/index.js";
+import {
+  currentTraceId,
+  type PerformanceLogger,
+  type PerformanceLoggingConfig,
+  prepareAppPerformance,
+  registerHttpPerformanceHooks,
+} from "./observability/index.js";
 import type { AgentRuntimeOptionsService } from "./services/agents/agent-runtime-options-service.js";
 import type { ContextTreeOperationService } from "./services/agents/context-tree-operation-service.js";
 import {
@@ -115,7 +130,7 @@ import { registerWebApp } from "./web-app.js";
 export interface CreateAppOptions {
   /** Drizzle client used by the readiness probe. The production bootstrap also exposes it through TaskService. */
   database?: DatabaseClient;
-  /** Replaces the `select 1` on `database`; production passes a probe on its own connection. */
+  /** Production checks both dedicated connectivity and application-pool availability. */
   databaseReadinessProbe?: () => Promise<void>;
   authService?: UserAuthService;
   /** Publishes Better Auth's allowlisted endpoints and lets every authenticated route resolve its sessions. */
@@ -217,12 +232,15 @@ export interface CreateAppOptions {
   slackOAuth?: SlackOAuthRouteOptions;
   slackConfiguration?: SlackConfigurationRouteOptions;
   /** GitHub integration management; always registered so the UI can read availability. */
-  githubIntegrations?: Omit<GitHubIntegrationsRouteOptions, "authService" | "authOptions">;
   loggerStream?: FastifyLoggerOptions["stream"];
   loggerLevel?: FastifyLoggerOptions["level"];
+  performanceLogger?: PerformanceLogger;
+  performanceLogging?: Partial<PerformanceLoggingConfig>;
   /** Passed to Fastify; `false` (the default) ignores `X-Forwarded-*` entirely. */
   trustProxy?: boolean | string[];
   readiness?: BootstrapReadiness;
+  environment?: string;
+  revision?: string;
   /** Non-secret deployment proof from the responding process, independent of control-plane state. */
   deployment?: { revision?: string; runner?: { image: string; version: string } };
   runtime?: RuntimeRoutesOptions;
@@ -332,9 +350,19 @@ export function ignoreHttpTraceRoute(path: string): boolean {
   );
 }
 
-function disableProbeRequestLogging(request: FastifyRequest): boolean {
+function disableProbeRequestLogging(request: { url: string }): boolean {
   const pathname = sanitizeRequestUrl(request.url);
   return pathname === "/healthz" || pathname === "/readyz";
+}
+
+function shouldIgnoreHttpPerformanceRequest(request: { url: string }): boolean {
+  const pathname = sanitizeRequestUrl(request.url);
+  return (
+    disableProbeRequestLogging(request) ||
+    pathname === HTTP_PATHS.computerRuntimeWebSocket ||
+    pathname === HTTP_PATHS.sandboxRunnerWebSocket ||
+    pathname === RUNTIME_PROVIDER_PROXY_PATH
+  );
 }
 
 const MAX_ERROR_STACK_LENGTH = 8_192;
@@ -343,8 +371,17 @@ const MAX_ERROR_STACK_LENGTH = 8_192;
 const READINESS_ATTEMPT_MAX_AGE_MS = 10_000;
 const READINESS_MAX_LIVE_ATTEMPTS = 2;
 
-type SerializedError = { type: string; message: string; stack: string };
+type SerializedError = {
+  type: string;
+  message: string;
+  stack: string;
+  code?: string;
+  errorCode?: string;
+  cause?: SerializedError;
+};
 type DrizzleQueryErrorLike = { params?: unknown; query?: unknown };
+/** Bounds the deserialized cause chain so a cyclic or deep wrap cannot grow one log line without limit. */
+const SERIALIZED_ERROR_CAUSE_DEPTH = 3;
 
 function hasOwnField(value: object, key: string): boolean {
   return Object.hasOwn(value, key);
@@ -361,27 +398,85 @@ function redactLogString(value: string): string {
   return (typeof redacted === "string" ? redacted : String(redacted)).slice(0, MAX_ERROR_STACK_LENGTH);
 }
 
-function serializeError(error: unknown): SerializedError {
-  if (isDrizzleQueryError(error)) {
-    const parameterCount = Array.isArray(error.params) ? error.params.length : undefined;
-    const summary = redactLogString(
-      `Database query failed${parameterCount === undefined ? "" : ` (${parameterCount} parameter${parameterCount === 1 ? "" : "s"})`}`,
-    );
-    return {
-      type: "DrizzleQueryError",
-      message: summary,
-      stack: redactLogString(`DrizzleQueryError: ${summary}`),
-    };
-  }
+function isPlainObjectError(error: unknown): error is Record<string, unknown> {
+  return typeof error === "object" && error !== null && ("message" in error || "stack" in error);
+}
+
+function serializeDrizzleQueryError(error: DrizzleQueryError | (Error & DrizzleQueryErrorLike)): SerializedError {
+  const parameterCount = Array.isArray(error.params) ? error.params.length : undefined;
+  const summary = redactLogString(
+    `Database query failed${parameterCount === undefined ? "" : ` (${parameterCount} parameter${parameterCount === 1 ? "" : "s"})`}`,
+  );
+  return {
+    type: "DrizzleQueryError",
+    message: summary,
+    stack: redactLogString(`DrizzleQueryError: ${summary}`),
+  };
+}
+
+function serializePlainObjectError(candidate: Record<string, unknown>, depth: number): SerializedError {
+  const name = typeof candidate.name === "string" ? candidate.name : "Error";
+  const message = typeof candidate.message === "string" ? redactLogString(candidate.message) : "";
+  const stack = typeof candidate.stack === "string" ? redactLogString(candidate.stack) : `${name}: ${message}`;
+  const code =
+    typeof candidate.code === "string" &&
+    StructuredErrorCodeSchema.safeParse(candidate.code).success &&
+    redactLogString(candidate.code) === candidate.code
+      ? candidate.code
+      : undefined;
+  const cause =
+    candidate.cause !== undefined && depth < SERIALIZED_ERROR_CAUSE_DEPTH
+      ? serializeError(candidate.cause, depth + 1)
+      : undefined;
+  return {
+    type: name,
+    message: message || name,
+    stack,
+    ...(code ? { code, errorCode: code } : {}),
+    ...(cause ? { cause } : {}),
+  };
+}
+
+function serializeError(error: unknown, depth = 0): SerializedError {
+  if (isDrizzleQueryError(error)) return serializeDrizzleQueryError(error);
   if (!(error instanceof Error)) {
+    if (isPlainObjectError(error)) {
+      return serializePlainObjectError(error, depth);
+    }
     const summary = redactLogString(String(error));
     return { type: typeof error, message: summary, stack: summary };
   }
+  const code = serializedErrorCode(error);
+  const cause =
+    error.cause !== undefined && depth < SERIALIZED_ERROR_CAUSE_DEPTH
+      ? serializeError(error.cause, depth + 1)
+      : undefined;
   return {
     type: error.name,
     message: redactLogString(error.message),
     stack: redactLogString(error.stack ?? `${error.name}: ${error.message}`),
+    ...(code ? { code, errorCode: code } : {}),
+    ...(cause ? { cause } : {}),
   };
+}
+
+/**
+ * The bounded structured code a thrown error carries, when it has one.
+ *
+ * Two separate guards, because neither is sufficient alone. `code` is provider-controlled and does
+ * not pass through the redaction that `message` and `stack` receive: an arbitrary string such as
+ * `token=...` would be logged verbatim. The shape check rejects that, but the shared pattern admits
+ * `:`, so a structurally valid `token:...` is still credential-shaped; that is why the value must
+ * also survive `redactLogString` unchanged. A non-matching or redaction-sensitive value is omitted
+ * rather than replaced, because a fabricated or half-redacted code on a nested cause points the
+ * reader at the wrong failure. Numeric SQLSTATE codes such as `23505` are dropped by the shared
+ * pattern (it must start with a letter); accepted, because the diagnostic value is the query
+ * failure rather than the SQLSTATE number.
+ */
+function serializedErrorCode(error: Error): string | undefined {
+  const code = (error as { code?: unknown }).code;
+  if (typeof code !== "string" || !StructuredErrorCodeSchema.safeParse(code).success) return undefined;
+  return redactLogString(code) === code ? code : undefined;
 }
 
 class DatabaseReadinessTimeoutError extends Error {
@@ -455,9 +550,47 @@ function createDatabaseReadinessProbe(run: (() => Promise<unknown>) | undefined)
   };
 }
 
-function createFastifyLoggerOptions(options: CreateAppOptions): FastifyLoggerOptions {
+function truncateClientIp(ip: string | undefined): string | undefined {
+  if (!ip || typeof ip !== "string") return ip;
+  if (ip.startsWith("::ffff:") && ip.includes(".")) {
+    return `::ffff:${ip.slice(7).replace(/\.\d+$/, ".0")}`;
+  }
+  if (ip.includes(".")) {
+    return ip.replace(/\.\d+$/, ".0");
+  }
+  if (ip.includes(":")) {
+    const parts = ip.split("::");
+    let hextets: string[];
+    if (parts.length === 2) {
+      const left = parts[0] ? parts[0].split(":") : [];
+      const right = parts[1] ? parts[1].split(":") : [];
+      const missing = 8 - (left.length + right.length);
+      hextets = [...left, ...Array(missing).fill("0"), ...right];
+    } else {
+      hextets = ip.split(":");
+    }
+    const prefix = hextets.slice(0, 3).map((h) => h || "0");
+    return `${prefix.join(":")}::`;
+  }
+  return ip;
+}
+
+function createFastifyLoggerOptions(options: CreateAppOptions): NonNullable<FastifyServerOptions["logger"]> & object {
   return {
     level: options.loggerLevel ?? "info",
+    base: {
+      pid: process.pid,
+      hostname: os.hostname(),
+      service: "opentag-server",
+      ...(options.environment !== undefined ? { environment: options.environment } : {}),
+      ...((options.revision ?? options.deployment?.revision)
+        ? { revision: options.revision ?? options.deployment?.revision }
+        : {}),
+    },
+    mixin: () => {
+      const traceId = currentTraceId();
+      return traceId ? { traceId } : {};
+    },
     ...(options.loggerStream ? { stream: options.loggerStream } : {}),
     serializers: {
       err: serializeError,
@@ -465,7 +598,7 @@ function createFastifyLoggerOptions(options: CreateAppOptions): FastifyLoggerOpt
         method: request.method,
         url: sanitizeRequestUrl(request.url),
         host: request.hostname,
-        remoteAddress: request.ip,
+        remoteAddress: truncateClientIp(request.ip),
         remotePort: request.socket.remotePort,
       }),
     },
@@ -500,6 +633,7 @@ function logClassifiedFailure(request: FastifyRequest, failure: ClassifiedFailur
     {
       category: failure.category,
       code: failure.code,
+      errorCode: failure.code,
       err: error,
       requestId: request.id,
       statusCode: failure.statusCode,
@@ -593,6 +727,8 @@ export function createApp(options: CreateAppOptions = {}) {
   const databaseReadinessProbe = createDatabaseReadinessProbe(
     options.databaseReadinessProbe ?? (healthDatabase ? () => healthDatabase.execute(sql`select 1`) : undefined),
   );
+  const preparedPerformance = prepareAppPerformance(app, options);
+  options = preparedPerformance.options;
 
   registerSessionProofRoutes(app, options);
   registerPublicCatalog(app, options);
@@ -628,6 +764,10 @@ export function createApp(options: CreateAppOptions = {}) {
     reply.header("x-request-id", _request.id);
     const traceId = currentTraceId();
     if (traceId) reply.header("x-trace-id", traceId);
+  });
+  registerHttpPerformanceHooks(app, preparedPerformance.perfLogger, {
+    shouldIgnore: shouldIgnoreHttpPerformanceRequest,
+    sanitizeUrl: sanitizeRequestUrl,
   });
 
   // Anonymous by design: a failure before sign-in is still a failure worth seeing.
@@ -761,12 +901,12 @@ export function createApp(options: CreateAppOptions = {}) {
       registerImBindingRoutes(app, authService, options.imBindingService, options.feishuSetupService, authOptions);
     }
     registerSlackSetupRoutes(app, authService, options, authOptions);
-    if (options.githubIntegrations) {
-      registerGitHubIntegrationsRoutes(app, { ...options.githubIntegrations, authService, authOptions });
-    }
+    registerGitHubIntegrationsRoutes(app);
     if (options.mcp) {
       registerMcpServerRoutes(app, authService, { ...options.mcp, authOptions });
       registerMcpOAuthRoutes(app, {
+        authOptions,
+        authService,
         flows: options.mcp.flows,
         /*
          * The callback cannot probe cheaply itself, so the probe is fired here and not awaited. The

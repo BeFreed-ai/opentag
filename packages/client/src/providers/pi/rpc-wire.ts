@@ -6,6 +6,7 @@ import { signalWatchedProcess, spawnWatchedProcess } from "../process-owner.js";
 export const PI_RPC_MAX_LINE_BYTES = 8 * 1024 * 1024;
 export const PI_RPC_MAX_STDERR_BYTES = 64 * 1024;
 export const PI_RPC_REQUEST_TIMEOUT_MS = 60_000;
+export const PI_RPC_STARTUP_GET_STATE_TIMEOUT_MS = 180_000;
 
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -49,6 +50,8 @@ export interface PiRpcRequestOptions {
    * `close()` still back up.
    */
   readonly timeoutMs?: number | null;
+  /** Runs synchronously at a successful correlated response, before following wire events. */
+  readonly onResponse?: () => void;
 }
 
 export interface PiRpcClient {
@@ -188,7 +191,12 @@ export class PiRpcProcess implements PiRpcClient {
         timer,
         resolve: (value) => {
           cleanup();
-          resolve(value);
+          try {
+            options?.onResponse?.();
+            resolve(value);
+          } catch (error) {
+            reject(error);
+          }
         },
         reject: (error) => {
           cleanup();

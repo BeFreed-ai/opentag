@@ -172,7 +172,7 @@ every commit. CI runs the complete regression matrix and must pass before merge.
 | Documentation only | `pnpm check`; no application build or tests. Keep root Chinese mirrors synchronized. Markdown shipped as runtime input, such as bundled Skills, follows the affected package's validation scope. |
 | Behavior within one package | Relevant test files and the package's type check. Expand to the package suite when the impact spans the package or is unclear. |
 | Shared schemas, public exports, or cross-package contracts | Producer tests and affected consumer tests/type checks. Build changed exports before testing consumers. |
-| Database queries, transactions, locking, or persistence | Relevant server unit and PostgreSQL integration tests. A new migration requires the full integration suite and migration-count update in `AGENTS.md`. |
+| Database queries, transactions, locking, or persistence | Relevant server unit and PostgreSQL integration tests. New migrations follow the [migration requirements](./docs/system/database-read-write-standards.md#migrations). |
 | Agent Runtime implementation or tests covered by `vitest.agent-runtime.config.ts`, or that configuration | Focused tests, then `pnpm --filter @opentag/client test:agent-runtime:coverage`. Its 100% gate is authoritative on CI's Ubuntu host; report host-specific failures. |
 | Repository scripts or workflows | Relevant `scripts/__tests__/*.test.mjs` files and any build/package smoke checks exercised by the change. |
 | Build, exports, generated code, or packaging | Affected builds plus relevant tests and type checks. |
@@ -225,6 +225,23 @@ published port binds to `127.0.0.1`; remote Docker endpoints retain Docker's def
 `SELECT 1` with a five-second connection timeout before migrations or tests begin. If container health passes but this
 query fails, check Docker port forwarding: an open TCP port alone does not prove that PostgreSQL traffic reaches the
 container. The fixture closes the probe connection and removes the container on failure.
+
+### Container PostgreSQL probes
+
+Run `psql` and `pg_isready` inside containers with an explicit TCP host, normally `-h 127.0.0.1` or
+`--host=127.0.0.1`. The official Postgres image starts a socket-only server during initialization; only the final
+server answers TCP. This relies on the image setting `listen_addresses = '*'` in `postgresql.conf.sample`.
+Revisit the probes when mounting a custom `postgresql.conf` or changing the image family.
+
+`pnpm check` enforces this with `scripts/check-container-postgres-tcp.mjs`. It checks literal Docker argument lists
+and local argv-forwarding functions declared with `function` in JS/TS, simple Docker shell commands in `.sh` and
+workflow `run` steps, workflow service `options`, and Compose/Docker health commands. Keep these invocations explicit;
+dynamically assembled commands or imported wrappers
+need the checker extended alongside them. Host-side clients (including URL-based connections), image initialization
+scripts that intentionally use the temporary server, and `--help`/`--version` calls remain valid without this flag.
+Ordinary text and comments are not commands. This static check does not prove runtime readiness or validate custom
+Postgres configuration.
+Only `-h`/`--host` satisfies the container-side rule; `PGHOST` and connection-string host settings do not replace it.
 
 ### CI and full-suite reproduction
 

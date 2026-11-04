@@ -10,6 +10,8 @@ import {
   DirectImMessageDeliveryRequestSchema,
   ProviderFailureReasonSchema,
   RuntimeImOutboxContextSchema,
+  RuntimeImSteerRequestSchema,
+  RuntimeImSteerResultSchema,
   RuntimeModelSchema,
   RuntimeOpaqueIdSchema,
   SessionMessageDeliveryRequestSchema,
@@ -353,8 +355,10 @@ export const RunnerAuthFrameSchema = z
      * pinned E4 Runner image (handoff contract). Legacy E3 Runners never set it.
      */
     cloudDeliveryVersion: z.literal(RUNNER_CLOUD_DELIVERY_VERSION).optional(),
+    imInputVersion: z.literal(1).optional(),
     turnActivityVersion: z.literal(1).optional(),
     githubUserTaskVersion: z.literal(1).optional(),
+    contextTreeExecutionVersion: z.literal(1).optional(),
     workspaceVersion: z.literal(RUNNER_WORKSPACE_VERSION).optional(),
     /**
      * E8: opt in to Cloud Session collaboration at a specific version. Only sent by a Runner
@@ -471,6 +475,36 @@ const RunnerCloudWebToolsSchema = z
     socketPath: z.string().startsWith("/").max(200),
   })
   .strict();
+
+export const RunnerCloudSteerFrameSchema = z
+  .object({
+    type: z.literal("delivery:steer"),
+    requestId: z.string().uuid(),
+    steer: RuntimeImSteerRequestSchema,
+  })
+  .strict()
+  .refine((frame) => frame.requestId === frame.steer.requestId, "Steer request identity mismatch");
+export const RunnerCloudSteerResultFrameSchema = z
+  .object({
+    type: z.literal("delivery:steer:result"),
+    requestId: z.string().uuid(),
+    inputHash: z.string().regex(/^[a-f0-9]{64}$/),
+    result: RuntimeImSteerResultSchema,
+  })
+  .strict()
+  .refine((frame) => frame.requestId === frame.result.requestId, "Steer result identity mismatch");
+export const RunnerCloudSteerAckFrameSchema = z
+  .object({
+    type: z.literal("delivery:steer:ack"),
+    requestId: z.string().uuid(),
+    deliveryId: z.string().uuid(),
+    inputHash: z.string().regex(/^[a-f0-9]{64}$/),
+    status: z.enum(["recorded", "conflict"]),
+  })
+  .strict();
+export type RunnerCloudSteerFrame = z.infer<typeof RunnerCloudSteerFrameSchema>;
+export type RunnerCloudSteerResultFrame = z.infer<typeof RunnerCloudSteerResultFrameSchema>;
+export type RunnerCloudSteerAckFrame = z.infer<typeof RunnerCloudSteerAckFrameSchema>;
 
 export const RunnerCloudDeliveryRunFrameSchema = z
   .object({
@@ -800,6 +834,7 @@ export const RunnerCloudTurnWorkerRequestSchema = z
     webTools: RunnerCloudWebToolsSchema.optional(),
     /** In-sandbox absolute path of the per-turn public material directory (proxy manifest). */
     executionDir: z.string().min(1).max(512),
+    steering: z.object({ turnId: RuntimeOpaqueIdSchema, token: z.string().uuid() }).strict().optional(),
     /**
      * Optional allocation-stable in-sandbox directory for Pi conversation continuity across the
      * turns of one Agent Session. When absent the worker uses its own default location inside the
@@ -915,6 +950,7 @@ export function serializeRunnerCloudSessionWorkerStdin(input: Omit<RunnerCloudSe
 }
 
 export const RunnerClientFrameSchema = z.discriminatedUnion("type", [
+  RunnerCloudSteerResultFrameSchema,
   RunnerAuthFrameSchema,
   RunnerHeartbeatFrameSchema,
   RunnerReadyFrameSchema,
@@ -944,8 +980,10 @@ export const RunnerWelcomeFrameSchema = z
      * Cloud journal reconciliation or Cloud frame handlers without it.
      */
     cloudDeliveryVersion: z.literal(RUNNER_CLOUD_DELIVERY_VERSION).optional(),
+    imInputVersion: z.literal(1).optional(),
     turnActivityVersion: z.literal(1).optional(),
     githubUserTaskVersion: z.literal(1).optional(),
+    contextTreeExecutionVersion: z.literal(1).optional(),
     /**
      * E4: verified Cloud UID of the CURRENT allocation, echoed by the Runner inside credential
      * execution-open sandbox facts. Required when `cloudDeliveryVersion` is present; a
@@ -1017,6 +1055,8 @@ export const RunnerServerCredentialFrameSchema = z
   .strict();
 
 export const RunnerServerFrameSchema = z.discriminatedUnion("type", [
+  RunnerCloudSteerFrameSchema,
+  RunnerCloudSteerAckFrameSchema,
   RunnerWelcomeFrameSchema,
   TurnActivityResultSchema,
   RunnerAuthResultFrameSchema,

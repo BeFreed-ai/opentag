@@ -246,6 +246,19 @@ have, verifies the sha256, and materializes it:
 | Codex | Agent-scoped only: `<workspace>/.agents/skills/<name>/`, or a per-Agent `CODEX_HOME`; otherwise out of v1 |
 | Pi | explicit `--skill <path>` arguments |
 
+Local Claude discovers its project Skills in `.claude/skills` through native configuration. OpenTag
+does not also link those paths into its private plugin. External packaged Skills, including Context
+Tree Skills, use the private plugin's per-Run namespace, `opentag-<random-id>:<name>`, as listed in the
+current native catalog. The unique name avoids shadowing a user plugin named `opentag`. Root comparison
+uses canonical filesystem paths so aliases of Agent Home do not offer a project Skill twice.
+This preserves the original resources. Native user plugins and Skills are separate from the
+platform's archive ownership and marker-based synchronization.
+
+Local Pi also discovers native user/project Skills. Platform paths stay explicit additions to
+that discovery; Pi owns canonical-path deduplication and native exclusion rules. The managed
+model-option query suppresses Skills and extensions and is not a loaded-Skill check. Inspect
+Pi's actual `get_commands` catalog from the Agent cwd to verify availability.
+
 **Codex materialization must be Agent-scoped.** The only acceptable targets are the workspace's
 `.agents/skills` or a per-Agent `CODEX_HOME`. The OS account home's `.agents/skills` is shared by
 every Agent on the Computer and is **never** a target or a fallback — writing there would expose one
@@ -436,8 +449,15 @@ A Skill the platform's own team owns is authored as a bundle under one of two ho
 
 `packages/skill-presets/skills/<name>/` is the **preset catalog**: these bundles ship with the
 product and are discoverable and installable through the routes above. One lives there today:
-`mcp-onboarding` tells an Agent how to find, mount, and verify an MCP Server for itself, and which of
-those steps only a human may take.
+`mcp-onboarding` tells an Agent to configure an MCP Server inside the current chat. The Agent branches on
+the operation first. An enable, disable, remove, or reauthorize request uses the mounted name from `self mcp
+list` and does not search or add. A new connection checks mounted and available definitions. A mounted Server
+whose authorization is missing, expired, revoked, or in error stays on that binding. A pending authorization
+waits on the link already sent and does not start a new OAuth flow. A Bearer key for an existing mount is
+written with `self mcp use`, not with another `add`. The Agent does not create a second definition. The Agent
+searches the catalog only when neither list has the Server, and asks the user to paste an MCP configuration
+when the catalog has no installable match. A reply that sends the user to the web console or the Connectors
+page is the failure this Skill forbids. The OAuth consent screen is the step only a human takes.
 
 Root `skills/<name>/` is the home for a first-party bundle that is not part of the discoverable
 catalog. `mcp-catalog-entry` lives there today: the operator's procedure for recording a remote

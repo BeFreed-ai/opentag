@@ -26,6 +26,7 @@ import {
 } from "@opentag/shared";
 import { outcomeAttrs, runtimeAttrs, setActiveSpanAttributes, tracePromise, withSpan } from "../observability/index.js";
 import type { ServiceLogger } from "../observability/service-logger.js";
+import { InboundReceiptPendingError } from "../services/im/inbound-admission.js";
 import { type ConnectionRegistry, RuntimeRegistrySendError } from "./connection-registry.js";
 import type { AcceptedDeliveryRecord, RecordedTurnRecord, RuntimeCustodyStore } from "./runtime-custody-store.js";
 import type { RuntimeBusinessContext, RuntimeBusinessOptions } from "./runtime-session.js";
@@ -271,7 +272,7 @@ export class RuntimeDomainOwner {
     for (const pending of this.#pending.values()) {
       clearTimeout(pending.timer);
       if (pending.kind === "steer") {
-        void this.#custody.releaseSteerDispatch(pending.request, pending.inputHash, "deferred").catch(() => undefined);
+        void this.#custody.releaseSteerDispatch(pending.request, pending.inputHash, "uncertain").catch(() => undefined);
       } else if (pending.kind === "delivery") {
         void this.#custody
           .releaseDeliveryDispatch(pending.request, pending.inputHash, "deferred")
@@ -416,6 +417,7 @@ export class RuntimeDomainOwner {
       computerId,
       instanceId,
     });
+    if (dispatch === "inbound_pending") throw new InboundReceiptPendingError();
     if (dispatch === "conflict") throw new RuntimeDomainConflictError("The steer dispatch conflicts");
     if (dispatch === "stale_generation") {
       throw new RuntimeDomainRequestError("stale_placement", "The steer dispatch placement is stale");
@@ -432,7 +434,8 @@ export class RuntimeDomainOwner {
         onDispatched,
       ) as Promise<RuntimeImSteerResult>;
     } catch (error) {
-      await this.#custody.releaseSteerDispatch(request, inputHash, "deferred").catch(() => undefined);
+      if (dispatch === "dispatched")
+        await this.#custody.releaseSteerDispatch(request, inputHash, "retry").catch(() => undefined);
       throw error;
     }
   }
@@ -604,6 +607,7 @@ export class RuntimeDomainOwner {
       computerId,
       instanceId,
     });
+    if (dispatch === "inbound_pending") throw new InboundReceiptPendingError();
     if (dispatch === "conflict") throw new RuntimeDomainConflictError("The delivery dispatch conflicts");
     if (dispatch === "stale_generation") {
       throw new RuntimeDomainRequestError("stale_placement", "The delivery dispatch placement is stale");
@@ -879,7 +883,7 @@ export class RuntimeDomainOwner {
       this.#pending.delete(request.requestId);
       if (pending.kind === "delivery") this.#rememberExpiredDelivery(pending);
       if (pending.kind === "steer") {
-        void this.#custody.releaseSteerDispatch(pending.request, pending.inputHash, "deferred").catch(() => undefined);
+        void this.#custody.releaseSteerDispatch(pending.request, pending.inputHash, "uncertain").catch(() => undefined);
       } else if (pending.kind === "delivery") {
         void this.#custody
           .releaseDeliveryDispatch(pending.request, pending.inputHash, "deferred")
@@ -923,7 +927,7 @@ export class RuntimeDomainOwner {
         if (pending.kind === "delivery") this.#rememberExpiredDelivery(pending);
         if (pending.kind === "steer") {
           void this.#custody
-            .releaseSteerDispatch(pending.request, pending.inputHash, "deferred")
+            .releaseSteerDispatch(pending.request, pending.inputHash, "uncertain")
             .catch(() => undefined);
         } else if (pending.kind === "delivery") {
           void this.#custody
@@ -1044,7 +1048,7 @@ export class RuntimeDomainOwner {
       if (custody === "conflict") throw new RuntimeDomainConflictError("The steer custody conflicts");
       if (custody === "stale_generation") return;
     } else {
-      const disposition = result.status === "retry" ? "retry" : "deferred";
+      const disposition = steerReleaseDisposition(result);
       const release = await this.#custody.releaseSteerDispatch(attempt.request, attempt.inputHash, disposition);
       if (release === "conflict") throw new RuntimeDomainConflictError("The steer dispatch release conflicts");
     }
@@ -1166,6 +1170,7 @@ export class RuntimeDomainOwner {
 }
 
 function runtimeDomainFailureAttrs(error: unknown): Record<string, unknown> {
+  if (error instanceof InboundReceiptPendingError) return outcomeAttrs("deferred", error.code);
   let code = "RUNTIME_REQUEST_FAILED";
   if (error instanceof RuntimeDomainConflictError) {
     code = "RUNTIME_REQUEST_CONFLICT";
@@ -1220,4 +1225,9 @@ function domainLaneKey(frame: ClientRuntimeBusinessFrame): string {
   }
   if (frame.type === "provider-cli:prewarm:result") return `provider-cli:prewarm:${frame.requestId}`;
   return `turn:${frame.turnId}`;
+}
+
+function steerReleaseDisposition(result: RuntimeImSteerResult): "retry" | "deferred" | "uncertain" {
+  if (result.status === "deferred" && result.reason === "steer_state_unknown") return "uncertain";
+  return result.status === "retry" ? "retry" : "deferred";
 }

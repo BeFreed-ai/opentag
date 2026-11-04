@@ -32,6 +32,28 @@ and an ordinary Feishu group, and the root itself in a Feishu topic group; a pri
 request nobody replied to report `sessionKind: "channel"` with no thread key, so the Web labels
 them by the conversation they came from.
 
+## Reading a Task
+
+`GET /api/v1/sessions/:id` is the legacy complete detail: a Turn page bounded by `limit`, plus every
+related Internal Session and collaboration message. It stays for readers written against that
+contract and is not the contract new readers use, because its section arrays are not bounded.
+
+`GET /api/v1/sessions/:id/detail` is the bounded detail: one page of the sections the caller names
+in `sections` — all three when it names none — each with its own `nextCursor`. The three sections
+also page independently at `/detail/turns`, `/detail/internal-sessions` and
+`/detail/collaboration-messages`, so a reader that needs more of one section asks for that section
+alone. Each section returns at most 100 rows and 20 by default. Naming a subset is the point of the
+contract: the Web conversation renders the summary and the Turns, asks for `sections=turns`, and
+never reads the Internal Session or collaboration history it would discard. Reading any of them
+resolves the topic and serves the requested sections from one read-only Repeatable Read transaction,
+so an authorized topic is read from a single snapshot and no wait spans external I/O.
+
+Every section cursor is the exact ordering key of the last row it returned: the timestamp at the
+microsecond precision PostgreSQL compares, not the millisecond a browser `Date` would keep, plus the
+row id. An ascending page therefore never re-reads the row it just returned and a descending page
+never steps over one; equal timestamps are ordered by id alone. The cursor is opaque and validated
+strictly, and a cursor that does not match the expected shape is a `400`.
+
 ## Executions and status
 
 The Task detail flattens the topic's messages and captured Agent replies into one oldest-to-newest
@@ -151,7 +173,14 @@ lock.
 A Task includes the internal Sessions that inherited its scope (channel and thread key, or the
 private chat) from a thread or private-chat Session, plus the internal Sessions a group's channel
 Session created while one of the topic's Turns was running, with their descendants. Collaboration
-messages are those exchanged by the topic's own Sessions and its internal Sessions.
+messages are those exchanged by the topic's own Sessions and its internal Sessions. A scheduled
+collaboration message has no source Session: it carries its scheduled origin instead, and belongs to
+the Task of the Session it targets. A message whose source and target both belong to the Task appears
+once.
+
+Internal Sessions are read earliest first, with ended Sessions included, so paging walks the whole
+attributed history rather than only what is alive now. Both sections page on `(createdAt, id)`; a
+message or Session is never repeated across pages.
 
 ## Boundaries
 
@@ -170,5 +199,7 @@ messages are those exchanged by the topic's own Sessions and its internal Sessio
 - A crashed Turn on a group's channel Session stays `running` until that Session accepts another
   delivery or the delivery deadline passes.
 - The list is computed per request from the Account's stored messages. Rollups decide the page
-  before any row resolves its title or Sessions; very large Accounts may later need an index on the
-  topic key.
+  before any row resolves its title or Sessions or execution; very large Accounts may later need an
+  index on the topic key. The topic rollups pair messages with their executions on the topic
+  identity — a concrete topic key by equality, a private chat's NULL key in its own branch — so a
+  page costs the rollup plus its own rows, not the product of two histories.

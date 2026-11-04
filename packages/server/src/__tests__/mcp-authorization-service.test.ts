@@ -246,6 +246,50 @@ describe("McpAuthorizationService.setBearerOrNone", () => {
       authorization.setBearerOrNone(ids.accountId, ids.agentId, ids.mcpServerId, { kind: "none" }),
     ).rejects.toMatchObject({ code: MCP_ERROR_CODES.BINDING_NOT_FOUND });
   });
+
+  /*
+   * The self-service source re-checks the owner's opt-in inside the write's own transaction. The
+   * authentication that preceded the request is not enough: an owner can revoke the opt-in while a
+   * request is in flight, and a credential written after that revocation is a credential the owner
+   * already refused.
+   */
+  it("refuses a self-service write once the owner has withdrawn the opt-in", async () => {
+    const ids = await seed();
+    const { authorization } = build();
+    await unit.database.update(agents).set({ selfConfigurationEnabled: false }).where(eq(agents.id, ids.agentId));
+
+    await expect(
+      authorization.setBearerOrNone(
+        ids.accountId,
+        ids.agentId,
+        ids.mcpServerId,
+        { kind: "bearer", bearerKey: "sk-secret" },
+        "agent-self",
+      ),
+    ).rejects.toMatchObject({ code: "AGENT_SELF_CONFIGURATION_DISABLED", statusCode: 403 });
+    expect(await unit.database.select().from(mcpServerAuthorizations)).toEqual([]);
+  });
+
+  it("still writes for the owner's own Account surface and for an opted-in Agent", async () => {
+    const ids = await seed();
+    const { authorization } = build();
+    // A human operator is not gated by an Agent's opt-in.
+    await authorization.setBearerOrNone(ids.accountId, ids.agentId, ids.mcpServerId, {
+      kind: "bearer",
+      bearerKey: "sk-human",
+    });
+    expect((await readRow(ids))?.kind).toBe("bearer");
+
+    await unit.database.update(agents).set({ selfConfigurationEnabled: true }).where(eq(agents.id, ids.agentId));
+    await authorization.setBearerOrNone(
+      ids.accountId,
+      ids.agentId,
+      ids.mcpServerId,
+      { kind: "bearer", bearerKey: "sk-agent" },
+      "agent-self",
+    );
+    expect((await readRow(ids))?.kind).toBe("bearer");
+  });
 });
 
 describe("McpAuthorizationService.revoke", () => {
@@ -371,10 +415,10 @@ describe("McpAuthorizationService.resolveActiveCredential", () => {
 });
 
 describe("McpAuthorizationService header construction", () => {
-  it("always uses Authorization: Bearer for OAuth, whatever the definition names", async () => {
+  it("always uses Authorization: Bearer for OAuth unless authHeader is x-lark-mcp-uat", async () => {
     /*
-     * The specification fixes the OAuth header name and forbids the token in the query string, so the
-     * effective `auth_header` is not consulted for this kind. The Agent's extra-header override is.
+     * Standard OAuth uses `Authorization: Bearer <token>` even when a shared definition sets
+     * `authHeader: "x-api-key"` for a bearer Agent, while honoring Feishu's `x-lark-mcp-uat`.
      */
     const ids = await seed();
     const { authorization, cipher } = build();
@@ -400,6 +444,19 @@ describe("McpAuthorizationService header construction", () => {
     });
     expect(await authorization.buildHeaders(ids.accountId, ids.agentId, ids.mcpServerId)).toEqual({
       authorization: "Bearer at_1",
+      "x-team": "agent",
+    });
+
+    await unit.database
+      .update(mcpServers)
+      .set({ authHeader: "x-lark-mcp-uat", authScheme: "" })
+      .where(eq(mcpServers.id, ids.mcpServerId));
+    await unit.database
+      .update(agentMcpServers)
+      .set({ authSchemeOverride: null })
+      .where(eq(agentMcpServers.agentId, ids.agentId));
+    expect(await authorization.buildHeaders(ids.accountId, ids.agentId, ids.mcpServerId)).toEqual({
+      "x-lark-mcp-uat": "at_1",
       "x-team": "agent",
     });
   });

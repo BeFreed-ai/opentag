@@ -315,6 +315,49 @@ describe("span helpers", () => {
   });
 });
 
+describe("server diagnostics", () => {
+  it("writes the structured context into the JSON payload beside the code", () => {
+    const error = vi.fn();
+    const report = createServerDiagnosticReporter(() => ({ error }) as never);
+    report("IM_DELIVERY_OPERATION_TIMEOUT", {
+      phase: "deliver",
+      deliveryId: "delivery-1",
+      agentId: "agent-1",
+      computerId: "computer-1",
+      attemptCount: 3,
+    });
+    expect(error).toHaveBeenCalledWith(
+      {
+        phase: "deliver",
+        deliveryId: "delivery-1",
+        agentId: "agent-1",
+        computerId: "computer-1",
+        attemptCount: 3,
+        code: "IM_DELIVERY_OPERATION_TIMEOUT",
+        errorCode: "IM_DELIVERY_OPERATION_TIMEOUT",
+      },
+      "Server diagnostic",
+    );
+  });
+
+  it("keeps a diagnostic context free of secrets and message bodies", () => {
+    const error = vi.fn();
+    const report = createServerDiagnosticReporter(() => ({ error }) as never);
+    report("IM_DELIVERY_RUNTIME_UNAVAILABLE", {
+      phase: "recover",
+      deliveryId: "delivery-2",
+      agentId: "agent-2",
+      computerId: "computer-2",
+      attemptCount: 1,
+      authorization: "Bearer top-secret",
+      messageBody: "PRIVATE_MESSAGE_BODY",
+    } as never);
+    const payload = error.mock.calls[0]?.[0];
+    expect(JSON.stringify(payload)).not.toContain("top-secret");
+    expect(JSON.stringify(payload)).not.toContain("PRIVATE_MESSAGE_BODY");
+  });
+});
+
 describe("background and WebSocket tracing", () => {
   it("supervises the Feishu maintenance timer with one event and counter", async () => {
     const events: unknown[] = [];
@@ -382,6 +425,13 @@ describe("background and WebSocket tracing", () => {
                 },
               ]),
             })),
+          })),
+          // The terminal write and its slot release commit in one transaction.
+          update: vi.fn(() => ({
+            set: vi.fn((values: Record<string, unknown>) => {
+              diagnosticWrites.push(values);
+              return { where: vi.fn(() => ({ returning: vi.fn().mockResolvedValue([]) })) };
+            }),
           })),
         }),
       ),
@@ -628,24 +678,34 @@ describe("background and WebSocket tracing", () => {
     const databaseFailure = Object.assign(new Error("PRIVATE_FEISHU_DATABASE_BODY"), {
       code: "PRIVATE_FEISHU_DATABASE_SENDER",
     });
+    const computerId = randomUUID();
+    const ownerAccountId = randomUUID();
     const fenceTransaction = {
+      execute: vi.fn().mockResolvedValue([]),
       update: vi.fn(() => ({ set: vi.fn(() => ({ where: vi.fn().mockResolvedValue([]) })) })),
-      select: vi.fn(() =>
-        resolvedQuery([
-          {
-            agent: { computerId: randomUUID() },
-            imBinding: {
-              connectionFencingEpoch: 1,
-              connectionLeaseExpiresAt: new Date(Date.now() + 60_000),
-              connectionOwnerInstanceId: "another-instance",
-              externalAppId: "app-1",
-              externalBotId: "bot-test",
-              externalTeamId: null,
-              provider: "feishu",
+      select: vi
+        .fn()
+        .mockImplementationOnce(() => resolvedQuery([{ agentId }]))
+        .mockImplementationOnce(() =>
+          resolvedQuery([{ computerId, createdByUserId: ownerAccountId, status: "active" }]),
+        )
+        .mockImplementationOnce(() => resolvedQuery([{ ownerAccountId }]))
+        .mockImplementationOnce(() =>
+          resolvedQuery([
+            {
+              agent: { computerId },
+              imBinding: {
+                connectionFencingEpoch: 1,
+                connectionLeaseExpiresAt: new Date(Date.now() + 60_000),
+                connectionOwnerInstanceId: "another-instance",
+                externalAppId: "app-1",
+                externalBotId: "bot-test",
+                externalTeamId: null,
+                provider: "feishu",
+              },
             },
-          },
-        ]),
-      ),
+          ]),
+        ),
     };
     const inbox = new ImMessageInbox({
       transaction: vi

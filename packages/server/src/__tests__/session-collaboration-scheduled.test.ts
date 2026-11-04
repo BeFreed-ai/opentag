@@ -102,8 +102,13 @@ async function dispatchWithAdmission<T>(
 
 function makeFixture(
   route: AuthorizedScheduledMessageRoute,
-  options: { budgets?: { localMs?: number; cloudMs?: number } } = {},
+  options: {
+    budgets?: { localMs?: number; cloudMs?: number };
+    /** Refuse the admission with `dispatch_not_marked` from this stage number onwards. */
+    refuseFrom?: number;
+  } = {},
 ): Fixture {
+  let admissionCalls = 0;
   const sessions = {
     beginScheduledMessageAttempt: vi.fn(async () => ({ id: "fenced" })),
     resolveScheduledMessageRoute: vi.fn(async () => ({ kind: "route" as const, route })),
@@ -117,6 +122,14 @@ function makeFixture(
       ) => {
         // Mirror the real admission: the operation runs under the "locks" and the outer promise
         // resolves once the send is marked, while the result promise carries the receipt wait.
+        admissionCalls += 1;
+        if (options.refuseFrom !== undefined && admissionCalls >= options.refuseFrom) {
+          // The real refusal happens after the transport was already asked to send, and the mark
+          // never arrives inside the window.
+          const abandoned = operation(() => undefined);
+          void abandoned.catch(() => undefined);
+          return { admitted: false as const, reason: "dispatch_not_marked" as const };
+        }
         let mark: () => void = () => undefined;
         const dispatched = new Promise<void>((resolve) => (mark = resolve));
         const result = operation(mark);
@@ -376,6 +389,31 @@ describe("SessionCollaborationService.dispatchScheduledMessage", () => {
     expect(outcome).toEqual({ outcome: "unknown", code: "delivery_timeout" });
   });
 
+  it("records a refused reconcile frame as unreachable: the message provably never left", async () => {
+    const { snapshot, route } = snapshotFixture();
+    const fixture = makeFixture(route, { refuseFrom: 1 });
+    await expect(fixture.service.dispatchScheduledMessage(snapshot)).resolves.toEqual({
+      outcome: "unreachable",
+      code: "delivery_timeout",
+    });
+    expect(fixture.domain.requestSessionMessageDelivery).not.toHaveBeenCalled();
+    expect(fixture.sessions.recordMessageOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: "unreachable", errorCode: "delivery_timeout" }),
+    );
+  });
+
+  it("never records a refused business frame as unreachable: its fate is unprovable", async () => {
+    const { snapshot, route } = snapshotFixture();
+    const fixture = makeFixture(route, { refuseFrom: 2 });
+    await expect(fixture.service.dispatchScheduledMessage(snapshot)).resolves.toEqual({
+      outcome: "unknown",
+      code: "delivery_timeout",
+    });
+    expect(fixture.sessions.recordMessageOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: "unknown", errorCode: "delivery_timeout" }),
+    );
+  });
+
   it("answers a negotiated Cloud v1 scheduled dispatch with unsupported origin", async () => {
     const { snapshot, route } = snapshotFixture();
     route.targetComputerKind = "cloud";
@@ -395,6 +433,7 @@ describe("SessionCollaborationService.dispatchScheduledMessage", () => {
         attemptCount: 1,
       }),
       expect.any(Function),
+      expect.any(AbortSignal),
     );
   });
 

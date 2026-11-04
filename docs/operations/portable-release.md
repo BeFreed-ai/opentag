@@ -60,6 +60,14 @@ The shim is what makes updates safe. It never names a version directory, so the 
 `OPENTAG_INSTALL_MODE=portable`, `OPENTAG_PORTABLE_ROOT`, and `OPENTAG_PORTABLE_BIN_DIR` before exec'ing the embedded
 runtime.
 
+Service installation, service refresh, and managed Agent command instructions select this installation's absolute stable
+launcher after validating its payload and channel. They do not select another installation from `PATH` or freeze the
+invocation to a version directory. During manual upgrade, the old process can refresh the service after `current`
+advances: both running and current payloads must belong to this prefix's `versions` directory and the same channel.
+Launcher validation checks its installation root and bin-directory assignments, so compatible template changes remain
+valid. An unavailable or inconsistent launcher is reported as a local configuration error with path and version details
+in the daemon log.
+
 Each payload contains:
 
 ~~~text
@@ -68,8 +76,12 @@ INSTALL.json            Release metadata, platform, install mode, and app entry
 node/bin/node           Embedded Node.js runtime, checked against the official SHASUMS256.txt
 app/                    Bundled CLI, its package manifest, LICENSE, README, THIRD_PARTY_NOTICES,
                         dependency-closure.json, and the embedded node_modules/ dependency tree
-bin/<binName>           Artifact-local shim, used before the payload is activated
+bin/<binName>           Artifact-local shim for inspecting an uninstalled payload
 ~~~
+
+The artifact-local shim supports direct CLI inspection before installation. Daemon service installation and managed
+Agent startup require activation through `install.sh`; an uninstalled artifact has no stable `current` launcher and
+fails with an installation diagnostic.
 
 The bundled CLI's Context Tree integration resolves the installed `@first-tree-ai/context-tree` package at runtime —
 its `package.json` through `createRequire`, its bundled CLI, and its packaged skills and templates — so every payload

@@ -51,6 +51,8 @@ saves the current authorized selection in an OpenTag-owned project configuration
 selections do not delete cached content or unpublished work. One sync refreshes the selected
 sources; a separate recovery budget permits offline cached reads after a timeout. Modified
 snapshots are unavailable. Partial results remain independent and no tree takes precedence.
+Managed command timeouts return a `TIMEOUT` status so preparation can attempt its bounded offline
+recovery; a transport failure returns `CLI_FAILED` instead of escaping the optional preparation.
 
 The [Context Tree integration](../capabilities/context-tree-integration.md) uses the current
 execution's managed GitHub environment. It never falls back to ambient host credentials.
@@ -100,3 +102,10 @@ until the Server acknowledges their durable commit. Credential closure alone is 
 
 Cloud delivery still uses one Server owner. E8 adds no cross-Server routing or independent task queue.
 Local Session collaboration keeps its current behavior and trust boundary.
+
+Scheduled handoffs carry their existing cancellation signal through the per-Session FIFO and
+preparation stages. Cancelled unsent entries skip model, database and allocation preparation;
+readiness polling stops without starting later stages. Already-issued database and allocation
+operations keep their own bounds, and a late result cannot restart preparation. Cancellation after
+the first frame preserves receipt processing and durable custody; it does not prove that execution
+stopped or authorize a replay.

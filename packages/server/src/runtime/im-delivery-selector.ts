@@ -1,5 +1,6 @@
-import { sql } from "drizzle-orm";
 import type { DatabaseClient, DatabaseTransaction } from "../db/client.js";
+import { parkedDelivery } from "../db/im-delivery-work.js";
+import { lockImAgentCustody, readInboundPendingAgents } from "../services/im/inbound-admission.js";
 import { DISPATCH_CLAIM_PREFIX } from "./im-delivery-claim.js";
 import { isCloudReadinessRetry } from "./im-delivery-ready-wakeup.js";
 import {
@@ -11,8 +12,8 @@ import {
   deliveryCandidatePage,
   loadDeliveryContexts,
   lockDeliveryCandidate,
-  readCloudPendingHead,
   readDeliveryCustody,
+  readPendingHead,
 } from "./im-delivery-work-query.js";
 
 function readyCandidate(row: DeliveryCandidate, context: DeliveryContext) {
@@ -30,6 +31,8 @@ export function eligibleDeliveryCandidate(
   custody: DeliveryCustodySnapshot,
   targeted = false,
 ): context is DeliveryContext & { computerId: string; computerKind: "local" | "cloud"; generation: number } {
+  // A parked pending dispatch stays out of the work set; the scan excludes it in SQL as well.
+  if (parkedDelivery(row)) return false;
   if (
     !activeDeliveryContext(context) ||
     !context.computerId ||
@@ -43,7 +46,9 @@ export function eligibleDeliveryCandidate(
   const dueInput =
     (row.state === "pending" &&
       row.reason === null &&
-      (row.ingressLive || (context.computerKind === "cloud" && row.dispatchRequestId !== null))) ||
+      (row.ingressLive ||
+        (row.dispatchRequestId !== null &&
+          (context.computerKind === "cloud" || row.steerTargetDeliveryId !== null)))) ||
     (row.state === "expired" && row.dispatchRequestId !== null);
   if (!dueInput) return false;
   const other = custody.other({
@@ -52,21 +57,13 @@ export function eligibleDeliveryCandidate(
     agentId: context.agentId,
     computerKind: context.computerKind,
   });
-  const steer =
-    context.computerKind === "local" &&
-    row.state === "pending" &&
-    row.dispatchRequestId === null &&
-    row.steerTargetDeliveryId === null &&
-    custody.acceptedInSession(row.sessionId, row.id);
+  const steer = canSteerCandidate(row, custody);
   return !other || !!steer;
 }
 
-export function needsCloudOrder(row: DeliveryCandidate, context: DeliveryContext) {
+export function needsPendingOrder(row: DeliveryCandidate, _context: DeliveryContext) {
   return (
-    context.computerKind === "cloud" &&
-    row.state === "pending" &&
-    row.dispatchRequestId === null &&
-    !row.lastErrorCode?.startsWith(DISPATCH_CLAIM_PREFIX)
+    row.state === "pending" && row.dispatchRequestId === null && !row.lastErrorCode?.startsWith(DISPATCH_CLAIM_PREFIX)
   );
 }
 
@@ -106,8 +103,8 @@ export class ImDeliverySelector {
   }
 
   async #ordered(row: DeliveryCandidate, context: DeliveryContext, heads: Map<string, string | undefined>) {
-    if (!needsCloudOrder(row, context)) return true;
-    if (!heads.has(row.sessionId)) heads.set(row.sessionId, await readCloudPendingHead(this.database, row.sessionId));
+    if (!needsPendingOrder(row, context)) return true;
+    if (!heads.has(row.sessionId)) heads.set(row.sessionId, await readPendingHead(this.database, row.sessionId));
     return heads.get(row.sessionId) === row.id;
   }
 
@@ -122,10 +119,15 @@ export class ImDeliverySelector {
       rows.map((row) => row.sessionId),
       now,
     );
+    const inboundPending = await readInboundPendingAgents(
+      this.database,
+      [...contexts.values()].map((context) => context.agentId),
+    );
     for (const row of rows) {
       if (!sessionId) this.#cursor = { time: row.cursorTime, id: row.id };
       const context = contexts.get(row.sessionId);
       if (!eligibleDeliveryCandidate(row, context, custody, !!sessionId)) continue;
+      if (row.state === "pending" && row.dispatchRequestId === null && inboundPending.has(context.agentId)) continue;
       if (await this.#ordered(row, context, heads)) yield { row, context };
     }
   }
@@ -170,9 +172,7 @@ export async function lockEligibleDelivery(
   now: Date,
   sessionId?: string,
 ) {
-  await database.execute(
-    sql`select pg_advisory_xact_lock(hashtextextended(${`im-agent-custody:${expectedAgentId}`}, 0))`,
-  );
+  await lockImAgentCustody(database, expectedAgentId);
   const delivery = await lockDeliveryCandidate(database, deliveryId, now);
   if (!delivery || (sessionId && delivery.sessionId !== sessionId)) return undefined;
   const rows = await readDeliveryCustody(database);
@@ -181,7 +181,22 @@ export async function lockEligibleDelivery(
   const custody = new DeliveryCustodySnapshot(rows, contexts);
   if (!eligibleDeliveryCandidate(delivery, context, custody, !!sessionId) || context.agentId !== expectedAgentId)
     return undefined;
-  if (needsCloudOrder(delivery, context) && (await readCloudPendingHead(database, delivery.sessionId)) !== delivery.id)
+  if (
+    delivery.state === "pending" &&
+    delivery.dispatchRequestId === null &&
+    (await readInboundPendingAgents(database, [expectedAgentId])).has(expectedAgentId)
+  )
+    return undefined;
+  if (needsPendingOrder(delivery, context) && (await readPendingHead(database, delivery.sessionId)) !== delivery.id)
     return undefined;
   return { row: { ...delivery, ...context }, custody };
+}
+
+function canSteerCandidate(row: DeliveryCandidate, custody: DeliveryCustodySnapshot): boolean {
+  return (
+    ["pending", "expired"].includes(row.state) &&
+    ((row.dispatchRequestId === null && row.steerTargetDeliveryId === null) ||
+      (row.dispatchRequestId !== null && row.steerTargetDeliveryId !== null)) &&
+    !!custody.acceptedInSession(row.sessionId, row.id)
+  );
 }

@@ -90,6 +90,15 @@ export const TASK_BY_ID_TEMPLATE = `${ACCOUNT_TASKS_PATH}/:sessionId`;
 export const TASK_CANCEL_TEMPLATE = `${TASK_BY_ID_TEMPLATE}/cancel`;
 /** Read-only paged subresource of the Task's platform-confirmed outbound IM replies. */
 export const TASK_REPLIES_TEMPLATE = `${TASK_BY_ID_TEMPLATE}/replies`;
+/**
+ * The bounded Task detail and its independently paged sections. The legacy complete detail stays at
+ * `TASK_BY_ID_TEMPLATE`; these paths are its versioned replacement, so no reader is silently given a
+ * truncated legacy answer.
+ */
+export const TASK_DETAIL_TEMPLATE = `${TASK_BY_ID_TEMPLATE}/detail`;
+export const TASK_DETAIL_TURNS_TEMPLATE = `${TASK_DETAIL_TEMPLATE}/turns`;
+export const TASK_DETAIL_INTERNAL_SESSIONS_TEMPLATE = `${TASK_DETAIL_TEMPLATE}/internal-sessions`;
+export const TASK_DETAIL_COLLABORATION_MESSAGES_TEMPLATE = `${TASK_DETAIL_TEMPLATE}/collaboration-messages`;
 /*
  * MCP management plane. Server definitions live on the Account pool; every binding, authorization,
  * and probe is addressed under the Agent that owns it, because authorization is strictly per Agent.
@@ -99,6 +108,7 @@ export const TASK_REPLIES_TEMPLATE = `${TASK_BY_ID_TEMPLATE}/replies`;
 export const MCP_SERVERS_PATH = `${API_V1_PREFIX}/mcp-servers`;
 export const MCP_SERVER_BY_ID_TEMPLATE = `${MCP_SERVERS_PATH}/:mcpServerId`;
 export const MCP_OAUTH_CALLBACK_PATH = `${MCP_SERVERS_PATH}/oauth/callback`;
+export const MCP_OAUTH_HANDOFF_PATH = `${MCP_SERVERS_PATH}/oauth/handoff`;
 export const AGENT_MCP_SERVERS_TEMPLATE = `${AGENT_BY_ID_TEMPLATE}/mcp-servers`;
 export const AGENT_MCP_SERVER_TEMPLATE = `${AGENT_MCP_SERVERS_TEMPLATE}/:mcpServerId`;
 export const AGENT_MCP_AUTHORIZATION_TEMPLATE = `${AGENT_MCP_SERVER_TEMPLATE}/authorization`;
@@ -177,7 +187,14 @@ export const AGENT_SCHEDULE_PAUSE_TEMPLATE = `${AGENT_SCHEDULE_TEMPLATE}/pause`;
 export const AGENT_SCHEDULE_RESUME_TEMPLATE = `${AGENT_SCHEDULE_TEMPLATE}/resume`;
 export const RUNTIME_AGENT_MCP_SERVERS_PATH = `${RUNTIME_AGENT_PATH}/mcp-servers`;
 export const RUNTIME_AGENT_MCP_SERVERS_AVAILABLE_PATH = `${RUNTIME_AGENT_MCP_SERVERS_PATH}/available`;
+/** Register a definition and mount it in one step; `/available` and `:mcpServerId` are the other reads. */
+export const RUNTIME_AGENT_MCP_SERVER_DEFINITIONS_PATH = `${RUNTIME_AGENT_MCP_SERVERS_PATH}/definitions`;
 export const RUNTIME_AGENT_MCP_SERVER_TEMPLATE = `${RUNTIME_AGENT_MCP_SERVERS_PATH}/:mcpServerId`;
+export const RUNTIME_AGENT_MCP_SERVER_CREDENTIALS_TEMPLATE = `${RUNTIME_AGENT_MCP_SERVER_TEMPLATE}/credentials`;
+export const RUNTIME_AGENT_MCP_SERVER_OAUTH_START_TEMPLATE = `${RUNTIME_AGENT_MCP_SERVER_TEMPLATE}/oauth/start`;
+export const RUNTIME_AGENT_MCP_SERVER_OAUTH_STATUS_TEMPLATE = `${RUNTIME_AGENT_MCP_SERVER_TEMPLATE}/oauth/status`;
+/** Unmount, then drop the definition when no other Agent mounts it. */
+export const RUNTIME_AGENT_MCP_SERVER_DEFINITION_TEMPLATE = `${RUNTIME_AGENT_MCP_SERVER_TEMPLATE}/definition`;
 
 export const HTTP_PATHS = {
   accountAgents: ACCOUNT_AGENTS_PATH,
@@ -199,6 +216,7 @@ export const HTTP_PATHS = {
   githubOAuthCallback: GITHUB_OAUTH_CALLBACK_PATH,
   mcpServers: MCP_SERVERS_PATH,
   mcpOAuthCallback: MCP_OAUTH_CALLBACK_PATH,
+  mcpOAuthHandoff: MCP_OAUTH_HANDOFF_PATH,
   mcpClientMetadata: MCP_CLIENT_METADATA_PATH,
   mcpCatalogEndpoints: MCP_CATALOG_ENDPOINTS_PATH,
   publicSkills: PUBLIC_SKILLS_PATH,
@@ -242,6 +260,17 @@ export function taskCancelPath(sessionId: string): string {
 
 export function taskRepliesPath(sessionId: string): string {
   return `${taskByIdPath(sessionId)}/replies`;
+}
+
+export function taskDetailPath(sessionId: string): string {
+  return `${taskByIdPath(sessionId)}/detail`;
+}
+
+export function taskDetailSectionPath(
+  sessionId: string,
+  section: "turns" | "internal-sessions" | "collaboration-messages",
+): string {
+  return `${taskDetailPath(sessionId)}/${section}`;
 }
 
 export function accountComputerConnectCodePath(connectCodeId: string): string {
@@ -538,6 +567,22 @@ export function computerAgentSkillBundlePath(agentId: string, skillId: string): 
 
 export function runtimeAgentMcpServerPath(mcpServerId: string): string {
   return `${RUNTIME_AGENT_MCP_SERVERS_PATH}/${encodeURIComponent(mcpServerId)}`;
+}
+
+export function runtimeAgentMcpServerCredentialsPath(mcpServerId: string): string {
+  return `${runtimeAgentMcpServerPath(mcpServerId)}/credentials`;
+}
+
+export function runtimeAgentMcpServerOAuthStartPath(mcpServerId: string): string {
+  return `${runtimeAgentMcpServerPath(mcpServerId)}/oauth/start`;
+}
+
+export function runtimeAgentMcpServerOAuthStatusPath(mcpServerId: string): string {
+  return `${runtimeAgentMcpServerPath(mcpServerId)}/oauth/status`;
+}
+
+export function runtimeAgentMcpServerDefinitionPath(mcpServerId: string): string {
+  return `${runtimeAgentMcpServerPath(mcpServerId)}/definition`;
 }
 
 export function runtimeSkillBundlePath(name: string): string {

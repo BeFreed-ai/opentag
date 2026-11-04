@@ -145,6 +145,13 @@ holds the half that needs a resolver: a public destination only, judged on every
 returning the address to dial. No redirect is followed, because a redirect names a destination the
 policy never saw.
 
+One deadline covers a fetch as a whole, the address check included. The transport is given what is
+left of that budget — so a slow lookup narrows the time left for the request rather than adding to
+it — together with the deadline's own signal, which is what destroys the request when the budget
+expires or the caller cancels. A lookup that outlasts the budget fails the fetch without dialing
+anything, and a signal that is already aborted before the request is built is refused without
+dialing too.
+
 The address rules produce the address to dial, and the two transports bind that address to the
 connection rather than resolving again:
 
@@ -197,6 +204,18 @@ and abandonment alike. A staging directory that cannot be called private fails c
 `SKILL_SOURCE_UNREACHABLE` rather than being used.
 
 ## Installing a selection
+
+The Web result report focuses the per-item outcome list after a partial or failed installation.
+When any item failed, **Review failed skills** retains the source and explicitly requests a new
+preview. Only previously failed names that remain installable are selected, even when the refreshed
+source contains just one candidate. An unrelated new candidate remains unchecked until the user
+explicitly selects it. The ordinary first-preview single-candidate shortcut is unchanged. Already installed,
+unavailable or missing names are excluded, and the next install uses the new preview's fingerprints.
+Reviewing never automatically installs or replaces a Skill: the user confirms the refreshed selection.
+
+A failed preview retains the source and offers its existing read retry. Editing the source clears
+the previous selection. All-installed responses still close the dialog; skipped name conflicts remain
+reported without offering an overwrite.
 
 The install request carries the source and the selected names, never file content. For each name:
 

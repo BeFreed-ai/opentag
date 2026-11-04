@@ -1,7 +1,7 @@
-import type { ListTasksResponse, TaskDetail, TaskSummary } from "@opentag/shared/browser";
+import type { ListTasksResponse, TaskSummary } from "@opentag/shared/browser";
 import { useInfiniteQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { type ReactNode, useMemo, useState } from "react";
+import { type ReactNode, type Ref, useMemo, useRef, useState } from "react";
 import { ApiError, browserApi } from "../api.js";
 import { PageHeader } from "../components/kumo/page-header/page-header.js";
 import { compareText, foldCase, formatDateTime, formatRelativeTime } from "../i18n/format.js";
@@ -33,6 +33,7 @@ import {
 import { useRememberedState } from "./shell/shell-memory.js";
 import { TaskCancelControl } from "./task-cancel.js";
 import { TaskActivity } from "./task-conversation.js";
+import type { TaskDetailView } from "./task-detail-view.js";
 import {
   TASK_STATUS_GROUPS,
   type TaskStatusGroup,
@@ -100,6 +101,8 @@ export function TasksPage({ agentId, showExamples = false }: { agentId?: string;
           task.source.provider,
           task.source.channelId,
           task.source.threadKey,
+          task.source.chatMode,
+          task.source.groupMessageType,
         ]
           .map((value) => foldCase(value ?? ""))
           .join(" ")
@@ -358,8 +361,9 @@ export function TaskDetailPage({
   taskId?: string;
 }) {
   /*
-   * The Task itself, its internal Sessions and its collaboration messages come from the first page
-   * only, exactly as the hand-rolled append kept them; each further page contributes Turns.
+   * The first page carries the Task summary and its Turns, and nothing else: the conversation asks for
+   * the Turns section alone, so the Server does not read the Internal Session or collaboration history
+   * this view never renders. Each further page contributes Turns and no summary.
    */
   const detailKey = taskDetailQueryKey(taskId, showExamples);
   const taskQuery = useInfiniteQuery({
@@ -382,7 +386,7 @@ export function TaskDetailPage({
    * the canonical Task id, so a legacy Session-alias URL queries replies under the Task's real id
    * instead of the route's alias.
    */
-  const repliesQuery = useTaskRepliesQuery(showExamples ? undefined : first?.task.id);
+  const repliesQuery = useTaskRepliesQuery(showExamples ? undefined : first?.task?.id);
   const taskError = asError(taskQuery.error);
   const persistedError = usePersistedSettledError(detailKey, {
     error: taskQuery.error ? taskError : null,
@@ -403,13 +407,13 @@ export function TaskDetailPage({
   if (taskId !== undefined && taskQuery.isPending) {
     return <TaskNotice loading heading={m.tasks_loading_task()} detail={m.tasks_loading_task_detail()} />;
   }
-  if (!first) {
+  if (!first?.task) {
     // No Task id at all is the same answer as one the Server does not have.
     const error = taskId === undefined ? new ApiError(404, m.tasks_not_found()) : asError(taskQuery.error);
     return <TaskUnavailable agentId={agentId} error={error} showExamples={showExamples} />;
   }
 
-  const { task } = first;
+  const task = first.task;
   const status = taskStatusGroup(task.status);
   const repliesStatus = <TaskRepliesStatus query={repliesQuery} />;
   const pagination = (
@@ -448,7 +452,11 @@ export function TaskDetailPage({
             </span>
           </TaskDetailFact>
           <TaskDetailFact label={m.tasks_source_label()}>
-            <span className="inline-flex items-center gap-1.5">
+            <span
+              className="inline-flex items-center gap-1.5"
+              data-chat-mode={task.source.chatMode ?? undefined}
+              data-group-message-type={task.source.groupMessageType ?? undefined}
+            >
               <ProviderIcon className="size-5" provider={task.source.provider} />
               {sourceLabel(task)}
             </span>
@@ -472,6 +480,7 @@ export function TaskDetailPage({
 
       <TaskActivity
         task={task}
+        internalSessions={first.internalSessions}
         replies={repliesQuery.supplied ? repliesQuery.replies : undefined}
         repliesStatus={repliesStatus}
         turns={turns}
@@ -760,14 +769,26 @@ function TaskRow({
   showExamples?: boolean;
   task: TaskSummary;
 }) {
+  const linkRef = useRef<HTMLAnchorElement>(null);
   const status = taskStatusGroup(task.status);
   return (
     <Table.Row
-      className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-1 border-b border-kumo-line last:border-b-0 @min-[40rem]/content:table-row @min-[40rem]/content:border-b-0"
+      className="cursor-pointer transition-colors hover:bg-kumo-tint/50 grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-1 border-b border-kumo-line last:border-b-0 @min-[40rem]/content:table-row @min-[40rem]/content:border-b-0"
       data-ui="task-table-row"
+      data-chat-mode={task.source.chatMode ?? undefined}
+      data-group-message-type={task.source.groupMessageType ?? undefined}
+      onClick={(event) => {
+        if (
+          event.defaultPrevented ||
+          (event.target instanceof Element && event.target.closest('a, button, input, [role="button"]'))
+        ) {
+          return;
+        }
+        (linkRef.current ?? event.currentTarget.querySelector<HTMLAnchorElement>("a"))?.click();
+      }}
     >
       <Table.Cell className="col-start-1 row-start-1 min-w-0" data-label={m.tasks_task_label()}>
-        <TaskTitleLink showExamples={showExamples} task={task} />
+        <TaskTitleLink linkRef={linkRef} showExamples={showExamples} task={task} />
       </Table.Cell>
       {showAgent ? (
         <Table.Cell className="col-span-2 row-start-3" data-label={m.tasks_agent_label()}>
@@ -781,7 +802,12 @@ function TaskRow({
           </span>
         </Table.Cell>
       ) : null}
-      <Table.Cell className="col-start-1 row-start-2 min-w-0" data-label={m.tasks_source_label()}>
+      <Table.Cell
+        className="col-start-1 row-start-2 min-w-0"
+        data-chat-mode={task.source.chatMode ?? undefined}
+        data-group-message-type={task.source.groupMessageType ?? undefined}
+        data-label={m.tasks_source_label()}
+      >
         <span className={"inline-flex min-w-0 items-center gap-2 @min-[40rem]/content:whitespace-nowrap"}>
           <ProviderIcon className="size-5" provider={task.source.provider} />
           <span>{sourceLabel(task)}</span>
@@ -806,7 +832,15 @@ function TaskRow({
   );
 }
 
-function TaskTitleLink({ showExamples, task }: { showExamples: boolean; task: TaskSummary }) {
+function TaskTitleLink({
+  linkRef,
+  showExamples,
+  task,
+}: {
+  linkRef?: Ref<HTMLAnchorElement>;
+  showExamples: boolean;
+  task: TaskSummary;
+}) {
   const className =
     "line-clamp-2 max-w-[40rem] wrap-anywhere text-sm font-normal text-kumo-default hover:text-kumo-link @min-[40rem]/content:line-clamp-1";
   if (showExamples) {
@@ -814,6 +848,7 @@ function TaskTitleLink({ showExamples, task }: { showExamples: boolean; task: Ta
       <Link
         className={className}
         params={{ taskId: task.id }}
+        ref={linkRef}
         search={{ examples: true }}
         title={task.title}
         to="/tasks/$taskId"
@@ -823,7 +858,7 @@ function TaskTitleLink({ showExamples, task }: { showExamples: boolean; task: Ta
     );
   }
   return (
-    <Link className={className} {...agentTaskDetailLink(task.agent.id, task.id)} title={task.title}>
+    <Link className={className} {...agentTaskDetailLink(task.agent.id, task.id)} ref={linkRef} title={task.title}>
       {task.title}
     </Link>
   );
@@ -921,18 +956,34 @@ async function readTasks({
   return browserApi.tasks({ agentId, cursor });
 }
 
+/**
+ * The first page carries the summary and the first page of every section; the conversation's own
+ * cursor continues only the Turns, which is the one section the reader scrolls.
+ */
 async function readTaskDetail(
   taskId: string,
   agentId?: string,
   cursor?: string,
   showExamples = false,
-): Promise<TaskDetail> {
+): Promise<TaskDetailView> {
   if (showExamples && !cursor) {
     const { createDevelopmentTaskDetail } = await loadDevelopmentTaskData();
     const detail = createDevelopmentTaskDetail(taskId, agentId ?? "40000000-0000-4000-8000-000000000001");
     if (detail) return detail;
   }
-  return browserApi.task(taskId, cursor);
+  if (cursor) {
+    const turns = await browserApi.taskTurns(taskId, cursor);
+    return { turns: turns.items, nextCursor: turns.nextCursor };
+  }
+  // The conversation renders the summary and the Turns; the other two sections are not asked for,
+  // and the Server does not read them.
+  const page = await browserApi.taskDetail(taskId, ["turns"]);
+  return {
+    task: page.task,
+    turns: page.turns?.items ?? [],
+    internalSessions: page.internalSessions?.items ?? [],
+    nextCursor: page.turns?.nextCursor ?? null,
+  };
 }
 
 async function loadDevelopmentTaskData() {

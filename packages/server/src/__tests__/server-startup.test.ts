@@ -1,3 +1,4 @@
+import Fastify from "fastify";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
@@ -15,6 +16,8 @@ const state = vi.hoisted(() => ({
   verifyDatabaseMigrations: vi.fn(),
   createDatabaseClient: vi.fn(),
   createApp: vi.fn(),
+  loadCloudBilling: vi.fn(),
+  shutdownTelemetry: vi.fn(),
   platformAuth: { verifyMachineToken: vi.fn() },
   credentialOwner: { issueValidationRun: vi.fn() },
   proxyTransport: { attach: vi.fn() },
@@ -49,6 +52,11 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock("../app.js", () => ({ createApp: state.createApp }));
+vi.mock("../services/cloud-billing-module.js", () => ({ loadCloudBilling: state.loadCloudBilling }));
+vi.mock("../observability/index.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../observability/index.js")>()),
+  shutdownTelemetry: state.shutdownTelemetry,
+}));
 vi.mock("../services/cloud-run/runner-image-prewarm-worker.js", () => ({
   createRunnerImagePrewarmWorker: () =>
     state.prewarmEnabled
@@ -206,7 +214,7 @@ vi.mock("../services/agents/index.js", () => ({
   AgentSetupService: class {},
   DatabaseAgentOwnerResolver: class {},
 }));
-vi.mock("../services/auth/index.js", () => ({
+vi.mock("../services/auth/index.js", async () => ({
   AuthService: class {},
   AuthServiceError: class extends Error {},
   ConnectCodeService: class {},
@@ -215,11 +223,7 @@ vi.mock("../services/auth/index.js", () => ({
       state.devAuthArgs = args;
     }
   },
-  formatStartupError: (error: unknown, knownSecrets: string[]) => {
-    let detail = error instanceof Error ? error.message : String(error);
-    for (const secret of knownSecrets) if (secret) detail = detail.replaceAll(secret, "[REDACTED]");
-    return detail;
-  },
+  formatStartupError: (await import("../services/auth/security.js")).formatStartupError,
   PostAuthenticationService: class {},
 }));
 vi.mock("../services/channel-target/index.js", () => ({
@@ -379,6 +383,9 @@ function defaultConfig() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  state.schedulerStop.mockReset();
+  state.loadCloudBilling.mockReset().mockResolvedValue(undefined);
+  state.shutdownTelemetry.mockReset().mockResolvedValue(undefined);
   state.events.length = 0;
   state.prewarmEnabled = false;
   state.config = defaultConfig();
@@ -599,7 +606,7 @@ describe("Server startup", () => {
 
     (state.workerOptions as { onDiagnostic(code: string): void }).onDiagnostic("IM_DELIVERY_FAILED");
     expect((state.app as { log: { error: ReturnType<typeof vi.fn> } }).log.error).toHaveBeenCalledWith(
-      { code: "IM_DELIVERY_FAILED" },
+      { code: "IM_DELIVERY_FAILED", errorCode: "IM_DELIVERY_FAILED" },
       "Server diagnostic",
     );
 
@@ -676,27 +683,31 @@ describe("Server startup", () => {
     );
   });
 
-  it("reports ignored GitHub App configuration names without logging their values", async () => {
-    vi.stubEnv("OPENTAG_GITHUB_APP_CLIENT_ID", "legacy-client-id");
-    vi.stubEnv("OPENTAG_GITHUB_APP_CLIENT_SECRET", "legacy-client-secret");
-    vi.stubEnv("OPENTAG_GITHUB_APP_PRIVATE_KEY", " ");
-    try {
-      await startServer();
-      const warn = (state.app as { log: { warn: ReturnType<typeof vi.fn> } }).log.warn;
-      expect(warn).toHaveBeenCalledWith(
-        {
-          event: "github_app_configuration_ignored",
-          variables: ["OPENTAG_GITHUB_APP_CLIENT_ID", "OPENTAG_GITHUB_APP_CLIENT_SECRET"],
-        },
-        expect.stringContaining("OPENTAG_GITHUB_OAUTH_*"),
-      );
-      expect(JSON.stringify(warn.mock.calls)).not.toContain("legacy-client-id");
-      expect(JSON.stringify(warn.mock.calls)).not.toContain("legacy-client-secret");
-      expect(state.events).toContain("listen");
-    } finally {
-      vi.unstubAllEnvs();
-    }
-  });
+  it.each(["APP", "OAUTH"])(
+    "reports ignored GitHub %s configuration names without logging their values",
+    async (kind) => {
+      const prefix = `OPENTAG_GITHUB_${kind}`;
+      vi.stubEnv(`${prefix}_CLIENT_ID`, "legacy-client-id");
+      vi.stubEnv(`${prefix}_CLIENT_SECRET`, "legacy-client-secret");
+      vi.stubEnv(`${prefix}_UNUSED`, " ");
+      try {
+        await startServer();
+        const warn = (state.app as { log: { warn: ReturnType<typeof vi.fn> } }).log.warn;
+        expect(warn).toHaveBeenCalledWith(
+          {
+            event: "github_app_configuration_ignored",
+            variables: [`${prefix}_CLIENT_ID`, `${prefix}_CLIENT_SECRET`],
+          },
+          expect.stringContaining("OPENTAG_MCP_GITHUB_CLIENT_ID"),
+        );
+        expect(JSON.stringify(warn.mock.calls)).not.toContain("legacy-client-id");
+        expect(JSON.stringify(warn.mock.calls)).not.toContain("legacy-client-secret");
+        expect(state.events).toContain("listen");
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    },
+  );
 
   it("verifies checked-in migrations before listening when auto-migrate is disabled", async () => {
     state.config = { ...defaultConfig(), autoMigrate: false, google: undefined, devAuth: undefined };
@@ -772,7 +783,7 @@ describe("Server startup", () => {
     expect(app.close).toHaveBeenCalledTimes(1);
     expect(state.events).not.toContain("ready:listen");
     expect(state.events).not.toContain("prewarm:start");
-    expect(state.events.slice(-8)).toEqual([
+    expect(state.events.slice(-9)).toEqual([
       "app:close",
       "prewarm:stop",
       "scheduler:stop",
@@ -780,6 +791,7 @@ describe("Server startup", () => {
       "platform:close",
       "feishu-setup:stop",
       "feishu-connections:stop",
+      "sql:end",
       "sql:end",
     ]);
     const logged = JSON.stringify(app.log.error.mock.calls);
@@ -795,6 +807,115 @@ describe("Server startup", () => {
       "cloud-runner-static-token",
     ]) {
       expect(logged).not.toContain(secret);
+    }
+  });
+
+  it.each([false, true])(
+    "settles a listen failure after onClose rejects, including outer cleanup failures=%s",
+    async (outerFailures) => {
+      const app = Fastify();
+      const listenError = new Error("listen failed jwt-secret");
+      const workerError = new Error("scheduler failed encryption-secret");
+      const billingError = new Error("billing failed slack-client-secret");
+      const telemetryError = new Error("telemetry failed google-secret");
+      const listen = vi.spyOn(app, "listen").mockRejectedValue(listenError);
+      const close = vi.spyOn(app, "close");
+      const report = vi.spyOn(app.log, "error");
+      state.app = app;
+      state.schedulerStop.mockRejectedValue(workerError);
+      state.loadCloudBilling.mockResolvedValue({
+        close: async () => {
+          state.events.push("billing:close");
+          if (outerFailures) throw billingError;
+        },
+      });
+      state.shutdownTelemetry.mockImplementation(async () => {
+        state.events.push("telemetry:close");
+        if (outerFailures) throw telemetryError;
+      });
+
+      await expect(startServer()).resolves.toBeUndefined();
+
+      expect(listen).toHaveBeenCalledOnce();
+      expect(close).toHaveBeenCalledOnce();
+      expect(process.exitCode).toBe(1);
+      expect(state.events).not.toContain("ready:listen");
+      expect(state.events.indexOf("sql:end")).toBeGreaterThan(state.events.indexOf("scheduler:stop"));
+      expect(state.events.indexOf("billing:close")).toBeGreaterThan(state.events.indexOf("sql:end"));
+      expect(state.events.slice(-3)).toEqual(["billing:close", "sql:end", "telemetry:close"]);
+      expect(state.shutdownTelemetry).toHaveBeenCalledTimes(2);
+      expect(report).toHaveBeenCalledOnce();
+      const logged = JSON.stringify(report.mock.calls);
+      expect(logged).toContain("Server startup and resource cleanup failed");
+      expect(logged).toContain("listen failed");
+      expect(logged).toContain("Failed to close application");
+      expect(logged).toContain("Failed to close schedule scheduler");
+      expect(logged).toContain("scheduler failed");
+      if (outerFailures) {
+        expect(logged).toContain("Failed to close cloud billing");
+        expect(logged).toContain("billing failed");
+        expect(logged).toContain("telemetry failed");
+      }
+      for (const secret of ["jwt-secret", "encryption-secret", "slack-client-secret", "google-secret"]) {
+        expect(logged).not.toContain(secret);
+      }
+    },
+  );
+
+  it.each([false, true])("closes the pool before App creation, including cleanup failure=%s", async (closeFails) => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    state.loadCloudBilling.mockRejectedValue(new Error("initialization failed jwt-secret"));
+    if (closeFails) state.sql.end.mockRejectedValue(new Error("database close failed encryption-secret"));
+    try {
+      await expect(startServer()).resolves.toBeUndefined();
+      expect(state.createDatabaseClient).toHaveBeenCalledOnce();
+      expect(state.createApp).not.toHaveBeenCalled();
+      expect(state.sql.end).toHaveBeenCalledExactlyOnceWith({ timeout: 1 });
+      expect(state.shutdownTelemetry).toHaveBeenCalledOnce();
+      expect(process.exitCode).toBe(1);
+      const output = stderr.mock.calls.flat().join(" ");
+      expect(output).toContain("initialization failed");
+      if (closeFails) expect(output).toContain("database close failed");
+      expect(output).not.toContain("jwt-secret");
+      expect(output).not.toContain("encryption-secret");
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it("closes the pool even when App close fails before its resource hook", async () => {
+    const app = state.app as {
+      listen: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+      log: { error: ReturnType<typeof vi.fn> };
+    };
+    app.listen.mockRejectedValue(new Error("listen failed"));
+    app.close.mockRejectedValue(new Error("App close failed"));
+    await expect(startServer()).resolves.toBeUndefined();
+    expect(state.sql.end).toHaveBeenCalledExactlyOnceWith({ timeout: 1 });
+    expect(state.shutdownTelemetry).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(1);
+    expect(JSON.stringify(app.log.error.mock.calls)).toContain("App close failed");
+  });
+
+  it("reports a pre-creation failure even when telemetry cleanup rejects", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    state.parseServerConfig.mockImplementation(() => {
+      throw new Error("configuration failed jwt-secret");
+    });
+    state.shutdownTelemetry.mockRejectedValue(new Error("telemetry failed google-secret"));
+    try {
+      await expect(startServer()).resolves.toBeUndefined();
+      expect(process.exitCode).toBe(1);
+      expect(state.createApp).not.toHaveBeenCalled();
+      expect(stderr).toHaveBeenCalledOnce();
+      const output = stderr.mock.calls.flat().join(" ");
+      expect(output).toContain("configuration failed");
+      expect(output).toContain("telemetry failed");
+      expect(output).not.toContain("jwt-secret");
+      expect(output).not.toContain("google-secret");
+    } finally {
+      stderr.mockRestore();
     }
   });
 });

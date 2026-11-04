@@ -60,6 +60,7 @@ import {
   slackInstallationCredentialContext,
   slackInstallationInspectionInput,
 } from "./credential-material.js";
+import { currentBindingOf } from "./current-binding.js";
 import { disableImBindingInTransaction } from "./disable-im-binding.js";
 import {
   ImBindingProviderCli,
@@ -70,7 +71,7 @@ import {
 type QueryExecutor = Pick<DatabaseClient, "select">;
 type CredentialMaterialWithId = CredentialMaterialInput & { id?: string };
 
-export { disableImBindingInTransaction } from "./disable-im-binding.js";
+export { disableImBindingInTransaction, releaseNeverActivatedSlots } from "./disable-im-binding.js";
 
 export interface VerifiedFeishuBinding {
   profile?: BotProfile;
@@ -109,6 +110,7 @@ export interface SlackIngressBinding extends SlackInstallationIngress {
 
 export interface FeishuConnectionMaterial {
   imBindingId: string;
+  agentId: string;
   generation: number;
   appId: string;
   teamId: string | null;
@@ -120,6 +122,7 @@ export interface FeishuConnectionMaterial {
 
 export interface SlackConnectionMaterial {
   imBindingId: string;
+  agentId: string;
   installationId: string;
   generation: number;
   appId: string;
@@ -149,6 +152,7 @@ export interface AgentSetupBindingState {
   handoff: ImBindingHandoffStatus;
 }
 interface ObservedAgentBinding {
+  row: typeof imBindings.$inferSelect;
   id: string;
   provider: "feishu" | "slack";
   status: ImBindingState;
@@ -172,8 +176,9 @@ export class ImBindingServiceError extends Error {
     readonly statusCode: number,
     message: string,
     readonly category: ErrorCategory = "deterministic",
+    options: { cause?: unknown } = {},
   ) {
-    super(message);
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
   }
 }
 
@@ -670,6 +675,7 @@ export class ImBindingService {
     if (!credential) return undefined;
     return {
       imBindingId,
+      agentId: row.imBinding.agentId,
       installationId: ingress.installationId,
       generation: ingress.generation,
       appId: ingress.appId,
@@ -710,6 +716,7 @@ export class ImBindingService {
     if (!credential) return undefined;
     return {
       imBindingId,
+      agentId: imBinding.agentId,
       generation: imBinding.credentialGeneration,
       appId: imBinding.externalAppId,
       teamId: imBinding.externalTeamId,
@@ -753,7 +760,7 @@ export class ImBindingService {
       .from(imBindings)
       .innerJoin(agents, eq(agents.id, imBindings.agentId))
       .leftJoin(slackInstallations, eq(slackInstallations.id, imBindings.slackInstallationId))
-      .where(and(eq(imBindings.agentId, agentId), ne(imBindings.status, "disabled")))
+      .where(currentBindingOf(agentId))
       .limit(1);
     if (!row) return undefined;
     const activity = await this.#activity(row.id);
@@ -783,53 +790,48 @@ export class ImBindingService {
   }
 
   async getSetupBindingForAgent(callerUserId: string, agentId: string): Promise<AgentSetupBindingState | undefined> {
+    return (await this.readSetupForAgent(callerUserId, agentId))?.binding;
+  }
+
+  /** Internal captured row for Feishu projection; only the public binding view may be serialized. */
+  async readSetupForAgent(callerUserId: string, agentId: string) {
     const observed = await this.#observeForAgent(callerUserId, agentId);
     if (!observed) return undefined;
     return {
-      bindingId: observed.id,
-      provider: observed.provider,
-      credentialGeneration: observed.credentialGeneration,
-      errorCode: projectedErrorCode({
-        credentialStatus: observed.credential.status,
-        lastErrorCode: observed.lastErrorCode,
-        missingCapabilities: observed.credential.missingCapabilities,
+      row: observed.row,
+      binding: {
+        bindingId: observed.id,
         provider: observed.provider,
-        reauthorizationRequired: observed.readiness.reauthorizationRequired,
-        status: observed.status,
-      }),
-      handoff: observed.readiness.handoff,
+        credentialGeneration: observed.credentialGeneration,
+        errorCode: projectedErrorCode({
+          credentialStatus: observed.credential.status,
+          lastErrorCode: observed.lastErrorCode,
+          missingCapabilities: observed.credential.missingCapabilities,
+          provider: observed.provider,
+          reauthorizationRequired: observed.readiness.reauthorizationRequired,
+          status: observed.status,
+        }),
+        handoff: observed.readiness.handoff,
+      },
     };
   }
 
   async #observeForAgent(callerUserId: string, agentId: string): Promise<ObservedAgentBinding | undefined> {
     await this.#assertCanRead(callerUserId, agentId);
-    const [row] = await this.#database
-      .select({
-        id: imBindings.id,
-        agentId: imBindings.agentId,
-        provider: imBindings.provider,
-        status: imBindings.status,
-        lastErrorCode: imBindings.lastErrorCode,
-        connectionLeaseExpiresAt: imBindings.connectionLeaseExpiresAt,
-        observedConnectedAt: imBindings.observedConnectedAt,
-        observedAt: imBindings.observedAt,
-        grantedCapabilities: imBindings.grantedCapabilities,
-        encryptedCredential: imBindings.encryptedCredential,
-        externalAppId: imBindings.externalAppId,
-        externalBotId: imBindings.externalBotId,
-        externalTeamId: imBindings.externalTeamId,
-        credentialSchemaVersion: imBindings.credentialSchemaVersion,
-        credentialGeneration: imBindings.credentialGeneration,
-        slackInstallation: slackInstallations,
-        computerKind: computers.kind,
-      })
+    const [selected] = await this.#database
+      .select({ binding: imBindings, slackInstallation: slackInstallations, computerKind: computers.kind })
       .from(imBindings)
       .innerJoin(agents, eq(agents.id, imBindings.agentId))
       .leftJoin(computers, eq(computers.id, agents.computerId))
       .leftJoin(slackInstallations, eq(slackInstallations.id, imBindings.slackInstallationId))
-      .where(and(eq(imBindings.agentId, agentId), ne(imBindings.status, "disabled")))
+      .where(currentBindingOf(agentId))
       .limit(1);
-    if (!row) return undefined;
+    if (!selected) return undefined;
+    const row = {
+      ...selected.binding,
+      slackInstallation: selected.slackInstallation,
+      computerKind: selected.computerKind,
+    };
     const credential = this.#inspectBindingCredentials(row, row.slackInstallation);
     const observedConnectedAt =
       row.provider === "slack" ? (row.slackInstallation?.observedConnectedAt ?? null) : row.observedConnectedAt;
@@ -859,6 +861,7 @@ export class ImBindingService {
       row.computerKind,
     );
     return {
+      row: selected.binding,
       id: row.id,
       provider: row.provider,
       status,

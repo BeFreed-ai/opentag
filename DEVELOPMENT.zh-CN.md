@@ -1,7 +1,7 @@
 # openTag 开发指南
 
 > 权威来源：[DEVELOPMENT.md](./DEVELOPMENT.md)
-> 同步日期：2026-10-21
+> 同步日期：2026-10-26
 
 ## 从源码在本地运行
 
@@ -165,7 +165,7 @@ pnpm --filter @opentag/server start
 | 仅文档 | `pnpm check`；无需应用构建或测试。同步根目录的中文镜像。作为运行时输入发布的 Markdown（如内置 Skills）应按受影响 package 的范围验证。 |
 | 单个 package 内的行为 | 相关测试文件与该 package 的类型检查。影响遍及 package 或范围不明确时，扩展到整个 package 的测试套件。 |
 | 共用 schema、公共导出或跨 package 契约 | 提供方测试，以及受影响使用方的测试与类型检查。测试使用方前先构建变更的导出。 |
-| 数据库查询、事务、锁或持久化 | 相关服务器单元测试与 PostgreSQL 集成测试。新增 migration 必须运行完整集成套件，并按 `AGENTS.md` 更新 migration 计数。 |
+| 数据库查询、事务、锁或持久化 | 相关服务器单元测试与 PostgreSQL 集成测试。新增 migration 遵循[迁移要求](./docs/system/database-read-write-standards.md#migrations)。 |
 | `vitest.agent-runtime.config.ts` 覆盖的 Agent Runtime 实现或测试，或该配置本身 | 先运行针对性测试，再运行 `pnpm --filter @opentag/client test:agent-runtime:coverage`。100% 覆盖率门禁以 CI 的 Ubuntu 主机为准；报告平台相关失败。 |
 | 仓库脚本或 workflow | 相关 `scripts/__tests__/*.test.mjs` 文件，以及改动涉及的构建或打包冒烟检查。 |
 | 构建、导出、生成代码或打包 | 受影响的构建，以及相关测试与类型检查。 |
@@ -214,6 +214,21 @@ Turbo 的 web typecheck 任务已包含此步骤。文件路径相对于选定�
 `127.0.0.1`；远程 Docker 保留默认绑定方式。启动后先从宿主机执行 `SELECT 1`，连接超时为五秒，
 成功后才开始迁移或测试。若容器健康检查通过，但该查询失败，应检查 Docker 端口转发：TCP 端口开放
 不代表 PostgreSQL 请求已到达容器。查询失败时，fixture 会关闭探测连接并删除容器。
+
+### 容器内 PostgreSQL 探针
+
+在容器内运行 `psql` 和 `pg_isready` 时显式指定 TCP 主机，通常使用 `-h 127.0.0.1` 或
+`--host=127.0.0.1`。官方 Postgres 镜像在初始化期间启动仅监听 socket 的临时服务器，只有最终服务器
+响应 TCP。这依赖镜像在 `postgresql.conf.sample` 中设置 `listen_addresses = '*'`。
+挂载自定义 `postgresql.conf` 或更换镜像系列时，需要重新检查这些探针。
+
+`pnpm check` 通过 `scripts/check-container-postgres-tcp.mjs` 执行此规则。检查覆盖 JS/TS 中的 Docker
+参数字面量与通过 `function` 声明的本地参数转发函数、`.sh` 和 workflow `run` 步骤中的简单 Docker shell
+命令、workflow service `options`，以及 Compose/Docker 健康检查命令。保持这些调用显式；
+动态拼接命令或导入封装函数时，需同步扩展检查器。
+宿主机客户端（包括通过 URL 连接）、有意使用临时服务器的镜像初始化脚本，以及 `--help`/`--version`
+调用无需此参数。普通文本和注释不视为命令。静态检查不能证明运行时就绪，也不验证自定义 Postgres 配置。
+容器内规则只认可 `-h`/`--host`；`PGHOST` 和连接字符串中的主机设置不能替代它。
 
 ### CI 与完整套件复现
 

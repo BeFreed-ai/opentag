@@ -576,30 +576,67 @@ describe("OpenTag Web App Shell", () => {
     });
   });
 
-  it("opens dedicated Slack setup without starting official OAuth", async () => {
-    installApi({ bound: false });
-    window.history.replaceState({}, "", `/agents/${agentId}/settings/messaging`);
-    render(<App />);
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Connect Slack" })).not.toHaveProperty("disabled", true),
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Connect Slack" }));
-    expect(await screen.findByLabelText("Code")).toBeTruthy();
-    expect(
-      vi
-        .mocked(fetch)
-        .mock.calls.filter(
-          ([input, init]) => String(input).endsWith("/im-binding/slack/oauth/start") && init?.method === "POST",
-        ),
-    ).toHaveLength(0);
-    expect(
-      vi
-        .mocked(fetch)
-        .mock.calls.filter(
-          ([input, init]) => String(input).endsWith("/im-binding/slack/configuration/auto") && init?.method === "POST",
-        ),
-    ).toHaveLength(1);
-  });
+  it.each(["local", "cloud"] as const)(
+    "opens dedicated Slack setup without starting official OAuth (%s)",
+    async (computerKind) => {
+      installApi({
+        bound: false,
+        ...(computerKind === "cloud"
+          ? {
+              computers: [
+                {
+                  id: computerId,
+                  kind: "cloud",
+                  displayName: "openTag Cloud",
+                  platform: "linux",
+                  connectionStatus: "offline",
+                  providerReadiness: [],
+                  connectedAt: null,
+                  lastSeenAt: null,
+                },
+              ],
+            }
+          : {}),
+      });
+      window.history.replaceState({}, "", `/agents/${agentId}/settings/messaging`);
+      render(<App />);
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Connect Slack" })).not.toHaveProperty("disabled", true),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Connect Slack" }));
+      if (computerKind === "cloud") {
+        expect(await screen.findByRole("link", { name: "View Apps" })).toHaveProperty(
+          "href",
+          "https://api.slack.com/apps",
+        );
+        expect(
+          vi
+            .mocked(fetch)
+            .mock.calls.filter(
+              ([input, init]) =>
+                String(input).endsWith("/im-binding/slack/configuration/auto") && init?.method === "POST",
+            ),
+        ).toHaveLength(0);
+        fireEvent.click(screen.getByRole("button", { name: "Create App" }));
+      }
+      expect(await screen.findByLabelText("Code")).toBeTruthy();
+      expect(
+        vi
+          .mocked(fetch)
+          .mock.calls.filter(
+            ([input, init]) => String(input).endsWith("/im-binding/slack/oauth/start") && init?.method === "POST",
+          ),
+      ).toHaveLength(0);
+      expect(
+        vi
+          .mocked(fetch)
+          .mock.calls.filter(
+            ([input, init]) =>
+              String(input).endsWith("/im-binding/slack/configuration/auto") && init?.method === "POST",
+          ),
+      ).toHaveLength(1);
+    },
+  );
 });
 
 /**
@@ -648,7 +685,9 @@ it("keeps manual Slack verification open when settings refresh to a bound Agent"
   expect(document.querySelector('[data-ui="messaging-app-identity"]')).toBeTruthy();
   const dialog = await screen.findByRole("dialog", { name: "Connect Slack" });
   expect(
-    within(dialog).getByText("In Event Subscriptions, confirm Verified and select Save Changes, then send a message."),
+    within(dialog).getByText(
+      "In Event Subscriptions, confirm Verified and select Save Changes. Then open the Bot’s chat, send “Hello” and check for a reply.",
+    ),
   ).toBeTruthy();
   expect(within(dialog).getByRole("link", { name: "Open settings" })).toHaveProperty(
     "href",

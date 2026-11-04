@@ -9,16 +9,23 @@ contents, and machine-specific operational logs outside the repository.
 
 - [Agent Runtime Provider test plan](agent-runtime-test-plan.md)
 - [Cloud Computer acceptance harness](cloud-computer.md)
+- [Managed CLI installation acceptance](managed-cli-entry/README.md)
 - [Slack local live acceptance](slack-live-acceptance.md)
+- [Agent usage and internal Session page benchmark](performance/agent-session/REPORT.md)
+- [Cloud startup performance](performance/cloud-startup/README.md)
 
 ## Verification by feature
 
 - [Account, Agent, and Computer management writes](verification/account-agent-computer-writes.md)
 
 - [Agent Runtime contract](verification/agent-runtime-contract.md)
+- [Claude native plugins](verification/claude-native-plugins.md)
+- [Codex native plugins](verification/codex-native-plugins.md)
+- [Pi native resources](verification/pi-native-resources.md)
 - [Agent Skills](verification/agent-skills.md)
 - [Cloud billing](verification/cloud-billing.md)
 - [Cloud Computer](verification/cloud-computer.md)
+- [Cloud model retry ownership](verification/cloud-model-retry.md)
 - [Cloud Context Tree and Session collaboration](verification/cloud-context.md)
 - [Cloud Pi image input](verification/cloud-pi-image-input.md)
 - [Cloud Runner execution](verification/cloud-runner-execution.md)
@@ -26,17 +33,26 @@ contents, and machine-specific operational logs outside the repository.
 - [Cloud workspace persistence](verification/cloud-workspace-persistence.md)
 - [Context Tree integration](verification/context-tree-integration.md)
 - [Custom Slack Apps](verification/custom-slack-apps.md)
+- [Cloud delivery cancellation reads](performance/cancel-deliveries/README.md)
 - [Database disconnect recovery](verification/database-disconnect.md)
+- [Feishu setup observation consistency](verification/feishu-setup-observation.md)
+- [Accepted inbound receipt ordering](verification/inbound-receipt-order.md)
 - [Feishu user MCP authorization](verification/feishu-user-mcp-authorization.md)
 - [GitHub platform integration](verification/github-platform-integration.md)
+- [Ownership gate reconciliation](verification/ownership-gate.md)
+- [GitHub MCP connector](verification/github-mcp.md)
+- [Agent GitHub access through MCP](verification/agent-github-mcp-only.md)
 - [GitHub OAuth cutover](verification/github-oauth-cutover.md)
 - [IM delivery claim queries](im-delivery-claim/README.md)
 - [IM Turn budget and recovery](im-turn-budget-recovery/README.md)
 - [Steered IM custody without terminal reports](verification/im-steer-custody.md)
 - [Provider process shutdown](verification/provider-process-custody.md)
 - [IM content and attachment delivery](verification/im-content-delivery.md)
+- [Ordered IM batches and Cloud steering](verification/im-backlog-batching.md)
 - [Inbound receipt recovery](verification/inbound-receipt-recovery.md)
 - [MCP Server integration](verification/mcp-server-integration.md)
+- [MCP catalog expansion](verification/mcp-catalog-expansion.md)
+- [MCP OAuth authorization reuse](verification/mcp-authorization-reuse.md)
 - [Release guide](verification/releasing.md)
 - [Session collaboration writes](verification/session-collaboration-writes.md)
 - [Session configuration transitions](verification/session-configuration-transitions.md)
@@ -52,6 +68,9 @@ contents, and machine-specific operational logs outside the repository.
 
 Screenshots and browser checks for Web UI changes, one directory per change:
 
+- [Cloud workspace recovery](web-ui/cloud-workspace-recovery/README.md)
+
+- [Context Tree GitHub MCP authorization](web-ui/context-mcp-authorization/README.md)
 - [Agent status layout](web-ui/agent-status/README.md)
 - [computer-recovery](web-ui/computer-recovery/README.md)
 - [computer-status-alignment](web-ui/computer-status-alignment/README.md)
@@ -60,6 +79,7 @@ Screenshots and browser checks for Web UI changes, one directory per change:
 - [GitHub OAuth cutover](web-ui/github-oauth-cutover/README.md)
 - [discover-categories](web-ui/discover-categories/README.md)
 - [mcp-add-server](web-ui/mcp-add-server/README.md)
+- [MCP catalog expansion](web-ui/mcp-catalog-expansion/README.md)
 - [MCP category filter](web-ui/mcp-category-filter/README.md)
 - [mcp-management](web-ui/mcp-management/README.md)
 - [mcp-settings-refinement](web-ui/mcp-settings-refinement/README.md)

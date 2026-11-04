@@ -3,6 +3,8 @@ import {
   CANVA_DEVELOPER_PORTAL_AUTHORIZATION_SERVER,
   CANVA_DEVELOPER_PORTAL_MCP_URL,
   GOOGLE_WORKSPACE_MCP_AUTHORIZATION_SERVER,
+  type McpStaticOAuthBrand,
+  resolveSignInDestination,
 } from "@opentag/shared";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,7 +21,7 @@ import { ApplicationCipher } from "../services/crypto.js";
 import { MCP_ERROR_CODES } from "../services/mcp/errors.js";
 import { McpAuthorizationService } from "../services/mcp/mcp-authorization-service.js";
 import { McpCredentialCipher } from "../services/mcp/mcp-credential-cipher.js";
-import { MCP_OAUTH_STATE_TTL_MS, McpOAuthClient } from "../services/mcp/mcp-oauth.js";
+import { FEISHU_DEFAULT_OAUTH_SCOPES, MCP_OAUTH_STATE_TTL_MS, McpOAuthClient } from "../services/mcp/mcp-oauth.js";
 import { McpOAuthFlowService, orderIssuers } from "../services/mcp/mcp-oauth-flow-service.js";
 import type { McpProbe } from "../services/mcp/mcp-probe.js";
 import { McpServerService } from "../services/mcp/mcp-server-service.js";
@@ -118,9 +120,7 @@ function build(
   options: {
     now?: () => Date;
     googleMcpClient?: { clientId: string; clientSecret: string };
-    staticMcpClients?: Partial<
-      Record<"canva" | "hubspot" | "asana" | "zoom", { clientId: string; clientSecret: string }>
-    >;
+    staticMcpClients?: Partial<Record<McpStaticOAuthBrand, { clientId: string; clientSecret: string }>>;
   } = {},
 ) {
   const { calls, fetchImpl } = oauthNode(routes);
@@ -445,8 +445,8 @@ describe("McpOAuthFlowService.start", () => {
     await expect(flows.start(ids.accountId, ids.agentId, ids.mcpServerId, [], FLOW_SECRET)).rejects.toMatchObject({
       code: MCP_ERROR_CODES.OAUTH_FAILED,
     });
-    // A refused discovery never writes an authorization row.
-    expect(await unit.database.select().from(mcpServerAuthorizations)).toHaveLength(0);
+    // Discovery may reserve identity, but never publishes an unverified flow or credential.
+    await expectUnpublishedAuthorization(ids);
   });
 
   it("requests the protected resource's scopes when no caller requests any", async () => {
@@ -640,6 +640,14 @@ describe("McpOAuthFlowService.start", () => {
 
   describe.each([
     {
+      brand: "github" as const,
+      mcpUrl: "https://api.githubcopilot.com/mcp/",
+      prmUrl: "https://api.githubcopilot.com/.well-known/oauth-protected-resource/mcp",
+      issuer: "https://github.com/login/oauth",
+      tokenUrl: "https://github.com/login/oauth/access_token",
+      method: "post",
+    },
+    {
       brand: "hubspot" as const,
       mcpUrl: "https://mcp.hubspot.com",
       prmUrl: "https://mcp.hubspot.com/.well-known/oauth-protected-resource",
@@ -667,25 +675,39 @@ describe("McpOAuthFlowService.start", () => {
     const client = { clientId: `${brand}-client-id`, clientSecret: `${brand}-client-secret` };
     const routes = (): RouteMap => ({
       [prmUrl]: doc({ resource: mcpUrl, authorization_servers: [issuer] }),
-      [`${issuer}/.well-known/oauth-authorization-server`]: doc({
-        issuer,
-        authorization_endpoint: `${issuer}/oauth/authorize`,
-        token_endpoint: tokenUrl,
-        response_types_supported: ["code"],
-        code_challenge_methods_supported: ["S256"],
+      [new URL(`/.well-known/oauth-authorization-server${new URL(issuer).pathname.replace(/\/$/, "")}`, issuer).href]:
+        doc({
+          issuer,
+          authorization_endpoint: brand === "github" ? `${issuer}/authorize` : `${issuer}/oauth/authorize`,
+          token_endpoint: tokenUrl,
+          response_types_supported: ["code"],
+          code_challenge_methods_supported: ["S256"],
+          ...(brand === "github"
+            ? { scopes_supported: ["offline_access"], authorization_response_iss_parameter_supported: true }
+            : {}),
+        }),
+      [tokenUrl]: doc({
+        access_token: "at_1",
+        refresh_token: "rt_1",
+        expires_in: 600,
+        ...(brand === "github" ? { scope: "repo, read:user" } : {}),
       }),
-      [tokenUrl]: doc({ access_token: "at_1", refresh_token: "rt_1", expires_in: 600 }),
     });
 
     it("is presented at start, the callback and refresh, and registers nothing", async () => {
       const ids = await seed(mcpUrl);
       const { calls, flows } = build(routes(), { staticMcpClients: { [brand]: client } });
-      const started = await flows.start(ids.accountId, ids.agentId, ids.mcpServerId, [], FLOW_SECRET);
+      const scopes = brand === "github" ? ["repo", "offline_access"] : [];
+      const started = await flows.start(ids.accountId, ids.agentId, ids.mcpServerId, scopes, FLOW_SECRET);
       expect(new URL(started.authorizationUrl).searchParams.get("client_id")).toBe(client.clientId);
       expect(started.authorizationUrl).not.toContain(client.clientSecret);
-      await flows.callback({ code: "code-1", state: stateOf(started.authorizationUrl) }, FLOW_SECRET);
+      if (brand === "github") {
+        expect(new URL(started.authorizationUrl).searchParams.get("scope")).toBe("repo offline_access");
+      }
+      await flows.callback({ code: "code-1", state: stateOf(started.authorizationUrl), iss: issuer }, FLOW_SECRET);
       const row = await readAuthorization(ids);
       expect(row?.status).toBe("active");
+      expectGitHubGrantedScopes(brand, row);
       await flows.refreshAuthorization(row?.id as string);
       const tokenCalls = calls.filter((call) => call.url === tokenUrl);
       expect(tokenCalls).toHaveLength(2);
@@ -728,6 +750,236 @@ describe("McpOAuthFlowService.start", () => {
       await expect(flows.start(ids.accountId, ids.agentId, ids.mcpServerId, [], FLOW_SECRET)).rejects.toMatchObject({
         code: MCP_ERROR_CODES.OAUTH_FAILED,
       });
+    });
+  });
+
+  describe("the deployment feishu client", () => {
+    const feishuMcpUrl = "https://mcp.feishu.cn/mcp";
+    const feishuPrmUrl = "https://mcp.feishu.cn/.well-known/oauth-protected-resource/mcp";
+    const feishuIssuer = "https://open.feishu.cn";
+    const feishuAuthorizeUrl = "https://accounts.feishu.cn/open-apis/authen/v1/authorize";
+    const feishuTokenUrl = "https://open.feishu.cn/open-apis/authen/v2/oauth/token";
+    const feishuClient = { clientId: "feishu-app-id", clientSecret: "feishu-app-secret" };
+
+    it("bypasses accounts.feishu.cn/mcp blocked DCR, exchanges code, and rotates tokens with X-Lark-MCP-UAT header", async () => {
+      const ids = await seed(feishuMcpUrl);
+      await unit.database
+        .update(mcpServers)
+        .set({
+          authHeader: "x-lark-mcp-uat",
+          authScheme: "",
+          extraHeaders: {
+            "x-lark-mcp-allowed-tools": "search-user,fetch-file,search-doc,create-doc,fetch-doc,update-doc",
+          },
+        })
+        .where(eq(mcpServers.id, ids.mcpServerId));
+
+      let tokenCallCount = 0;
+      const { calls, cipher, flows, servers } = build(
+        {
+          [feishuPrmUrl]: doc({
+            resource: feishuMcpUrl,
+            authorization_servers: ["https://accounts.feishu.cn/mcp"],
+            scopes_supported: [
+              "mcp-tool:common:fetch-file-v2",
+              "mcp-tool:common:get-user",
+              "mcp-tool:common:search-user",
+              "mcp-tool:docs:search-doc",
+              "mcp-tool:docs:create-doc",
+              "mcp-tool:docs:fetch-doc",
+              "mcp-tool:docs:update-doc",
+              "mcp-tool:docs:get-comments",
+              "mcp-tool:docs:add-comments",
+              "mcp-tool:docs:list-docs-v2",
+              "mcp-tool:im:search-groups",
+              "offline_access",
+            ],
+          }),
+          [feishuTokenUrl]: (init) => {
+            tokenCallCount += 1;
+            const form = new URLSearchParams(String(init.body));
+            expect(form.get("client_id")).toBe(feishuClient.clientId);
+            expect(form.get("client_secret")).toBe(feishuClient.clientSecret);
+            if (tokenCallCount === 1) {
+              expect(form.get("grant_type")).toBe("authorization_code");
+              return doc({
+                code: 0,
+                access_token: "u-feishu-at-1",
+                refresh_token: "ur-feishu-rt-1",
+                token_type: "Bearer",
+                expires_in: 7200,
+                scope: FEISHU_DEFAULT_OAUTH_SCOPES.join(" "),
+              });
+            }
+            expect(form.get("grant_type")).toBe("refresh_token");
+            expect(form.get("refresh_token")).toBe("ur-feishu-rt-1");
+            return doc({
+              code: 0,
+              data: {
+                access_token: "u-feishu-at-2",
+                refresh_token: "ur-feishu-rt-2",
+                token_type: "Bearer",
+                expires_in: 7200,
+                scope: FEISHU_DEFAULT_OAUTH_SCOPES.join(" "),
+              },
+            });
+          },
+        },
+        { staticMcpClients: { feishu: feishuClient } },
+      );
+
+      const started = await flows.start(ids.accountId, ids.agentId, ids.mcpServerId, [], FLOW_SECRET);
+      const authUrl = new URL(started.authorizationUrl);
+      expect(`${authUrl.origin}${authUrl.pathname}`).toBe(feishuAuthorizeUrl);
+      expect(authUrl.searchParams.get("client_id")).toBe(feishuClient.clientId);
+      expect(authUrl.searchParams.get("code_challenge_method")).toBe("S256");
+      expect(authUrl.searchParams.get("scope")).toBe(FEISHU_DEFAULT_OAUTH_SCOPES.join(" "));
+      expect(authUrl.searchParams.get("scope")).not.toContain("mcp-tool:");
+      expect(calls.some((call) => call.url.includes("accounts.feishu.cn"))).toBe(false);
+
+      await flows.callback({ code: "feishu-code-1", state: stateOf(started.authorizationUrl) }, FLOW_SECRET);
+      const afterCallback = await readAuthorization(ids);
+      expect(afterCallback).toMatchObject({
+        status: "active",
+        authorizationServer: feishuIssuer,
+        scopes: [...FEISHU_DEFAULT_OAUTH_SCOPES],
+      });
+
+      const authorizationService = new McpAuthorizationService({
+        database: unit.database,
+        cipher,
+        servers,
+        probe: { probe: vi.fn() } as unknown as McpProbe,
+      });
+      expect(await authorizationService.buildHeaders(ids.accountId, ids.agentId, ids.mcpServerId)).toEqual({
+        "x-lark-mcp-uat": "u-feishu-at-1",
+        "x-lark-mcp-allowed-tools": "search-user,fetch-file,search-doc,create-doc,fetch-doc,update-doc",
+      });
+
+      await flows.refreshAuthorization(afterCallback?.id as string);
+      const afterRefresh = await readAuthorization(ids);
+      expect(afterRefresh).toMatchObject({
+        status: "active",
+        failureCode: null,
+        refreshGeneration: 2,
+      });
+      expect(
+        cipher.decryptAuthorizationCredential(
+          { mcpServerId: ids.mcpServerId, agentId: ids.agentId, authorizationServer: feishuIssuer },
+          { ciphertext: afterRefresh?.ciphertext as string, keyId: afterRefresh?.keyId as string },
+        ),
+      ).toEqual({
+        accessToken: "u-feishu-at-2",
+        refreshToken: "ur-feishu-rt-2",
+        tokenType: "Bearer",
+      });
+      expect(await authorizationService.buildHeaders(ids.accountId, ids.agentId, ids.mcpServerId)).toEqual({
+        "x-lark-mcp-uat": "u-feishu-at-2",
+        "x-lark-mcp-allowed-tools": "search-user,fetch-file,search-doc,create-doc,fetch-doc,update-doc",
+      });
+    });
+
+    it.each([
+      {
+        label: "with error field (20003)",
+        payload: { code: 20003, error: "invalid_grant", error_description: "expired" },
+        status: 200,
+      },
+      { label: "numeric-only 20026", payload: { code: 20026, msg: "refresh_token invalid" }, status: 400 },
+      { label: "numeric-only 20037", payload: { code: 20037, msg: "refresh_token expired" }, status: 400 },
+      { label: "numeric-only 20064 (revoked)", payload: { code: 20064, msg: "refresh_token revoked" }, status: 400 },
+      { label: "numeric-only 20073", payload: { code: 20073, msg: "refresh_token consumed" }, status: 400 },
+    ])(
+      "transitions a Feishu authorization to revoked when refresh_token is terminally rejected ($label)",
+      async ({ payload, status }) => {
+        const ids = await seed(feishuMcpUrl);
+        const { row } = await authorizedRow(
+          ids,
+          { accessToken: "u-feishu-at-1", refreshToken: "ur-expired" },
+          { authorizationServer: feishuIssuer, flowAuthorizationServer: feishuIssuer, oauthResource: feishuMcpUrl },
+        );
+        const cipher = new McpCredentialCipher(new ApplicationCipher(new Uint8Array(32).fill(7)));
+        const sealed = cipher.encryptAuthorizationCredential(
+          { mcpServerId: ids.mcpServerId, agentId: ids.agentId, authorizationServer: feishuIssuer },
+          { accessToken: "u-feishu-at-1", refreshToken: "ur-expired" },
+        );
+        await unit.database
+          .update(mcpServerAuthorizations)
+          .set({ ciphertext: sealed.ciphertext, keyId: sealed.keyId })
+          .where(eq(mcpServerAuthorizations.id, row?.id as string));
+
+        const { flows } = build(
+          {
+            [feishuTokenUrl]: doc(payload, status),
+          },
+          { staticMcpClients: { feishu: feishuClient } },
+        );
+        await flows.refreshAuthorization(row?.id as string);
+        expect(await readAuthorization(ids)).toMatchObject({
+          status: "revoked",
+          failureCode: null,
+          ciphertext: null,
+          keyId: null,
+          accessTokenExpiresAt: null,
+          refreshClaimId: null,
+        });
+      },
+    );
+
+    it("clears potentially consumed Feishu refresh credentials on 5xx or transport failure without blind reuse", async () => {
+      const ids = await seed(feishuMcpUrl);
+      const cipher = new McpCredentialCipher(new ApplicationCipher(new Uint8Array(32).fill(7)));
+      const sealed = cipher.encryptAuthorizationCredential(
+        { mcpServerId: ids.mcpServerId, agentId: ids.agentId, authorizationServer: feishuIssuer },
+        { accessToken: "u-feishu-at-1", refreshToken: "ur-feishu-rt-1" },
+      );
+      const [row] = await unit.database
+        .insert(mcpServerAuthorizations)
+        .values({
+          agentId: ids.agentId,
+          mcpServerId: ids.mcpServerId,
+          kind: "oauth",
+          status: "active",
+          authorizationServer: feishuIssuer,
+          oauthResource: feishuMcpUrl,
+          ciphertext: sealed.ciphertext,
+          keyId: sealed.keyId,
+          probeState: "succeeded",
+        })
+        .returning();
+
+      const { flows } = build(
+        {
+          [feishuTokenUrl]: { status: 502, body: "<html>502 Bad Gateway</html>" },
+        },
+        { staticMcpClients: { feishu: feishuClient } },
+      );
+      await flows.refreshAuthorization(row?.id as string);
+      expect(await readAuthorization(ids)).toMatchObject({
+        status: "error",
+        failureCode: MCP_ERROR_CODES.REFRESH_OUTCOME_UNKNOWN,
+        ciphertext: null,
+        keyId: null,
+        refreshClaimId: null,
+      });
+    });
+
+    it("does not offer the Feishu client to a Lark origin or rewrite Lark authorization servers", async () => {
+      const larkMcpUrl = "https://mcp.larksuite.com/mcp";
+      const ids = await seed(larkMcpUrl);
+      const { calls, flows } = build(
+        {
+          "https://mcp.larksuite.com/.well-known/oauth-protected-resource/mcp": doc({
+            resource: larkMcpUrl,
+            authorization_servers: ["https://accounts.larksuite.com/mcp"],
+          }),
+        },
+        { staticMcpClients: { feishu: feishuClient } },
+      );
+      await expect(flows.start(ids.accountId, ids.agentId, ids.mcpServerId, [], FLOW_SECRET)).rejects.toMatchObject({
+        code: MCP_ERROR_CODES.OAUTH_FAILED,
+      });
+      expect(JSON.stringify(calls)).not.toContain(feishuClient.clientSecret);
     });
   });
 
@@ -1023,7 +1275,7 @@ describe("McpOAuthFlowService.start", () => {
     await expect(flows.start(ids.accountId, ids.agentId, ids.mcpServerId, [], FLOW_SECRET)).rejects.toMatchObject({
       code: MCP_ERROR_CODES.URL_BLOCKED,
     });
-    expect(await unit.database.select().from(mcpServerAuthorizations)).toEqual([]);
+    await expectUnpublishedAuthorization(ids);
   });
 
   it("reports every issuer it tried when none of them can be used", async () => {
@@ -1040,7 +1292,7 @@ describe("McpOAuthFlowService.start", () => {
       .catch((caught: unknown) => caught);
     expect(error).toMatchObject({ code: MCP_ERROR_CODES.OAUTH_FAILED });
     expect(JSON.stringify((error as { detail?: unknown }).detail)).toContain("tried");
-    expect(await unit.database.select().from(mcpServerAuthorizations)).toEqual([]);
+    await expectUnpublishedAuthorization(ids);
   });
 
   it("refuses a start for an Agent that does not mount the Server", async () => {
@@ -1434,7 +1686,7 @@ describe("McpOAuthFlowService.callback", () => {
     });
     const [registration] = await unit.database.select().from(mcpClientRegistrations);
     expect(registration?.clientId).toBe("someone-elses-client");
-    expect(await unit.database.select().from(mcpServerAuthorizations)).toEqual([]);
+    await expectUnpublishedAuthorization(ids);
   });
 
   it("refuses to redeem a code when no client registration survives for the issuer", async () => {
@@ -1801,7 +2053,7 @@ describe("McpOAuthFlowService.refreshAuthorization", () => {
     }
   });
 
-  it("keeps the token and asks for a human when the outcome is unknown", async () => {
+  it("clears potentially consumed credentials when the refresh outcome is unknown", async () => {
     const ids = await seed();
     const { row } = await authorizedRow(ids, { accessToken: "at_1", refreshToken: "rt_1" });
     await unit.database.insert(mcpClientRegistrations).values({
@@ -1818,11 +2070,12 @@ describe("McpOAuthFlowService.refreshAuthorization", () => {
     });
     await flows.refreshAuthorization(row?.id as string);
     const after = await readAuthorization(ids);
-    // A blind retry could spend a token the AS already rotated away, so the token is kept untouched.
+    // A blind retry could spend a token the AS already rotated away; remove the replayable material.
     expect(after).toMatchObject({
       status: "error",
       failureCode: MCP_ERROR_CODES.REFRESH_OUTCOME_UNKNOWN,
-      ciphertext: row?.ciphertext,
+      ciphertext: null,
+      keyId: null,
     });
   });
 
@@ -1848,7 +2101,7 @@ describe("McpOAuthFlowService.refreshAuthorization", () => {
     });
   });
 
-  it("classifies a failure that is not a service error as an unknown outcome", async () => {
+  it("preserves unspent credentials when client preparation fails before dispatch", async () => {
     /*
      * The client resolution throws a plain `Error` when the recorded secret cannot be authenticated.
      * That is not a `McpServiceError`, so the row keeps its token and asks a human rather than
@@ -1871,8 +2124,9 @@ describe("McpOAuthFlowService.refreshAuthorization", () => {
     expect(calls.filter((call) => call.url === TOKEN_URL)).toEqual([]);
     expect(await readAuthorization(ids)).toMatchObject({
       status: "error",
-      failureCode: MCP_ERROR_CODES.REFRESH_OUTCOME_UNKNOWN,
+      failureCode: MCP_ERROR_CODES.OAUTH_FAILED,
       ciphertext: row?.ciphertext,
+      keyId: row?.keyId,
     });
   });
 
@@ -2070,4 +2324,243 @@ describe("cancelling reauthorization", () => {
     ).rejects.toMatchObject({ code: MCP_ERROR_CODES.OAUTH_FLOW_INVALID });
     expect((await readAuthorization(ids))?.ciphertext).toBe(before?.ciphertext);
   });
+
+  describe("browser handoff", () => {
+    /*
+     * `startWithHandoff` is the Agent self-service path (`source: "agent-self"`), so the Agent behind
+     * it must have the owner's opt-in. Seeding it here rather than in the shared `seed()` keeps the
+     * Account-surface tests on the default: an Agent with self-configuration off is still authorized
+     * by a human, and only the self-service entry point may refuse.
+     */
+    async function handoffSeed() {
+      const ids = await seed();
+      await unit.database.update(agents).set({ selfConfigurationEnabled: true }).where(eq(agents.id, ids.agentId));
+      return ids;
+    }
+
+    it("starts with handoff and redeems token successfully", async () => {
+      const ids = await handoffSeed();
+      const { flows } = build(discoverableAs());
+      const started = await flows.startWithHandoff(
+        ids.accountId,
+        ids.agentId,
+        ids.mcpServerId,
+        [],
+        "https://opentag.example",
+      );
+      expect(started.authorizationUrl).toContain("/api/v1/mcp-servers/oauth/handoff?token=");
+      const token = new URL(started.authorizationUrl).searchParams.get("token");
+      expect(token).not.toBeNull();
+      const redeemed = await flows.redeemHandoffToken(token ?? "", ids.accountId);
+      expect(redeemed.targetUrl).toContain("https://auth.example.com/authorize");
+      expect(redeemed.flowSecret).toBeDefined();
+    });
+
+    it("allows handoff redemption when reauthorizing an existing active credential", async () => {
+      const ids = await handoffSeed();
+      const { flows } = build({
+        ...discoverableAs(),
+        [TOKEN_URL]: doc({ access_token: "active-token", expires_in: 3600 }),
+      });
+      const initial = await flows.start(ids.accountId, ids.agentId, ids.mcpServerId, [], FLOW_SECRET);
+      await flows.callback({ code: "initial-code", state: stateOf(initial.authorizationUrl) }, FLOW_SECRET);
+      const auth = await readAuthorization(ids);
+      expect(auth?.status).toBe("active");
+
+      const started = await flows.startWithHandoff(
+        ids.accountId,
+        ids.agentId,
+        ids.mcpServerId,
+        [],
+        "https://opentag.example",
+      );
+      const token = new URL(started.authorizationUrl).searchParams.get("token");
+      expect(token).not.toBeNull();
+
+      const redeemed = await flows.redeemHandoffToken(token ?? "", ids.accountId);
+      expect(redeemed.targetUrl).toContain("https://auth.example.com/authorize");
+      expect(redeemed.flowSecret).toBeDefined();
+    });
+
+    it("rejects expired handoff token", async () => {
+      const { cipher, flows } = build(discoverableAs());
+      const expiredToken = cipher.encryptHandoff({
+        flowSecret: FLOW_SECRET,
+        targetUrl: "https://example.com",
+        stateHash: "hash",
+        expiresAt: Date.now() - 10000,
+      });
+      await expect(flows.redeemHandoffToken(expiredToken, randomUUID())).rejects.toMatchObject({
+        code: MCP_ERROR_CODES.OAUTH_FLOW_INVALID,
+      });
+    });
+
+    it("rejects handoff token when no flow is bound to its state", async () => {
+      const { cipher, flows } = build(discoverableAs());
+      const token = cipher.encryptHandoff({
+        flowSecret: FLOW_SECRET,
+        targetUrl: "https://example.com",
+        stateHash: "nonexistent-state-hash",
+        expiresAt: Date.now() + 60000,
+      });
+      // The Account cannot matter here: the lookups that could tell it apart never run.
+      await expect(flows.redeemHandoffToken(token, randomUUID())).rejects.toMatchObject({
+        code: MCP_ERROR_CODES.OAUTH_FLOW_INVALID,
+      });
+    });
+
+    it("survives the sign-in round trip unresolved and redeems only for its owner", async () => {
+      /*
+       * The whole round trip an unauthenticated human takes: the Agent hands out a link, the browser is
+       * bounced through `/login?next=…`, and the destination has to come back intact and still
+       * redeemable. Two things used to break here — a destination bound tighter than the URL this
+       * deployment mints, and a redemption that treated being shown to a browser as being used.
+       */
+      const ids = await handoffSeed();
+      const { cipher, flows } = build(discoverableAs());
+      const started = await flows.startWithHandoff(
+        ids.accountId,
+        ids.agentId,
+        ids.mcpServerId,
+        [],
+        "https://opentag.example",
+      );
+
+      const url = new URL(started.authorizationUrl);
+      const destination = `${url.pathname}${url.search}`;
+      // The sign-in allowlist carries the real generated URL, token and all.
+      expect(resolveSignInDestination(destination)).toBe(destination);
+
+      // Passing through sign-in reads the destination; it must not consume the flow.
+      // This fixture's own URL already runs past the bound that used to refuse a real one.
+      expect(destination.length).toBeGreaterThan(1024);
+
+      // Passing through sign-in reads the destination; it must not consume the flow.
+      const token = url.searchParams.get("token") ?? "";
+      const before = await readAuthorization(ids);
+      expect(before?.state).not.toBeNull();
+      expect(before?.loginSessionHash).toBe(hashSecret(cipher.decryptHandoff(token).flowSecret));
+      const redeemed = await flows.redeemHandoffToken(token, ids.accountId);
+      expect(redeemed.targetUrl).toContain("https://auth.example.com/authorize");
+      // Only now is the issued binding gone, replaced by the fresh secret the cookie will carry.
+      const after = await readAuthorization(ids);
+      expect(after?.state).not.toBeNull();
+      expect(after?.loginSessionHash).toBe(hashSecret(redeemed.flowSecret));
+      expect(after?.loginSessionHash).not.toBe(before?.loginSessionHash);
+    });
+
+    it("rejects a handoff token whose flow state has already lapsed", async () => {
+      const ids = await handoffSeed();
+      const { flows } = build(discoverableAs());
+      const started = await flows.startWithHandoff(
+        ids.accountId,
+        ids.agentId,
+        ids.mcpServerId,
+        [],
+        "https://opentag.example",
+      );
+      const token = new URL(started.authorizationUrl).searchParams.get("token") ?? "";
+      await unit.database
+        .update(mcpServerAuthorizations)
+        .set({ stateExpiresAt: new Date(Date.now() - 1000) })
+        .where(eq(mcpServerAuthorizations.agentId, ids.agentId));
+
+      await expect(flows.redeemHandoffToken(token, ids.accountId)).rejects.toMatchObject({
+        code: MCP_ERROR_CODES.OAUTH_FLOW_INVALID,
+      });
+    });
+
+    it("rejects a handoff token that does not match the flow's browser binding", async () => {
+      const ids = await handoffSeed();
+      const { flows } = build(discoverableAs());
+      const started = await flows.startWithHandoff(
+        ids.accountId,
+        ids.agentId,
+        ids.mcpServerId,
+        [],
+        "https://opentag.example",
+      );
+      const token = new URL(started.authorizationUrl).searchParams.get("token") ?? "";
+
+      /*
+       * The row's own CHECK constraint refuses a null binding while a state is live, so the only
+       * reachable mismatch is a different browser's secret.
+       */
+      await unit.database
+        .update(mcpServerAuthorizations)
+        .set({ loginSessionHash: hashSecret("another-browser") })
+        .where(eq(mcpServerAuthorizations.agentId, ids.agentId));
+      await expect(flows.redeemHandoffToken(token, ids.accountId)).rejects.toMatchObject({
+        code: MCP_ERROR_CODES.OAUTH_FLOW_INVALID,
+      });
+    });
+
+    it("redeems a handoff token exactly once", async () => {
+      const ids = await handoffSeed();
+      const { flows } = build(discoverableAs());
+      const started = await flows.startWithHandoff(
+        ids.accountId,
+        ids.agentId,
+        ids.mcpServerId,
+        [],
+        "https://opentag.example",
+      );
+      const token = new URL(started.authorizationUrl).searchParams.get("token") ?? "";
+
+      const first = await flows.redeemHandoffToken(token, ids.accountId);
+      /*
+       * The secret the browser is given is not the one the token carried, and the callback accepts
+       * exactly the new one — so a replayed link cannot re-bind the flow to another browser.
+       */
+      expect(first.flowSecret).not.toBe(FLOW_SECRET);
+      expect((await readAuthorization(ids))?.loginSessionHash).toBe(hashSecret(first.flowSecret));
+      await expect(flows.redeemHandoffToken(token, ids.accountId)).rejects.toMatchObject({
+        code: MCP_ERROR_CODES.OAUTH_FLOW_INVALID,
+      });
+    });
+
+    it("refuses a handoff token belonging to another Account, as a missing Server", async () => {
+      const ids = await handoffSeed();
+      const stranger = await handoffSeed();
+      const { flows } = build(discoverableAs());
+      const started = await flows.startWithHandoff(
+        ids.accountId,
+        ids.agentId,
+        ids.mcpServerId,
+        [],
+        "https://opentag.example",
+      );
+      const token = new URL(started.authorizationUrl).searchParams.get("token") ?? "";
+
+      // 404, not 403: a stranger must not learn from the answer that the flow is real.
+      await expect(flows.redeemHandoffToken(token, stranger.accountId)).rejects.toMatchObject({
+        code: MCP_ERROR_CODES.SERVER_NOT_FOUND,
+        statusCode: 404,
+      });
+      // The refusal does not consume the token for its real owner.
+      const redeemed = await flows.redeemHandoffToken(token, ids.accountId);
+      expect(redeemed.targetUrl).toContain("https://auth.example.com/authorize");
+    });
+  });
 });
+
+function expectGitHubGrantedScopes(brand: McpStaticOAuthBrand, row: { scopes: string[] | null } | undefined) {
+  if (brand === "github") expect(row?.scopes).toEqual(["repo", "read:user"]);
+}
+
+async function expectUnpublishedAuthorization(ids: { agentId: string; mcpServerId: string }) {
+  expect(await unit.database.select().from(mcpServerAuthorizations)).toMatchObject([
+    {
+      agentId: ids.agentId,
+      mcpServerId: ids.mcpServerId,
+      kind: "oauth",
+      status: "pending",
+      state: null,
+      pkceCiphertext: null,
+      ciphertext: null,
+      keyId: null,
+      authorizationServer: null,
+      clientRegistrationId: null,
+    },
+  ]);
+}

@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentRuntimeEvent, CreateAgentRuntimeRequest } from "../agent-runtime/types.js";
 import {
@@ -62,6 +65,25 @@ describe("CodexAgentRuntime", () => {
       effort: "high",
     });
     await runtime.close();
+  });
+
+  it("writes the exact managed CLI prefix even without user command allowances", async () => {
+    const root = await mkdtemp(join(tmpdir(), "opentag-codex-managed-cli-"));
+    const invocation = ["/opt/current node/bin/node", "/opt/owner's app/cli/index.mjs"];
+    const request = createRequest(() => undefined);
+    const runtime = await codexFactory(new ScriptedCodexClient("complete")).create({
+      ...request,
+      workspace: { cwd: root },
+      policy: { ...request.policy, managedCli: invocation },
+    });
+    try {
+      const rules = await readFile(join(root, ".codex/rules/opentag.rules"), "utf8");
+      expect(rules).toContain(`prefix_rule(pattern=${JSON.stringify(invocation)}, decision="allow")`);
+      expect(rules).not.toContain(`pattern=${JSON.stringify([invocation[0]])}`);
+    } finally {
+      await runtime.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("resumes only the exact thread encoded by the binding", async () => {
@@ -208,16 +230,19 @@ describe("CodexAgentRuntime", () => {
     });
   });
 
-  it("passes only provider-owned environment variables to Codex", () => {
-    expect(
-      codexAgentRuntimeEnvironment({
-        HOME: "/home/provider",
-        PATH: "/bin",
-        OPENAI_API_KEY: "provider-key",
-        OPENTAG_ACCESS_TOKEN: "opentag-secret",
-        RANDOM_SECRET: "other-secret",
-      }),
-    ).toEqual({ HOME: "/home/provider", PATH: "/bin" });
+  it("preserves native plugin variables and does not mutate the source environment", () => {
+    const source = {
+      HOME: "/home/provider",
+      PATH: "/bin",
+      CODEX_HOME: "/home/provider/.codex",
+      PLUGIN_API_KEY: "fixture-plugin-key",
+      CUSTOM_PLUGIN_OPTION: "fixture-option",
+    };
+    const environment = codexAgentRuntimeEnvironment(source);
+    expect(environment).toEqual(source);
+    expect(environment).not.toBe(source);
+    environment.PLUGIN_API_KEY = "replacement";
+    expect(source.PLUGIN_API_KEY).toBe("fixture-plugin-key");
   });
 });
 

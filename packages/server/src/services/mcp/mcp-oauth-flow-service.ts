@@ -1,24 +1,43 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import {
   GOOGLE_WORKSPACE_MCP_AUTHORIZATION_SERVER,
   isGoogleWorkspaceMcpEndpoint,
   isMcpStaticOAuthEndpoint,
   MCP_CATALOG_DEPLOYMENT_ENDPOINTS,
+  MCP_OAUTH_HANDOFF_PATH,
   MCP_STATIC_OAUTH_PROVIDERS,
   type MCPCatalogEndpoint,
   type McpStaticOAuthBrand,
 } from "@opentag/shared";
-import { and, eq, isNull, lte, or, sql } from "drizzle-orm";
+import { and, eq, isNull, or, sql } from "drizzle-orm";
 import type { DatabaseClient } from "../../db/client.js";
-import { agents, mcpClientRegistrations, mcpServerAuthorizations } from "../../db/schema/index.js";
-import { hashSecret } from "../auth/security.js";
+import {
+  agentMcpServers,
+  agents,
+  mcpClientRegistrations,
+  mcpServerAuthorizations,
+  mcpServers,
+} from "../../db/schema/index.js";
+import type { ServiceLogger } from "../../observability/service-logger.js";
+import { generateSecret, hashSecret } from "../auth/security.js";
 import { MCP_ERROR_CODES, McpServiceError } from "./errors.js";
+import {
+  invalidateMcpCredentialProbes,
+  type McpAuthorizationContext,
+  mcpConfigEqual,
+  mcpEffectiveConfig,
+  readMcpAuthorizationContexts,
+  readMcpCredentialRoot,
+} from "./mcp-authorization-graph.js";
+import { lockMcpAccounts, lockMcpCredentialBinding } from "./mcp-binding-locks.js";
 import type { McpCredentialCipher } from "./mcp-credential-cipher.js";
 import {
+  FEISHU_MCP_ISSUER,
   MCP_OAUTH_STATE_TTL_MS,
   type McpAuthorizationServerMetadata,
   type McpClientCredentials,
   McpOAuthClient,
+  type McpProtectedResourceMetadata,
   mcpCallbackRedirect,
   normalizeAuthorizationServerIssuer,
   normalizeResource,
@@ -61,13 +80,14 @@ export interface McpOAuthFlowServiceOptions {
    */
   googleMcpClient?: { clientId: string; clientSecret: string };
   /**
-   * The deployment's static clients for providers without DCR or CIMD (Canva, HubSpot, Asana, Zoom),
+   * The deployment's static clients for providers without DCR or CIMD,
    * keyed by brand and present only for a brand whose `OPENTAG_MCP_<BRAND>_CLIENT_*` pair is
    * configured. Each is offered only to that provider's own MCP origins and exact issuer. Canva's is
    * Developer Portal only: the waitlist endpoint at `mcp.canva.com` keeps its automatic resolution.
    */
   staticMcpClients?: Partial<Record<McpStaticOAuthBrand, { clientId: string; clientSecret: string }>>;
   now?: () => Date;
+  logger?: ServiceLogger;
 }
 
 /**
@@ -116,6 +136,7 @@ function deploymentOAuthClients(options: McpOAuthFlowServiceOptions): readonly D
 export interface StartedMcpOAuth {
   authorizationUrl: string;
   expiresAt: Date;
+  state: string;
 }
 
 export class McpOAuthFlowService {
@@ -125,6 +146,7 @@ export class McpOAuthFlowService {
   readonly #now: () => Date;
   readonly #oauth: McpOAuthClient;
   readonly #servers: McpServerService;
+  readonly #logger: ServiceLogger | undefined;
 
   constructor(options: McpOAuthFlowServiceOptions) {
     this.#cipher = options.cipher;
@@ -133,6 +155,7 @@ export class McpOAuthFlowService {
     this.#now = options.now ?? (() => new Date());
     this.#oauth = options.oauth;
     this.#servers = options.servers;
+    this.#logger = options.logger;
   }
 
   /**
@@ -144,6 +167,20 @@ export class McpOAuthFlowService {
       const url = client.catalogId === undefined ? undefined : MCP_CATALOG_DEPLOYMENT_ENDPOINTS[client.catalogId];
       return client.catalogId === undefined || url === undefined ? [] : [{ catalogId: client.catalogId, url }];
     });
+  }
+
+  reusableClient(
+    effectiveUrl: string,
+    issuer: string,
+    clientId: string | undefined,
+    registrationId: string | null,
+  ): boolean {
+    const deployed = this.#deploymentClients.find(
+      (client) => client.matchesEndpoint(effectiveUrl) && client.issuer === issuer,
+    );
+    return deployed
+      ? clientId === deployed.clientId
+      : registrationId !== null || clientId === this.#oauth.clientMetadataUrl;
   }
 
   /**
@@ -162,8 +199,9 @@ export class McpOAuthFlowService {
      * silently produce an unbound flow, which is the vulnerability this parameter exists to close.
      */
     flowSecret: string,
+    source: "account" | "agent-self" = "account",
   ): Promise<StartedMcpOAuth> {
-    const context = await this.#servers.readProbeContext(accountId, agentId, mcpServerId);
+    const context = await this.#prepareAuthorization(accountId, agentId, mcpServerId, source);
     const effective = McpServerService.resolveEffectiveConfig(context.server, context.binding);
     const existing = context.authorization;
 
@@ -177,10 +215,6 @@ export class McpOAuthFlowService {
     const state = McpOAuthClient.createState();
     const now = this.#now();
     const expiresAt = new Date(now.getTime() + MCP_OAUTH_STATE_TTL_MS);
-    const sealedPkce = this.#cipher.encryptPkceVerifier(
-      { mcpServerId, agentId, authorizationServer: metadata.issuer },
-      pkce.verifier,
-    );
     /*
      * The protected resource's own scopes are the fallback the specification names, and for Google
      * they are load-bearing: an authorization request with no `scope` at all is rejected outright.
@@ -196,87 +230,253 @@ export class McpOAuthFlowService {
       ...(client.authorizationParams ? { authorizationParams: client.authorizationParams } : {}),
     });
 
-    await this.#database
-      .insert(mcpServerAuthorizations)
-      .values({
-        agentId,
-        mcpServerId,
-        kind: "oauth",
-        status: "pending",
-        // A row created by a flow has no credential yet, so the flow's issuer is also its own.
-        authorizationServer: metadata.issuer,
-        flowAuthorizationServer: metadata.issuer,
-        flowOauthResource: resource,
-        clientRegistrationId: registrationId,
-        // Stored hashed: the raw state is only ever in the URL the browser carries.
+    await this.#database.transaction(async (transaction) => {
+      await lockMcpCredentialBinding(transaction, accountId, agentId, mcpServerId, source);
+      const [current] = await readMcpAuthorizationContexts(
+        transaction,
+        and(eq(mcpServers.accountId, accountId), eq(mcpServers.id, mcpServerId), eq(agentMcpServers.agentId, agentId)),
+      );
+      requireUnchangedMcpBinding(context, current, effective);
+      const root = current.credentialAuthorization;
+      const holder = root?.agentId ?? agentId;
+      const family = root
+        ? await transaction
+            .select({ id: mcpServerAuthorizations.id })
+            .from(mcpServerAuthorizations)
+            .where(eq(mcpServerAuthorizations.credentialSourceId, root.id))
+            .limit(1)
+        : [];
+      const sharedFormat =
+        this.#servers.reuseOAuth || Boolean(current.localAuthorization?.credentialSourceId) || family.length > 0;
+      const sealedPkce = sharedFormat
+        ? this.#cipher.encryptPkceFlow(
+            { mcpServerId, agentId: holder, authorizationServer: metadata.issuer },
+            {
+              version: 2,
+              accountId,
+              initiatingAgentId: agentId,
+              codeVerifier: pkce.verifier,
+              clientId: client.clientId,
+              registrationId,
+              scopes,
+              config: effective,
+            },
+          )
+        : this.#cipher.encryptPkceVerifier(
+            { mcpServerId, agentId: holder, authorizationServer: metadata.issuer },
+            pkce.verifier,
+          );
+      const flow = {
         state: hashSecret(state),
         stateExpiresAt: expiresAt,
         pkceCiphertext: sealedPkce.ciphertext,
-        scopes,
         loginSessionHash: hashSecret(flowSecret),
-        probeState: "pending",
-        createdAt: now,
+        flowAuthorizationServer: metadata.issuer,
+        flowOauthResource: resource,
         updatedAt: now,
-      })
-      .onConflictDoUpdate({
-        target: [mcpServerAuthorizations.mcpServerId, mcpServerAuthorizations.agentId],
-        set: {
+      };
+      if (root) {
+        await transaction
+          .update(mcpServerAuthorizations)
+          .set({
+            ...flow,
+            kind: "oauth",
+            // The old credential and refresh claim remain valid until consent succeeds.
+            ...(!root.ciphertext
+              ? {
+                  kind: "oauth" as const,
+                  status: "pending" as const,
+                  authorizationServer: metadata.issuer,
+                  clientRegistrationId: registrationId,
+                  scopes,
+                  failureCode: null,
+                }
+              : {}),
+            revision: sql`${mcpServerAuthorizations.revision} + 1`,
+          })
+          .where(eq(mcpServerAuthorizations.id, root.id));
+      } else {
+        await transaction.insert(mcpServerAuthorizations).values({
+          ...flow,
+          agentId,
+          mcpServerId,
           kind: "oauth",
-          // A restarted flow invalidates the previous state in the same write, so an old callback
-          // URL can no longer be redeemed.
-          state: hashSecret(state),
-          stateExpiresAt: expiresAt,
-          pkceCiphertext: sealedPkce.ciphertext,
-          /*
-           * The flow's issuer goes in its own column, and `authorizationServer` is left alone unless
-           * there is no credential to protect.
-           *
-           * `authorizationServer` is the credential envelope's AAD, so writing this flow's issuer over
-           * it while an existing ciphertext stays on the row made that ciphertext undecryptable. The
-           * row's credential is only replaced at the callback, which writes the credential's issuer and
-           * the new envelope together — so a row that keeps its credential keeps the issuer that sealed
-           * it.
-           */
-          flowAuthorizationServer: metadata.issuer,
-          /*
-           * The flow's audience goes in `flow_oauth_resource`, mirroring the issuer split: the
-           * credential's `oauth_resource` is replaced only at the callback, together with the
-           * credential it belongs to, so an abandoned flow cannot change a working credential.
-           */
-          flowOauthResource: resource,
-          /*
-           * `authorizationServer` is only written when the row has no credential to protect.
-           *
-           * It is the credential envelope's AAD — and it is legitimately `null` for a Bearer row, whose
-           * key is not issued by any authorization server. Writing this flow's issuer into it either
-           * invalidated a working credential or, with a `coalesce`, filled in a column the Bearer
-           * envelope was sealed against being null. The flow's own issuer is `flowAuthorizationServer`,
-           * and the credential's issuer is replaced only at the callback, together with the envelope.
-           */
-          authorizationServer: sql`case when ${mcpServerAuthorizations.ciphertext} is null then ${metadata.issuer} else ${mcpServerAuthorizations.authorizationServer} end`,
-          clientRegistrationId: sql`case when ${mcpServerAuthorizations.ciphertext} is null then ${registrationId}::uuid else ${mcpServerAuthorizations.clientRegistrationId} end`,
+          status: "pending",
+          authorizationServer: metadata.issuer,
+          clientRegistrationId: registrationId,
           scopes,
-          /*
-           * The existing credential is deliberately left in place, and so is its `status`.
-           *
-           * Both used to be reset here, which meant that starting a flow destroyed a working token
-           * before the user had consented to anything: open the dialog on an Agent that already works,
-           * close the tab, and the Agent is unauthorized with no way back except authorizing again.
-           * A live flow is identified by `state` being set and unexpired — which is how the callback
-           * finds its row — so nothing needs `status` to be bent for the flow's sake. A row that has
-           * no credential yet still gets `pending`, because that is the honest description of it.
-           */
-          status: sql`case when ${mcpServerAuthorizations.ciphertext} is null then 'pending' else ${mcpServerAuthorizations.status} end`,
-          failureCode: null,
           probeState: "pending",
-          loginSessionHash: hashSecret(flowSecret),
-          refreshClaimId: null,
-          refreshClaimedAt: null,
-          revision: sql`${mcpServerAuthorizations.revision} + 1`,
-          updatedAt: now,
-        },
-      });
-    return { authorizationUrl, expiresAt };
+          createdAt: now,
+        });
+      }
+    });
+    return { authorizationUrl, expiresAt, state };
+  }
+
+  async #prepareAuthorization(
+    accountId: string,
+    agentId: string,
+    mcpServerId: string,
+    source: "account" | "agent-self",
+  ) {
+    return this.#database.transaction(async (transaction) => {
+      await lockMcpCredentialBinding(transaction, accountId, agentId, mcpServerId, source);
+      const [context] = await readMcpAuthorizationContexts(
+        transaction,
+        and(eq(mcpServers.accountId, accountId), eq(mcpServers.id, mcpServerId), eq(agentMcpServers.agentId, agentId)),
+        { tools: false, limit: 1 },
+      );
+      if (!context) throw new McpServiceError(MCP_ERROR_CODES.BINDING_NOT_FOUND, "The MCP binding was not found");
+      if (context.localAuthorization) return context;
+      const [root] = await transaction
+        .insert(mcpServerAuthorizations)
+        .values({
+          agentId,
+          mcpServerId,
+          kind: "oauth",
+          status: "pending",
+          createdAt: this.#now(),
+          updatedAt: this.#now(),
+        })
+        .returning();
+      if (!root) throw new McpServiceError(MCP_ERROR_CODES.OAUTH_FAILED, "The authorization could not be prepared");
+      return { ...context, authorization: root, localAuthorization: root, credentialAuthorization: root };
+    });
+  }
+
+  /**
+   * Start an OAuth flow with a same-origin handoff URL for Agent self-service.
+   *
+   * An Agent CLI or runtime cannot set cookies in the user's browser directly.
+   * By routing through `MCP_OAUTH_HANDOFF_PATH`, the user's browser receives the
+   * required single-use `mcpOAuthContext` cookie and is immediately redirected to
+   * the upstream provider authorization URL, preserving full PKCE/state/cookie security.
+   */
+  async startWithHandoff(
+    accountId: string,
+    agentId: string,
+    mcpServerId: string,
+    requestedScopes: readonly string[] = [],
+    publicOrigin: string,
+    source: "account" | "agent-self" = "agent-self",
+  ): Promise<StartedMcpOAuth> {
+    const flowSecret = randomUUID();
+    const started = await this.start(accountId, agentId, mcpServerId, requestedScopes, flowSecret, source);
+    const handoffUrl = this.createHandoffUrl({
+      flowSecret,
+      authorizationUrl: started.authorizationUrl,
+      state: started.state,
+      expiresAt: started.expiresAt,
+      publicOrigin,
+    });
+    return {
+      authorizationUrl: handoffUrl,
+      expiresAt: started.expiresAt,
+      state: started.state,
+    };
+  }
+
+  createHandoffUrl(params: {
+    flowSecret: string;
+    authorizationUrl: string;
+    state: string;
+    expiresAt: Date;
+    publicOrigin: string;
+  }): string {
+    const token = this.#cipher.encryptHandoff({
+      flowSecret: params.flowSecret,
+      targetUrl: params.authorizationUrl,
+      stateHash: hashSecret(params.state),
+      expiresAt: params.expiresAt.getTime(),
+    });
+    const origin = params.publicOrigin.replace(/\/+$/, "");
+    return `${origin}${MCP_OAUTH_HANDOFF_PATH}?token=${encodeURIComponent(token)}`;
+  }
+
+  /**
+   * Redeem a handoff token for the browser secret the callback will compare against.
+   *
+   * Three properties make this safe to expose as a link a human clicks:
+   *
+   * - The caller must be signed in, and the signed-in Account must own the Agent the flow belongs to
+   *   (`expectedAccountId`). Otherwise a link an Agent posted into a shared channel would bind
+   *   *whoever clicked it* into the Agent's authorization. A mismatch is reported as
+   *   `MCP_SERVER_NOT_FOUND`, the same bounded answer a caller gets for a token that does not exist,
+   *   so the response never tells a stranger whether the flow is real.
+   * - Redemption is single use. The row's `loginSessionHash` is compared and then replaced with the
+   *   hash of a fresh browser secret in one conditional update, so the token that was redeemed can
+   *   never be redeemed again — a replay updates nothing and is refused.
+   * - The returned secret is the *new* one, which the route sets as the `mcpOAuthContext` cookie. The
+   *   token therefore stops being a bearer credential for the callback the moment it is used.
+   */
+  async redeemHandoffToken(
+    token: string,
+    expectedAccountId: string,
+  ): Promise<{ flowSecret: string; targetUrl: string }> {
+    const payload = this.#cipher.decryptHandoff(token);
+    const now = this.#now();
+    if (now.getTime() > payload.expiresAt) {
+      throw new McpServiceError(MCP_ERROR_CODES.OAUTH_FLOW_INVALID, "The authorization handoff token has expired");
+    }
+
+    return this.#database.transaction(async (transaction) => {
+      await lockMcpAccounts(transaction, [expectedAccountId]);
+      const issuedBinding = hashSecret(payload.flowSecret);
+      const [row] = await transaction
+        .select({
+          id: mcpServerAuthorizations.id,
+          stateExpiresAt: mcpServerAuthorizations.stateExpiresAt,
+          loginSessionHash: mcpServerAuthorizations.loginSessionHash,
+          ownerAccountId: agents.createdByUserId,
+        })
+        .from(mcpServerAuthorizations)
+        .innerJoin(agents, eq(agents.id, mcpServerAuthorizations.agentId))
+        .where(eq(mcpServerAuthorizations.state, payload.stateHash))
+        .limit(1);
+
+      if (!row?.stateExpiresAt || row.stateExpiresAt.getTime() <= now.getTime()) {
+        throw new McpServiceError(MCP_ERROR_CODES.OAUTH_FLOW_INVALID, "The authorization flow is no longer valid");
+      }
+
+      if (!row.loginSessionHash || !timingSafeEqual(Buffer.from(row.loginSessionHash), Buffer.from(issuedBinding))) {
+        throw new McpServiceError(
+          MCP_ERROR_CODES.OAUTH_FLOW_INVALID,
+          "The authorization flow was not started by this browser",
+        );
+      }
+
+      if (row.ownerAccountId !== expectedAccountId) {
+        throw new McpServiceError(MCP_ERROR_CODES.SERVER_NOT_FOUND, "The requested MCP Server was not found");
+      }
+
+      if (!(await readMcpCredentialRoot(transaction, expectedAccountId, row.id))) {
+        throw new McpServiceError(MCP_ERROR_CODES.OAUTH_FLOW_INVALID, "The authorization flow is no longer valid");
+      }
+
+      /*
+       * The conditional update is the single-use gate: the secret that arrived in the token is the one
+       * being replaced, so exactly one caller can win, and a second redemption of the same token matches
+       * no row. The flow itself stays live — `state`, its deadline, and the PKCE verifier are untouched —
+       * because the callback still needs them.
+       */
+      const browserSecret = generateSecret(32);
+      const [consumed] = await transaction
+        .update(mcpServerAuthorizations)
+        .set({ loginSessionHash: hashSecret(browserSecret), updatedAt: now })
+        .where(
+          and(
+            eq(mcpServerAuthorizations.id, row.id),
+            eq(mcpServerAuthorizations.loginSessionHash, issuedBinding),
+            eq(mcpServerAuthorizations.state, payload.stateHash),
+          ),
+        )
+        .returning({ id: mcpServerAuthorizations.id });
+      if (!consumed) {
+        throw new McpServiceError(MCP_ERROR_CODES.OAUTH_FLOW_INVALID, "The authorization handoff was already used");
+      }
+
+      return { flowSecret: browserSecret, targetUrl: payload.targetUrl };
+    });
   }
 
   /**
@@ -290,10 +490,33 @@ export class McpOAuthFlowService {
    * document (RFC 8414 §3.3) instead of being rewritten into a mismatch.
    */
   #advertisedIssuer(effectiveUrl: string, issuer: string): string {
+    if (this.#deploymentClient(effectiveUrl, FEISHU_MCP_ISSUER) && isFeishuAdvertisedIssuer(issuer)) {
+      return FEISHU_MCP_ISSUER;
+    }
     if (!isGoogleWorkspaceMcpEndpoint(effectiveUrl)) return issuer;
     const canonical = normalizeAuthorizationServerIssuer(issuer);
     if (canonical !== GOOGLE_WORKSPACE_MCP_AUTHORIZATION_SERVER) return issuer;
     return canonical;
+  }
+
+  async #protectedResourceForStart(
+    accountId: string,
+    url: string,
+  ): Promise<{ metadata: McpProtectedResourceMetadata; challengeScope?: string }> {
+    try {
+      return await this.#oauth.protectedResourceMetadata(accountId, url);
+    } catch (error) {
+      if (isMissingPrmError(error) && this.#deploymentClient(url, FEISHU_MCP_ISSUER)) {
+        return {
+          metadata: {
+            resource: normalizeResource(undefined, url),
+            authorizationServers: [FEISHU_MCP_ISSUER],
+            scopesSupported: [],
+          },
+        };
+      }
+      throw error;
+    }
   }
 
   /**
@@ -312,7 +535,7 @@ export class McpOAuthFlowService {
     resource: string;
     prmScopes: readonly string[];
   }> {
-    const { metadata: prm, challengeScope } = await this.#oauth.protectedResourceMetadata(accountId, url);
+    const { metadata: prm, challengeScope } = await this.#protectedResourceForStart(accountId, url);
     /*
      * Each advertised identifier is requested as published, except for Google's own identifier on a
      * Google Workspace origin (see `#advertisedIssuer`). The metadata reader compares exactly, so an
@@ -635,10 +858,10 @@ export class McpOAuthFlowService {
     onVerified?: (target: { agentId: string; mcpServerId: string }) => void,
   ): Promise<{ accountId: string; agentId: string; mcpServerId: string }> {
     const row = await this.#locateFlow(query.state, flowSecret);
-    const { authorization, agentId, accountId } = row;
+    const { authorization, agentId, accountId, initiatingAgentId, returnAgentId } = row;
     const mcpServerId = authorization.mcpServerId;
     // Only a valid state and browser binding may identify the page for a failed callback.
-    onVerified?.({ agentId, mcpServerId });
+    onVerified?.({ agentId: returnAgentId, mcpServerId });
     if (query.error) {
       /*
        * A denial is terminal, so it is recorded as such rather than only cleared.
@@ -661,13 +884,27 @@ export class McpOAuthFlowService {
       await this.#failFlow(authorization.id, query.state, MCP_ERROR_CODES.OAUTH_FLOW_INVALID);
       throw new McpServiceError(MCP_ERROR_CODES.OAUTH_FLOW_INVALID, "The authorization response carried no code");
     }
+    const redeemState = `redeeming:${randomUUID()}`;
+    const [claimed] = await this.#database
+      .update(mcpServerAuthorizations)
+      .set({ state: hashSecret(redeemState) })
+      .where(
+        and(
+          eq(mcpServerAuthorizations.id, authorization.id),
+          eq(mcpServerAuthorizations.state, hashSecret(query.state)),
+        ),
+      )
+      .returning({ id: mcpServerAuthorizations.id });
+    if (!claimed)
+      throw new McpServiceError(MCP_ERROR_CODES.OAUTH_FLOW_INVALID, "The authorization flow has already been claimed");
+    let completedAgentId = agentId;
     try {
-      await this.#redeemCode({
+      completedAgentId = await this.#redeemCode({
         accountId,
         agentId,
         authorization,
         code: query.code,
-        issuedState: query.state,
+        issuedState: redeemState,
         iss: query.iss,
       });
     } catch (error) {
@@ -682,12 +919,13 @@ export class McpOAuthFlowService {
       if (error instanceof McpServiceError && error.code === MCP_ERROR_CODES.OAUTH_FLOW_INVALID) throw error;
       await this.#failFlow(
         authorization.id,
-        query.state,
+        redeemState,
         error instanceof McpServiceError && error.category === "transient" ? undefined : MCP_ERROR_CODES.OAUTH_FAILED,
       );
       throw error;
     }
-    return { accountId, agentId, mcpServerId };
+    completedAgentId = await this.#flowReturnAgent(accountId, authorization.id, mcpServerId, initiatingAgentId);
+    return { accountId, agentId: completedAgentId, mcpServerId };
   }
 
   /**
@@ -703,100 +941,119 @@ export class McpOAuthFlowService {
     code: string;
     issuedState: string;
     iss: string | undefined;
-  }): Promise<void> {
+  }): Promise<string> {
     const { accountId, agentId, authorization, code, issuedState, iss } = input;
     const mcpServerId = authorization.mcpServerId;
-    const metadata = await this.#oauth.authorizationServerMetadata(accountId, requireFlowIssuer(authorization));
-    /*
-     * `iss` is validated before anything from the response is used. On a mismatch the response's
-     * own `error` values are never shown or adopted, because a mismatched response is evidence of
-     * an attack rather than a hint about what went wrong.
-     */
-    this.#oauth.validateIssuer(metadata, iss, metadata.issuer);
-    const binding = { mcpServerId, agentId, authorizationServer: metadata.issuer };
-    const codeVerifier = this.#cipher.decryptPkceVerifier(binding, requirePkce(authorization));
-    /*
-     * The effective URL is read before the client, because a deployment client is offered only to
-     * its provider's origins and the URL is half of that decision.
-     */
-    const context = await this.#servers.readProbeContext(accountId, agentId, mcpServerId);
-    const effective = McpServerService.resolveEffectiveConfig(context.server, context.binding);
-    const client = await this.#readClientCredentials(
-      accountId,
-      effective.url,
-      metadata,
-      authorization.clientRegistrationId,
+    const flow = this.#cipher.decryptPkceFlow(
+      { mcpServerId, agentId, authorizationServer: requireFlowIssuer(authorization) },
+      requirePkce(authorization),
     );
-    /*
-     * The audience the authorization request named is repeated verbatim on the exchange. A live
-     * flow from before the column existed has no recorded resource; it keeps the effective-endpoint
-     * derivation it was started with.
-     */
+    const context = await readMcpCredentialRoot(this.#database, accountId, authorization.id);
+    if (!context)
+      throw new McpServiceError(MCP_ERROR_CODES.OAUTH_FLOW_INVALID, "The authorization holder is no longer valid");
+    const effective = mcpEffectiveConfig(context.server, context.binding);
+    if ("version" in flow && flow.accountId !== accountId)
+      throw new McpServiceError(MCP_ERROR_CODES.OAUTH_FLOW_INVALID, "The flow Account no longer matches");
+    if ("version" in flow && !mcpConfigEqual(flow.config, effective))
+      throw new McpServiceError(MCP_ERROR_CODES.OAUTH_FLOW_INVALID, "The MCP connection changed during authorization");
+    const metadata = await this.#oauth.authorizationServerMetadata(accountId, requireFlowIssuer(authorization));
+    this.#oauth.validateIssuer(metadata, iss, metadata.issuer);
+    const registrationId = "version" in flow ? flow.registrationId : authorization.clientRegistrationId;
+    const client = await this.#readClientCredentials(accountId, effective.url, metadata, registrationId);
+    if ("version" in flow && client.clientId !== flow.clientId)
+      throw new McpServiceError(MCP_ERROR_CODES.REGISTRATION_FAILED, "The OAuth client changed during authorization");
     const resource = authorization.flowOauthResource ?? normalizeResource(undefined, effective.url);
+    if (!resourceRelatesToEndpoint(resource, effective.url))
+      throw new McpServiceError(MCP_ERROR_CODES.OAUTH_FLOW_INVALID, "The OAuth resource no longer matches");
     const tokens = await this.#oauth.exchangeAuthorizationCode(accountId, metadata, {
       code,
-      codeVerifier,
+      codeVerifier: flow.codeVerifier,
       client,
       resource,
     });
-    const sealed = this.#cipher.encryptAuthorizationCredential(binding, {
-      accessToken: tokens.accessToken,
-      ...(tokens.refreshToken ? { refreshToken: tokens.refreshToken } : {}),
-      ...(tokens.tokenType ? { tokenType: tokens.tokenType } : {}),
+    const holder = await this.#database.transaction(async (transaction) => {
+      await lockMcpAccounts(transaction, [accountId]);
+      const current = await readMcpCredentialRoot(transaction, accountId, authorization.id);
+      const root = requireMcpFlowRoot(current, issuedState, effective, this.#now());
+      const sealed = this.#cipher.encryptAuthorizationCredential(
+        { mcpServerId, agentId: root.agentId, authorizationServer: metadata.issuer },
+        {
+          ...("version" in flow ? { clientId: client.clientId } : {}),
+          accessToken: tokens.accessToken,
+          ...(tokens.refreshToken ? { refreshToken: tokens.refreshToken } : {}),
+          ...(tokens.tokenType ? { tokenType: tokens.tokenType } : {}),
+        },
+      );
+      const now = this.#now();
+      const [stored] = await transaction
+        .update(mcpServerAuthorizations)
+        .set({
+          kind: "oauth",
+          status: "active",
+          authorizationServer: metadata.issuer,
+          clientRegistrationId: registrationId,
+          ciphertext: sealed.ciphertext,
+          keyId: sealed.keyId,
+          oauthResource: resource,
+          scopes:
+            tokens.scope !== undefined
+              ? grantedMcpScopes(tokens.scope, metadata.issuer)
+              : "version" in flow
+                ? flow.scopes
+                : authorization.scopes,
+          accessTokenExpiresAt: accessTokenExpiry(now, tokens.expiresIn),
+          failureCode: null,
+          state: null,
+          stateExpiresAt: null,
+          pkceCiphertext: null,
+          loginSessionHash: null,
+          flowAuthorizationServer: null,
+          flowOauthResource: null,
+          refreshClaimId: null,
+          refreshClaimedAt: null,
+          refreshGeneration: sql`${mcpServerAuthorizations.refreshGeneration} + 1`,
+          updatedAt: now,
+        })
+        .where(and(eq(mcpServerAuthorizations.id, root.id), eq(mcpServerAuthorizations.state, hashSecret(issuedState))))
+        .returning({ id: mcpServerAuthorizations.id });
+      if (!stored)
+        throw new McpServiceError(
+          MCP_ERROR_CODES.OAUTH_FLOW_INVALID,
+          "The authorization was superseded before it completed",
+        );
+      await invalidateMcpCredentialProbes(transaction, root.id);
+      return root.agentId;
     });
-    const now = this.#now();
-    const [stored] = await this.#database
-      .update(mcpServerAuthorizations)
-      .set({
-        status: "active",
-        authorizationServer: metadata.issuer,
-        ciphertext: sealed.ciphertext,
-        keyId: sealed.keyId,
-        // The credential and the audience it was issued for are written together; the flow's own
-        // resource is dropped in the same write.
-        oauthResource: resource,
-        flowOauthResource: null,
-        scopes: tokens.scope ? tokens.scope.split(/\s+/).filter(Boolean) : authorization.scopes,
-        accessTokenExpiresAt: accessTokenExpiry(now, tokens.expiresIn),
-        failureCode: null,
-        // Single use: the state, its verifier, and the flow binding are gone the moment the code is redeemed.
-        state: null,
-        stateExpiresAt: null,
-        pkceCiphertext: null,
-        loginSessionHash: null,
-        probeState: "pending",
-        refreshClaimId: null,
-        refreshClaimedAt: null,
-        refreshGeneration: sql`${mcpServerAuthorizations.refreshGeneration} + 1`,
-        revision: sql`${mcpServerAuthorizations.revision} + 1`,
-        updatedAt: now,
-      })
-      /*
-       * Fenced on the flow this callback started, not just the row.
-       *
-       * The exchange takes an upstream round trip, and the user can revoke or switch to a Bearer key
-       * during it. Those writes clear `state`, so requiring the state we resolved to still be there
-       * means a callback that lost the race leaves the newer decision alone instead of resurrecting
-       * a credential the user just discarded.
-       */
-      .where(
-        and(
-          eq(mcpServerAuthorizations.id, authorization.id),
-          eq(mcpServerAuthorizations.state, hashSecret(issuedState)),
-        ),
-      )
-      .returning({ id: mcpServerAuthorizations.id });
-    /*
-     * The row was decided by someone else while the exchange was in flight: a revoke, a switch to a
-     * Bearer key, or a newer flow. Reporting success would tell the user their authorization landed
-     * when the credential they just discarded is still the one in force.
-     */
-    if (!stored) {
+    this.#logger?.info(
+      {
+        accountId,
+        authorizationId: authorization.id,
+        agentId: "version" in flow ? flow.initiatingAgentId : agentId,
+        holderAgentId: holder,
+      },
+      "MCP OAuth authentication updated",
+    );
+    return holder;
+  }
+
+  async #flowReturnAgent(accountId: string, rootId: string, mcpServerId: string, initiatingAgentId: string) {
+    const contexts = await readMcpAuthorizationContexts(
+      this.#database,
+      and(
+        eq(mcpServers.accountId, accountId),
+        eq(mcpServers.id, mcpServerId),
+        or(eq(agentMcpServers.agentId, initiatingAgentId), eq(mcpServerAuthorizations.id, rootId)),
+      ),
+      { tools: false },
+    );
+    const members = contexts.filter((context) => context.credentialAuthorization?.id === rootId);
+    const target = members.find((context) => context.binding.agentId === initiatingAgentId) ?? members[0];
+    if (!target)
       throw new McpServiceError(
         MCP_ERROR_CODES.OAUTH_FLOW_INVALID,
-        "The authorization was superseded before it completed",
+        "The authorization has no return binding in its Account",
       );
-    }
+    return target.binding.agentId;
   }
 
   async #locateFlow(
@@ -806,6 +1063,8 @@ export class McpOAuthFlowService {
     authorization: typeof mcpServerAuthorizations.$inferSelect;
     agentId: string;
     accountId: string;
+    initiatingAgentId: string;
+    returnAgentId: string;
   }> {
     /*
      * A missing secret is rejected before the lookup rather than after, so an attacker without the
@@ -844,7 +1103,7 @@ export class McpOAuthFlowService {
       );
     }
     if (!authorization.stateExpiresAt || authorization.stateExpiresAt.getTime() <= this.#now().getTime()) {
-      await this.#clearFlow(authorization.id);
+      await this.#failFlow(authorization.id, state, MCP_ERROR_CODES.OAUTH_FLOW_EXPIRED);
       throw new McpServiceError(MCP_ERROR_CODES.OAUTH_FLOW_EXPIRED, "The authorization flow has expired");
     }
     /*
@@ -855,21 +1114,33 @@ export class McpOAuthFlowService {
      * state resolved to it and has not expired — both checked above — and `#clearFlow` nulls the state
      * the moment the code is redeemed, so a replay still finds nothing.
      */
-    return { authorization, agentId: authorization.agentId, accountId: row.accountId };
-  }
-
-  async #clearFlow(id: string): Promise<void> {
-    await this.#database
-      .update(mcpServerAuthorizations)
-      .set({
-        state: null,
-        stateExpiresAt: null,
-        pkceCiphertext: null,
-        loginSessionHash: null,
-        flowOauthResource: null,
-        updatedAt: this.#now(),
-      })
-      .where(eq(mcpServerAuthorizations.id, id));
+    const context = await readMcpCredentialRoot(this.#database, row.accountId, authorization.id);
+    if (!context)
+      throw new McpServiceError(MCP_ERROR_CODES.OAUTH_FLOW_INVALID, "The authorization holder is no longer valid");
+    const flow = this.#cipher.decryptPkceFlow(
+      {
+        mcpServerId: authorization.mcpServerId,
+        agentId: authorization.agentId,
+        authorizationServer: requireFlowIssuer(authorization),
+      },
+      requirePkce(authorization),
+    );
+    if ("version" in flow && flow.accountId !== row.accountId)
+      throw new McpServiceError(MCP_ERROR_CODES.OAUTH_FLOW_INVALID, "The initiating Account no longer matches");
+    const initiatingAgentId = "version" in flow ? flow.initiatingAgentId : authorization.agentId;
+    const returnAgentId = await this.#flowReturnAgent(
+      row.accountId,
+      authorization.id,
+      authorization.mcpServerId,
+      initiatingAgentId,
+    );
+    return {
+      authorization,
+      agentId: authorization.agentId,
+      accountId: row.accountId,
+      initiatingAgentId,
+      returnAgentId,
+    };
   }
 
   /**
@@ -918,6 +1189,7 @@ export class McpOAuthFlowService {
                */
               status: sql`case when ${mcpServerAuthorizations.ciphertext} is null then 'error' else ${mcpServerAuthorizations.status} end`,
             }),
+        revision: sql`${mcpServerAuthorizations.revision} + 1`,
         updatedAt: this.#now(),
       })
       .where(and(eq(mcpServerAuthorizations.id, id), eq(mcpServerAuthorizations.state, hashSecret(issuedState))));
@@ -1021,9 +1293,8 @@ export class McpOAuthFlowService {
    * Refresh one row, single-flighted by a claim and fenced by a generation.
    *
    * The failure taxonomy is deliberately conservative. A transport failure, a timeout, or a 5xx
-   * leaves the outcome genuinely unknown — the AS may or may not have rotated the refresh token — so
-   * the token is kept (discarding it would strand the user) and the row is marked as needing
-   * reauthorization, never silently retried. Only `invalid_grant` and `invalid_client` are terminal,
+   * leaves the outcome unknown: the AS may have rotated the refresh token. Potentially consumed
+   * material is cleared and the shared authentication requires new consent, without replay. Only `invalid_grant` and `invalid_client` are terminal,
    * because only they mean the credential is definitively gone.
    */
   async refreshAuthorization(authorizationId: string): Promise<void> {
@@ -1036,7 +1307,7 @@ export class McpOAuthFlowService {
       agentId: row.agentId,
       authorizationServer: row.authorizationServer,
     };
-    let credential: { accessToken: string; refreshToken?: string };
+    let credential: { accessToken: string; refreshToken?: string; clientId?: string };
     try {
       if (!row.ciphertext || !row.keyId) throw new Error("no envelope");
       credential = this.#cipher.decryptAuthorizationCredential(binding, {
@@ -1053,6 +1324,7 @@ export class McpOAuthFlowService {
       await this.#markExpired(authorizationId, claimId);
       return;
     }
+    let requestDispatched = false;
     try {
       /*
        * The effective URL is read before the authorization server is contacted, because the
@@ -1060,8 +1332,7 @@ export class McpOAuthFlowService {
        * the recorded resource must fail as requiring reauthorization, not have a fresh token minted
        * for an audience the token will never be presented to.
        */
-      const context = await this.#servers.readProbeContext(row.accountId, row.agentId, row.mcpServerId);
-      const effective = McpServerService.resolveEffectiveConfig(context.server, context.binding);
+      const effective = row.effective;
       const resource = row.oauthResource ?? normalizeResource(undefined, effective.url);
       if (row.oauthResource !== null && !resourceRelatesToEndpoint(row.oauthResource, effective.url)) {
         throw new McpServiceError(
@@ -1077,79 +1348,121 @@ export class McpOAuthFlowService {
         metadata,
         row.clientRegistrationId,
       );
+      if (credential.clientId && client.clientId !== credential.clientId)
+        throw new McpServiceError(MCP_ERROR_CODES.REGISTRATION_FAILED, "The OAuth client changed; authorize again");
+      requestDispatched = true;
       const tokens = await this.#oauth.refreshAccessToken(row.accountId, metadata, {
         refreshToken: credential.refreshToken,
         client,
         resource,
       });
-      const sealed = this.#cipher.encryptAuthorizationCredential(binding, {
-        accessToken: tokens.accessToken,
-        // Rotation: keep the previous refresh token when the AS did not issue a new one (RFC 6749 §6).
-        refreshToken: tokens.refreshToken ?? credential.refreshToken,
-      });
-      const now = this.#now();
-      await this.#database
-        .update(mcpServerAuthorizations)
-        .set({
-          ciphertext: sealed.ciphertext,
-          keyId: sealed.keyId,
-          accessTokenExpiresAt: accessTokenExpiry(now, tokens.expiresIn),
-          ...(tokens.scope ? { scopes: tokens.scope.split(/\s+/).filter(Boolean) } : {}),
-          status: "active",
-          failureCode: null,
-          refreshClaimId: null,
-          refreshClaimedAt: null,
-          refreshGeneration: sql`${mcpServerAuthorizations.refreshGeneration} + 1`,
-          lastRefreshedAt: now,
-          updatedAt: now,
-        })
-        .where(
-          and(eq(mcpServerAuthorizations.id, authorizationId), eq(mcpServerAuthorizations.refreshClaimId, claimId)),
+      const scopes = tokens.scope === undefined ? undefined : grantedMcpScopes(tokens.scope, metadata.issuer);
+      const scopeUpdate = scopes === undefined ? {} : { scopes };
+      await this.#database.transaction(async (transaction) => {
+        await lockMcpAccounts(transaction, [row.accountId]);
+        const current = await readMcpCredentialRoot(transaction, row.accountId, authorizationId);
+        const root = current?.credentialAuthorization;
+        if (
+          !current ||
+          !root ||
+          root.status !== "active" ||
+          root.refreshClaimId !== claimId ||
+          root.refreshGeneration !== row.refreshGeneration ||
+          !mcpConfigEqual(effective, mcpEffectiveConfig(current.server, current.binding))
+        )
+          throw new McpServiceError(MCP_ERROR_CODES.OAUTH_FLOW_INVALID, "The refresh result was superseded");
+        const sealed = this.#cipher.encryptAuthorizationCredential(
+          { ...binding, agentId: root.agentId },
+          {
+            ...(credential.clientId || this.#servers.reuseOAuth ? { clientId: client.clientId } : {}),
+            accessToken: tokens.accessToken,
+            refreshToken: tokens.refreshToken ?? credential.refreshToken,
+            ...(tokens.tokenType ? { tokenType: tokens.tokenType } : {}),
+          },
         );
-      // A successful refresh does not re-probe: the tool list is a snapshot of the Server, not of
-      // this token, and the credential change alone is not evidence the capabilities moved.
+        const now = this.#now();
+        const [stored] = await transaction
+          .update(mcpServerAuthorizations)
+          .set({
+            ciphertext: sealed.ciphertext,
+            keyId: sealed.keyId,
+            accessTokenExpiresAt: accessTokenExpiry(now, tokens.expiresIn),
+            ...scopeUpdate,
+            status: "active",
+            failureCode: null,
+            refreshClaimId: null,
+            refreshClaimedAt: null,
+            refreshGeneration: sql`${mcpServerAuthorizations.refreshGeneration} + 1`,
+            lastRefreshedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(mcpServerAuthorizations.id, authorizationId),
+              eq(mcpServerAuthorizations.refreshClaimId, claimId),
+              eq(mcpServerAuthorizations.refreshGeneration, row.refreshGeneration),
+            ),
+          )
+          .returning({ id: mcpServerAuthorizations.id });
+        if (!stored) throw new McpServiceError(MCP_ERROR_CODES.OAUTH_FLOW_INVALID, "The refresh result was superseded");
+        if (scopes !== undefined && !sameScopeSet(root.scopes, scopes))
+          await invalidateMcpCredentialProbes(transaction, root.id);
+      });
+      // Token rotation alone keeps each Agent's tool snapshot.
     } catch (error) {
-      await this.#classifyRefreshFailure(authorizationId, claimId, error);
+      this.#logger?.warn(
+        {
+          authorizationId,
+          claimId,
+          code: refreshFailureCode(error, requestDispatched),
+        },
+        "MCP refresh did not commit a credential",
+      );
+      await this.#classifyRefreshFailure(authorizationId, claimId, error, this.#database, requestDispatched);
     }
   }
 
   /**
-   * Claim the row for one refresh pass. The claim is taken with a single CAS so two workers cannot
-   * both spend the same refresh token, and a stale claim from a crashed worker expires after two
-   * minutes rather than wedging the row forever.
+   * Capture a root and its effective configuration before network I/O. A stale claim has an unknown
+   * outcome and fails closed after two minutes; another worker never spends that token again.
    */
-  async #claimForRefresh(
-    authorizationId: string,
-    claimId: string,
-  ): Promise<(typeof mcpServerAuthorizations.$inferSelect & { accountId: string }) | undefined> {
-    const staleBefore = new Date(this.#now().getTime() - 2 * 60 * 1000);
-    const now = this.#now();
-    const [row] = await this.#database
-      .update(mcpServerAuthorizations)
-      .set({ refreshClaimId: claimId, refreshClaimedAt: now })
-      .where(
-        and(
-          eq(mcpServerAuthorizations.id, authorizationId),
-          eq(mcpServerAuthorizations.kind, "oauth"),
-          eq(mcpServerAuthorizations.status, "active"),
-          or(
-            isNull(mcpServerAuthorizations.refreshClaimId),
-            lte(mcpServerAuthorizations.refreshClaimedAt, staleBefore),
-          ),
-        ),
-      )
-      .returning();
-    if (!row) return undefined;
+  async #claimForRefresh(authorizationId: string, claimId: string) {
     const [owner] = await this.#database
-      .select({ accountId: agents.createdByUserId })
-      .from(agents)
-      .where(eq(agents.id, row.agentId))
-      .limit(1);
-    if (!owner) {
-      await this.#releaseClaim(authorizationId, claimId);
-      return undefined;
-    }
-    return { ...row, accountId: owner.accountId };
+      .select({ accountId: mcpServers.accountId })
+      .from(mcpServerAuthorizations)
+      .innerJoin(mcpServers, eq(mcpServers.id, mcpServerAuthorizations.mcpServerId))
+      .where(eq(mcpServerAuthorizations.id, authorizationId));
+    if (!owner) return undefined;
+    return this.#database.transaction(async (transaction) => {
+      await lockMcpAccounts(transaction, [owner.accountId]);
+      const context = await readMcpCredentialRoot(transaction, owner.accountId, authorizationId);
+      const row = context?.credentialAuthorization;
+      if (!context || !row || row.kind !== "oauth" || row.status !== "active") return undefined;
+      if (row.refreshClaimId) {
+        if (row.refreshClaimedAt && row.refreshClaimedAt.getTime() <= this.#now().getTime() - 2 * 60 * 1000)
+          await this.#classifyRefreshFailure(
+            authorizationId,
+            row.refreshClaimId,
+            new Error("Refresh outcome unknown"),
+            transaction,
+          );
+        return undefined;
+      }
+      const [claimed] = await transaction
+        .update(mcpServerAuthorizations)
+        .set({ refreshClaimId: claimId, refreshClaimedAt: this.#now() })
+        .where(
+          and(
+            eq(mcpServerAuthorizations.id, authorizationId),
+            isNull(mcpServerAuthorizations.refreshClaimId),
+            isNull(mcpServerAuthorizations.credentialSourceId),
+          ),
+        )
+        .returning();
+      return claimed
+        ? { ...claimed, accountId: owner.accountId, effective: mcpEffectiveConfig(context.server, context.binding) }
+        : undefined;
+    });
   }
 
   async #releaseClaim(authorizationId: string, claimId: string): Promise<void> {
@@ -1164,6 +1477,7 @@ export class McpOAuthFlowService {
       .update(mcpServerAuthorizations)
       .set({
         status: "expired",
+        revision: sql`${mcpServerAuthorizations.revision} + 1`,
         refreshClaimId: null,
         refreshClaimedAt: null,
         updatedAt: this.#now(),
@@ -1175,13 +1489,25 @@ export class McpOAuthFlowService {
    * The failure classification table, in one place. Each branch exists because it demands a
    * different operator action: renew the credential, re-register the client, or re-authorize.
    */
-  async #classifyRefreshFailure(authorizationId: string, claimId: string, error: unknown): Promise<void> {
+  async #classifyRefreshFailure(
+    authorizationId: string,
+    claimId: string,
+    error: unknown,
+    executor: Pick<DatabaseClient, "update"> = this.#database,
+    requestDispatched = true,
+  ): Promise<void> {
     const now = this.#now();
     const detail = error instanceof McpServiceError ? error.detail : undefined;
     const upstreamError = typeof detail?.error === "string" ? detail.error : undefined;
+    const status = typeof detail?.status === "number" ? detail.status : undefined;
     const terminal = upstreamError === "invalid_grant" || upstreamError === "invalid_client";
-    const unknownOutcome = !(error instanceof McpServiceError) || error.code === MCP_ERROR_CODES.UPSTREAM_UNAVAILABLE;
-    await this.#database
+    const unknownOutcome =
+      requestDispatched &&
+      (!(error instanceof McpServiceError) ||
+        error.code === MCP_ERROR_CODES.UPSTREAM_UNAVAILABLE ||
+        error.code === MCP_ERROR_CODES.UPSTREAM_ERROR ||
+        (status !== undefined && status >= 500));
+    await executor
       .update(mcpServerAuthorizations)
       .set({
         ...(terminal
@@ -1195,16 +1521,22 @@ export class McpOAuthFlowService {
               accessTokenExpiresAt: null,
             }
           : unknownOutcome
-            ? // Result unknown: keep the refresh token, refuse to auto-retry, and ask a human. The
-              // specification's point is that a blind retry could spend a token the AS already
-              // rotated away, which loses the credential outright.
-              { status: "error", failureCode: MCP_ERROR_CODES.REFRESH_OUTCOME_UNKNOWN }
+            ? // An unanswered refresh may already have consumed the old token.
+              {
+                status: "error",
+                ciphertext: null,
+                keyId: null,
+                accessTokenExpiresAt: null,
+                oauthResource: null,
+                failureCode: MCP_ERROR_CODES.REFRESH_OUTCOME_UNKNOWN,
+              }
             : {
                 status: "error",
                 failureCode: error instanceof McpServiceError ? error.code : MCP_ERROR_CODES.OAUTH_FAILED,
               }),
         refreshClaimId: null,
         refreshClaimedAt: null,
+        revision: sql`${mcpServerAuthorizations.revision} + 1`,
         updatedAt: now,
       })
       .where(and(eq(mcpServerAuthorizations.id, authorizationId), eq(mcpServerAuthorizations.refreshClaimId, claimId)));
@@ -1263,3 +1595,79 @@ function requirePkce(row: { pkceCiphertext: string | null }): { ciphertext: stri
 }
 
 export { normalizeResource };
+
+function requireUnchangedMcpBinding(
+  previous: McpAuthorizationContext,
+  current: McpAuthorizationContext | undefined,
+  effective: ReturnType<typeof mcpEffectiveConfig>,
+): asserts current is McpAuthorizationContext {
+  if (
+    !current ||
+    !mcpConfigEqual(effective, mcpEffectiveConfig(current.server, current.binding)) ||
+    (previous.credentialAuthorization?.id ?? null) !== (current.credentialAuthorization?.id ?? null)
+  )
+    throw new McpServiceError(
+      MCP_ERROR_CODES.OAUTH_FLOW_INVALID,
+      "The MCP binding changed before authorization started",
+    );
+  if (current.localAuthorization?.credentialSourceId && !current.credentialAuthorization)
+    throw new McpServiceError(MCP_ERROR_CODES.AUTHORIZATION_REQUIRED, "The shared authorization is no longer valid");
+}
+
+function requireMcpFlowRoot(
+  current: McpAuthorizationContext | undefined,
+  issuedState: string,
+  effective: ReturnType<typeof mcpEffectiveConfig>,
+  now: Date,
+) {
+  const root = current?.credentialAuthorization;
+  if (
+    !current ||
+    !root ||
+    root.state !== hashSecret(issuedState) ||
+    !root.stateExpiresAt ||
+    root.stateExpiresAt <= now ||
+    !mcpConfigEqual(effective, mcpEffectiveConfig(current.server, current.binding))
+  )
+    throw new McpServiceError(
+      MCP_ERROR_CODES.OAUTH_FLOW_INVALID,
+      "The authorization was superseded before it completed",
+    );
+  return root;
+}
+
+function isMissingPrmError(error: unknown): boolean {
+  if (!(error instanceof McpServiceError) || error.code !== MCP_ERROR_CODES.UPSTREAM_ERROR) return false;
+  return Array.isArray(error.detail?.tried) && error.detail.tried.length === 0;
+}
+
+const FEISHU_ADVERTISED_AUTH_ORIGINS = new Set(["https://accounts.feishu.cn", "https://open.feishu.cn"]);
+
+function isFeishuAdvertisedIssuer(issuer: string): boolean {
+  try {
+    const parsed = new URL(issuer);
+    return parsed.protocol === "https:" && !parsed.username && !parsed.password && !parsed.port
+      ? FEISHU_ADVERTISED_AUTH_ORIGINS.has(parsed.origin)
+      : false;
+  } catch {
+    return false;
+  }
+}
+
+function grantedMcpScopes(value: string, issuer: string) {
+  const github = MCP_STATIC_OAUTH_PROVIDERS.find((provider) => provider.brand === "github");
+  const feishu = MCP_STATIC_OAUTH_PROVIDERS.find((provider) => provider.brand === "feishu");
+  return value.split(issuer === github?.issuer || issuer === feishu?.issuer ? /[,\s]+/ : /\s+/).filter(Boolean);
+}
+
+function sameScopeSet(previous: string[] | null, next: string[]) {
+  if (!previous) return false;
+  const scopes = new Set(previous.filter((scope) => scope !== "offline_access"));
+  const granted = new Set(next.filter((scope) => scope !== "offline_access"));
+  return scopes.size === granted.size && [...granted].every((scope) => scopes.has(scope));
+}
+
+function refreshFailureCode(error: unknown, requestDispatched: boolean) {
+  if (error instanceof McpServiceError) return error.code;
+  return requestDispatched ? MCP_ERROR_CODES.REFRESH_OUTCOME_UNKNOWN : MCP_ERROR_CODES.OAUTH_FAILED;
+}

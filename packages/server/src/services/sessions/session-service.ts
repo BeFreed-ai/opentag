@@ -175,6 +175,7 @@ export type ScheduledDispatchAdmissionFailure =
   | "schedule_deleted"
   | "schedule_disabled"
   | "schedule_changed"
+  | "dispatch_not_marked"
   | ScheduledTargetPermanentCode
   | ScheduledTargetTemporaryCode;
 
@@ -444,6 +445,7 @@ export class SessionService {
         lastMessageId: message.id,
         lastDeliveryOutcome: attempt.message.lastOutcome,
         taskPreview,
+        descendantActive: true,
       });
       await transaction.execute(sql`
         insert into session_descendants (
@@ -453,7 +455,8 @@ export class SessionService {
           last_message_created_at,
           last_message_id,
           last_delivery_outcome,
-          task_preview
+          task_preview,
+          descendant_active
         )
         select
           ancestor_session_id,
@@ -462,7 +465,8 @@ export class SessionService {
           ${message.createdAt.toISOString()}::timestamptz,
           ${message.id}::uuid,
           ${attempt.message.lastOutcome},
-          ${taskPreview}
+          ${taskPreview},
+          true
         from session_descendants
         where descendant_session_id = ${input.creatorSessionId}::uuid
       `);
@@ -988,7 +992,11 @@ export class SessionService {
         throw error;
       }
       void result.catch(() => markDispatched());
-      await dispatched;
+      if (!(await waitForSendMark(dispatched, SCHEDULED_SEND_MARK_TIMEOUT_MS))) {
+        // The send never confirmed the frame inside the admission window: refuse it and commit, so
+        // the authority locks are released instead of being held for the whole stall.
+        return this.#rejectScheduledAdmission(route, fence, "dispatch_not_marked");
+      }
       return { admitted: true, result } as const;
     });
   }
@@ -1035,6 +1043,9 @@ export class SessionService {
       from session_descendants link
       inner join sessions child on child.id = link.descendant_session_id
       where link.ancestor_session_id = ${sourceSessionId}::uuid
+        and link.descendant_active
+        -- An older binary ends a Session without maintaining the closure flag. The derived predicate
+        -- keeps that row out of the page and bounds the extra work to the drift, not to the history.
         and child.ended_at is null
         ${query.recursive ? sql`` : sql`and link.depth = 1`}
         ${since ? sql`and link.last_message_created_at >= ${since.toISOString()}::timestamptz` : sql``}
@@ -1585,6 +1596,29 @@ interface ScheduledAdmissionRows {
   placement: { computerId: string; generation: number } | undefined;
   computer: { ownerAccountId: string } | undefined;
   scheduleRow: { id: string; enabled: boolean; nextTriggerAt: Date | null; revision: number } | undefined;
+}
+
+/**
+ * How long the admission waits for the transport to mark its send before it refuses the dispatch.
+ * The admission holds the Agent, IM binding, Session, placement, and Computer row locks until that
+ * mark, so a stalled send blocks every other writer of those rows: a management pause or delete, a
+ * placement move, and an inbound IM transaction all wait behind it. A send normally marks in
+ * milliseconds.
+ */
+const SCHEDULED_SEND_MARK_TIMEOUT_MS = 5_000;
+
+/** True once the transport marks its send; false when the admission deadline expires first. */
+export async function waitForSendMark(marked: Promise<void>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([marked.then(() => true), expired]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**

@@ -318,6 +318,7 @@ export interface CreateClientRuntimeOptions {
   readonly piCommand?: string;
   readonly piHome?: string;
   readonly cliCommand?: string;
+  readonly cliInvocation?: readonly string[];
   /** Authoritative packaged CLI entry for the Slack deployment hook; absent embeddings use manual setup. */
   readonly slackAutoSetupCliEntry?: string;
   readonly environment?: NodeJS.ProcessEnv;
@@ -751,10 +752,12 @@ export async function createClientRuntime(
     environment: sourceEnvironment,
     bindingStore,
     cliCommand: options.cliCommand ?? "opentag",
+    cliInvocation: options.cliInvocation,
     cleanupProviderEnvironment: (sessionId) => credentialEnvironment.cleanup(sessionId),
     contextTree,
     contextTreeBin: contextTree.binDirectory(),
-    contextTreeEnvironment: (sessionId) => {
+    contextTreeEnvironment: (sessionId, configuration) => {
+      credentialEnvironment.configureContextTree(sessionId, configuration.cwd, configuration.sources);
       const hostSide = options.runtimeCredentials?.contextTreeEnvironment?.(sessionId);
       if (hostSide) return hostSide;
       // Cloud: the session execution environment targets the Sandbox-side loopback, so only a
@@ -1207,6 +1210,7 @@ export function resolvedPiFactory(options: ResolvedPiFactoryOptions): AgentRunti
     options.createCandidateFactory ??
     ((command: string, environment: NodeJS.ProcessEnv) =>
       new PiAgentRuntimeFactory({
+        nativeResources: true,
         process: {
           args: skillArgs,
           command,

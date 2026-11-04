@@ -36,12 +36,32 @@ const cloudSession: ManagedSessionContext = {
 };
 
 describe("renderManagedSystemPrompt Agent Home", () => {
+  it("describes native configuration only for Local Codex, independently of Server self-configuration", () => {
+    const prompt = renderManagedSystemPrompt(snapshot, { ...session, selfConfigurationEnabled: false });
+    expect(prompt).toContain("## Native Codex configuration");
+    expect(prompt).toContain("Prefer Agent Home's project configuration");
+    expect(prompt).toContain("Native local and stdio MCP configuration does not use opentag self mcp");
+    expect(renderManagedSystemPrompt({ ...snapshot, provider: "pi" }, session)).not.toContain(
+      "## Native Codex configuration",
+    );
+    expect(renderManagedSystemPrompt(snapshot, cloudSession)).not.toContain("## Native Codex configuration");
+  });
+  it("describes native configuration only for Local Claude, independently of Server self-configuration", () => {
+    const claude = { ...snapshot, provider: "claude-code" as const };
+    const prompt = renderManagedSystemPrompt(claude, { ...session, selfConfigurationEnabled: false });
+    expect(prompt).toContain("## Native Claude configuration");
+    expect(prompt).toContain("Prefer project scope under Agent Home");
+    expect(prompt).toContain("Native local and stdio MCP configuration does not use opentag self mcp");
+    expect(renderManagedSystemPrompt(snapshot, session)).not.toContain("## Native Claude configuration");
+    expect(renderManagedSystemPrompt(claude, cloudSession)).not.toContain("## Native Claude configuration");
+  });
+
   it.each([session, cloudSession])(
     "provides fixed CLI manuals in the $environment visible Session prompt",
     (context) => {
       const prompt = renderManagedSystemPrompt(snapshot, context);
       expect(prompt).toContain("Agent ID: agent-1");
-      expect(prompt).toContain("GitHub integration, when enabled");
+      expect(prompt).toContain("Use this Agent's connected GitHub MCP tools");
       expect(prompt).toContain("slack api chat.postMessage --json");
       expect(prompt).toContain("lark-cli im +messages-reply");
       expect(prompt).toContain("files.getUploadURLExternal");
@@ -53,7 +73,7 @@ describe("renderManagedSystemPrompt Agent Home", () => {
 
   it("keeps internal Session prompts free of IM outbox manuals", () => {
     const prompt = renderManagedSystemPrompt(snapshot, { ...session, sessionKind: "internal" });
-    expect(prompt).toContain("GitHub integration, when enabled");
+    expect(prompt).toContain("Use this Agent's connected GitHub MCP tools");
     expect(prompt).not.toContain("slack api chat.postMessage");
     expect(prompt).not.toContain("messages-resources-download");
   });
@@ -102,18 +122,39 @@ describe("renderManagedSystemPrompt Agent Home", () => {
     expect(prompt).toContain("## Self-configuration");
     expect(prompt).toContain("`opentag-dev agent self show`");
     expect(prompt).toContain("`opentag-dev agent self update`");
-    expect(prompt).toContain("`opentag-dev agent self mcp`");
     expect(prompt).toContain("apply from your next Turn and start a new provider conversation");
-    expect(prompt).toContain("An Agent that had no usable MCP Server gets MCP access at its next execution.");
-    expect(prompt).not.toContain("MCP mount changes apply to your next MCP request");
     expect(prompt).toContain("read the current value first");
+    expect(prompt).toContain("## MCP");
+    expect(prompt).toContain("Run `opentag-dev self mcp` before you reply.");
+    expect(prompt).toContain("Do not answer with a setup guide.");
+    expect(prompt).toContain("Connectors page");
+    expect(prompt).toContain("Branch on the operation before you search or add.");
+    expect(prompt).toContain("disable Notion");
+    expect(prompt).toContain("Do not search the catalog and do not run add.");
+    expect(prompt).toContain("`opentag-dev self mcp list --json`");
+    expect(prompt).toContain("Search the catalog only when neither list has it");
+    expect(prompt).toContain("authorization: null");
+    expect(prompt).toContain("Do not add a second definition.");
+    expect(prompt).toContain("Stop only when the observed state is enabled");
+    expect(prompt).toContain("Do not call generate_oauth_url while the status is pending.");
+    expect(prompt).toContain("`opentag-dev self mcp use <server> --api-key-stdin`");
+    expect(prompt).not.toContain("report it and stop");
+    expect(prompt).toContain("`opentag-dev self mcp search <query> --json`");
+    expect(prompt).toContain("paste the MCP configuration into this chat");
+    expect(prompt).toContain("`opentag-dev self mcp add <name> <url> [oauth|bearer]`");
+    expect(prompt).toContain("`opentag-dev self mcp generate_oauth_url <server>`");
+    expect(prompt).toContain("`opentag-dev self mcp check_oauth_status <server>`");
+    expect(prompt).toContain("available on the next execution");
+    expect(prompt).not.toContain("MCP mount changes apply to your next MCP request");
 
     const unavailable = renderManagedSystemPrompt(snapshot, { ...session, sessionCliAvailable: false });
     expect(unavailable).not.toContain("## Self-configuration");
+    expect(unavailable).not.toContain("## MCP");
     expect(unavailable).not.toContain("agent self");
 
     const disabled = renderManagedSystemPrompt(snapshot, { ...session, selfConfigurationEnabled: false });
     expect(disabled).not.toContain("## Self-configuration");
+    expect(disabled).not.toContain("## MCP");
     expect(disabled).not.toContain("agent self");
 
     const disabledUnavailable = renderManagedSystemPrompt(snapshot, {
@@ -122,6 +163,7 @@ describe("renderManagedSystemPrompt Agent Home", () => {
       selfConfigurationEnabled: false,
     });
     expect(disabledUnavailable).not.toContain("## Self-configuration");
+    expect(disabledUnavailable).not.toContain("## MCP");
     expect(disabledUnavailable).not.toContain("agent self");
   });
 
@@ -298,6 +340,10 @@ describe("renderManagedSystemPrompt shared visible/internal behavior", () => {
       expect(prompt).toContain(
         "Do not react to messages you are not acting on, duplicate acknowledgments, or observer deliveries",
       );
+      expect(prompt).toContain(
+        "While working, do not send intermediate progress messages, status cards, steps, or todo lists to IM, or change the working reaction mid-task.",
+      );
+      expect(prompt).toContain("Questions needed to proceed and required approval requests are still allowed.");
       expect(prompt).not.toContain("optionally");
       expect(prompt).not.toContain("unnecessary");
       expect(prompt).toContain("OpenTag internal Sessions and Provider-native subagents are separate mechanisms");
@@ -322,6 +368,7 @@ describe("renderManagedSystemPrompt shared visible/internal behavior", () => {
       expect(prompt).toContain("Creator Session: session-parent-1");
       expect(prompt).not.toContain("emoji");
       expect(prompt).not.toContain("be warm and natural");
+      expect(prompt).not.toContain("do not send intermediate progress messages");
       expect(prompt).not.toContain("## When to speak");
     }
   });
@@ -415,6 +462,15 @@ describe("renderManagedSystemPrompt Cloud environment", () => {
     expect(prompt).not.toContain("skill push");
     expect(prompt).not.toContain("## Self-configuration");
     expect(prompt).not.toContain("agent self");
+    expect(prompt).toContain("## MCP");
+    expect(prompt).toContain("Branch on the operation before you search or add.");
+    expect(prompt).toContain("Do not search the catalog and do not run add.");
+    expect(prompt).toContain("authorization: null");
+    expect(prompt).toContain("Do not add a second definition.");
+    expect(prompt).toContain("Do not call generate_oauth_url while the status is pending.");
+    expect(prompt).toContain("`opentag self mcp use <server> --api-key-stdin`");
+    expect(prompt).toContain("`opentag self mcp search <query> --json`");
+    expect(prompt).toContain("paste the MCP configuration into this chat");
   });
 
   it("renders the current Context Tree truthfully with the Agent slug and exact path", () => {
@@ -548,9 +604,11 @@ it("describes one-code Slack provisioning for visible managed Sessions without g
   expect(prompt).toContain("do not guess events or rebuild the App manifest");
   expect(prompt).toContain("opentag slack manage -- api --help");
   expect(prompt).not.toContain("## Self-configuration");
+  expect(prompt).not.toContain("## MCP");
   expect(renderManagedSystemPrompt(snapshot, { ...cloudSession, sessionCliAvailable: false })).not.toContain(
     "agent provision-slack",
   );
+  expect(renderManagedSystemPrompt(snapshot, { ...cloudSession, sessionCliAvailable: false })).not.toContain("## MCP");
   expect(renderManagedSystemPrompt(snapshot, { ...cloudSession, sessionKind: "internal" })).not.toContain(
     "agent provision-slack",
   );

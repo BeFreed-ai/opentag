@@ -228,8 +228,9 @@ describe("createClientRuntime production composition", () => {
       await expect(
         runtime.reconciler.reconcile(reconcileRequest(connection.installationId, { ...snapshot(), provider: "pi" })),
       ).resolves.toMatchObject({ status: "ready" });
-      await runtime.runtimeManager.ensureRuntime("session-1");
-      expect(requestedSessions).toEqual(["session-1"]);
+      const firstRuntime = await runtime.runtimeManager.ensureRuntime("session-1");
+      expect(await runtime.runtimeManager.ensureRuntime("session-1")).toBe(firstRuntime);
+      expect(requestedSessions).toEqual(["session-1", "session-1"]);
       expect(ensureAgent).toHaveBeenCalledTimes(1);
       const [cwd, provider, connections, environment] = ensureAgent.mock.calls[0] ?? [];
       expect(cwd).toBe(await runtime.workspace.cwd("agent-1"));
@@ -489,7 +490,18 @@ describe("createClientRuntime production composition", () => {
     const factory = new PiAgentRuntimeFactory({
       probeRunner: async () => ({ credential: true, rpc: true, version: "0.84.2" }),
     });
-    const options = { clientVersion: "0.0.1", environment: { HOME: home, PATH: process.env.PATH }, factory, home };
+    const create = vi.spyOn(factory, "create");
+    const resume = vi.spyOn(factory, "resume");
+    const cliInvocation = ["/opt/current node/bin/node", "/opt/owner's app/cli/index.mjs"];
+    const cliCommand = cliInvocation.map((value) => `'${value.replaceAll("'", `'"'"'`)}'`).join(" ");
+    const options = {
+      clientVersion: "0.0.1",
+      environment: { HOME: home, PATH: process.env.PATH },
+      factory,
+      home,
+      cliInvocation,
+      cliCommand,
+    };
     const piSnapshot: EffectiveRuntimeSnapshot = { ...snapshot(), provider: "pi" };
     const first = await createClientRuntime(connection, options);
     let originalBinding: AgentRuntime["binding"];
@@ -497,6 +509,8 @@ describe("createClientRuntime production composition", () => {
       await first.reconciler.reconcile(reconcileRequest(connection.installationId, piSnapshot));
       originalBinding = (await first.runtimeManager.ensureRuntime("session-1")).binding;
       expect(originalBinding?.providerId).toBe("pi");
+      expect(create.mock.calls[0]?.[0].policy.managedCli).toEqual(cliInvocation);
+      expect(create.mock.calls[0]?.[0].systemPrompt).toContain(cliCommand);
     } finally {
       first.stop();
       await first.run();
@@ -508,6 +522,8 @@ describe("createClientRuntime production composition", () => {
       const recovered = await restarted.runtimeManager.ensureRuntime("session-1");
       expect(recovered.binding?.providerId).toBe("pi");
       expect(recovered.binding).toEqual(originalBinding);
+      expect(resume.mock.calls[0]?.[0].policy.managedCli).toEqual(cliInvocation);
+      expect(resume.mock.calls[0]?.[0].systemPrompt).toContain(cliCommand);
     } finally {
       restarted.stop();
       await restarted.run();
@@ -1047,7 +1063,7 @@ printf '__OT_SHELL_PATH____OT_SHELL_PATH____OT_SHELL_ENV__\n\n__OT_SHELL_ENV__'
     const command = resolve(home, "claude-fixture");
     await writeFile(
       command,
-      '#!/bin/sh\nif [ "$1" = "--version" ]; then printf "2.1.210 (Claude Code)\\n"; exit 0; fi\nif [ "$1" = "--help" ]; then printf "stream-json --session-id --resume --mcp-config --strict-mcp-config --allowedTools --permission-prompt-tool auto --append-system-prompt\\n"; exit 0; fi\nif [ "$3" = "auth" ]; then echo \'{"loggedIn":true}\'; exit 0; fi\nexit 1\n',
+      '#!/bin/sh\nif [ "$1" = "--version" ]; then printf "2.1.210 (Claude Code)\\n"; exit 0; fi\nif [ "$1" = "--help" ]; then printf "stream-json --session-id --resume --mcp-config --strict-mcp-config --allowedTools --permission-prompt-tool acceptEdits --append-system-prompt\\n"; exit 0; fi\nif [ "$3" = "auth" ]; then echo \'{"loggedIn":true}\'; exit 0; fi\nexit 1\n',
       "utf8",
     );
     await chmod(command, 0o755);
@@ -2638,7 +2654,7 @@ async function composeClaudeCodeRuntime(options: {
   const command = resolve(options.home, "claude-env-fixture");
   await writeFile(
     command,
-    `#!/bin/sh\nif [ -n "\${CLAUDE_CONFIG_DIR+x}" ]; then printf 'set:%s' "$CLAUDE_CONFIG_DIR" > ${JSON.stringify(capturePath)}; else printf 'unset' > ${JSON.stringify(capturePath)}; fi\nif [ -n "\${PATH+x}" ]; then printf 'set:%s' "$PATH" > ${JSON.stringify(pathCapturePath)}; else printf 'unset' > ${JSON.stringify(pathCapturePath)}; fi\nif [ "$1" = "--version" ]; then printf "2.1.210 (Claude Code)\\n"; exit 0; fi\nif [ "$1" = "--help" ]; then printf "stream-json --session-id --resume --mcp-config --strict-mcp-config --allowedTools --permission-prompt-tool auto --append-system-prompt\\n"; exit 0; fi\nexit 0\n`,
+    `#!/bin/sh\nif [ -n "\${CLAUDE_CONFIG_DIR+x}" ]; then printf 'set:%s' "$CLAUDE_CONFIG_DIR" > ${JSON.stringify(capturePath)}; else printf 'unset' > ${JSON.stringify(capturePath)}; fi\nif [ -n "\${PATH+x}" ]; then printf 'set:%s' "$PATH" > ${JSON.stringify(pathCapturePath)}; else printf 'unset' > ${JSON.stringify(pathCapturePath)}; fi\nif [ "$1" = "--version" ]; then printf "2.1.210 (Claude Code)\\n"; exit 0; fi\nif [ "$1" = "--help" ]; then printf "stream-json --session-id --resume --mcp-config --strict-mcp-config --allowedTools --permission-prompt-tool acceptEdits --append-system-prompt\\n"; exit 0; fi\nexit 0\n`,
     "utf8",
   );
   await chmod(command, 0o755);
