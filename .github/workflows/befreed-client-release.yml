@@ -63,9 +63,11 @@ jobs:
         run: |
           base="$(node -p "require('./apps/cli/package.json').version")"
           label="${base}-befreed.${BUILD_NUMBER}"
-          echo "base=$base" >> "$GITHUB_OUTPUT"
-          echo "label=$label" >> "$GITHUB_OUTPUT"
-          echo "tag=befreed-v${label}" >> "$GITHUB_OUTPUT"
+          {
+            echo "base=$base"
+            echo "label=$label"
+            echo "tag=befreed-v${label}"
+          } >> "$GITHUB_OUTPUT"
           echo "Building $label from $(git rev-parse HEAD)"
 
       - name: Refuse to reuse a label
