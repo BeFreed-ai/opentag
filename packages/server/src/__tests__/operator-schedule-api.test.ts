@@ -7,9 +7,12 @@
 
 import { randomUUID } from "node:crypto";
 import { AGENT_SCHEDULE_PROMPT_MAX_BYTES, type AgentSchedule } from "@opentag/shared";
+import Fastify from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { registerOperatorScheduleRoutes } from "../api/operator-schedules.js";
 import { createApp } from "../app.js";
 import { resourceNotFound } from "../services/agents/errors.js";
+import { BROWSER_COOKIE_NAMES } from "../services/auth/browser-cookies.js";
 import { invalidCredential } from "../services/auth/errors.js";
 import type { UserAuthService } from "../services/auth/index.js";
 import { ScheduleServiceError } from "../services/schedules/index.js";
@@ -238,5 +241,51 @@ describe("operator schedule route", () => {
     });
     expect(rule.statusCode).toBe(400);
     expect(rule.json().error.code).toBe("SCHEDULE_INVALID_RULE");
+  });
+
+  it("refuses a browser cookie session even for an allow-listed operator (Bearer only)", async () => {
+    const service = { createSchedule: vi.fn(async () => created) };
+    const logger = { info: vi.fn(), warn: vi.fn() };
+    const origin = "https://opentag.example.com";
+    const authService = {
+      getActiveUserById: vi.fn(async () => ({
+        user: { id: operatorId, email: "x@example.com", displayName: "X" },
+        setupCompletedAt: null,
+      })),
+    } as unknown as UserAuthService;
+    const betterAuth = {
+      api: {
+        getSession: vi.fn(async () => ({
+          response: { user: { id: operatorId }, session: { expiresAt: new Date("2030-01-01T00:00:00.000Z") } },
+          headers: new Headers(),
+        })),
+      },
+    };
+    const app = Fastify();
+    apps.push(app as never);
+    registerOperatorScheduleRoutes(
+      app,
+      authService,
+      { service: service as never, allowedUserIds: new Set([operatorId]), logger },
+      { betterAuth: betterAuth as never, publicOrigin: origin },
+    );
+    const response = await app.inject({
+      method: "POST",
+      url,
+      headers: {
+        origin,
+        cookie: `${BROWSER_COOKIE_NAMES.csrf}=csrf-token`,
+        "x-opentag-csrf": "csrf-token",
+      },
+      payload: validBody,
+    });
+    // The cookie session itself authenticated (the stub was consulted), and the route still said no.
+    expect(betterAuth.api.getSession).toHaveBeenCalled();
+    expect(response.statusCode).toBe(403);
+    expect(service.createSchedule).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "operator.schedule.denied", reason: "bearer_required" }),
+      "operator.schedule.denied",
+    );
   });
 });
