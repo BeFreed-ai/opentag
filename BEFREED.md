@@ -151,6 +151,23 @@ Risk to keep in mind: the platform token has no scope. With this route on, whoev
 account's agents a prompt and trigger a turn. Keep the token in Secrets Manager, keep the allow-list to the platform
 account only, and switch the route off when it is not in use.
 
+## Known limits of the operator schedule route
+
+Found in the independent security review of the S2 route (no P1/P2 blockers; these are accepted, documented limits):
+
+1. **No idempotency or duplicate protection.** Two identical create calls create two schedules. Usage rule: the
+   stage-relay script must **list the agent's schedules before creating** (idempotency is the caller's job), and must
+   not blindly retry a create whose response was lost.
+2. **Create-then-pause is not one transaction.** Creating with `enabled: false` is done as create, then pause. If the
+   pause step fails, a live schedule can remain. After any error on a paused create, list schedules and pause or delete
+   the stray one.
+3. **Binding selection is non-deterministic** when an agent has both a Slack and a Feishu binding: the route picks one of
+   them without a stable rule. Keep one IM binding per agent that uses this route.
+4. **No rate limit** on the route. The only brake is the per-token allow-list and the operator keeping the route off when
+   unused.
+5. **`channelId` is not validated** against the agent's binding or the IM platform. A wrong ID fails later at delivery
+   time, not at create time.
+
 ## Rebasing onto a newer upstream
 
 Policy: stay on v0.1.5 plus our patches; move the baseline only for a needed fix, through an upgrade rehearsal.
