@@ -1,0 +1,14 @@
+BeFreed fork of OpenTag
+=======================
+
+This work is a modified copy of OpenTag (https://github.com/first-tree-ai/opentag), Copyright its contributors,
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It is NOT an official OpenTag release. "OpenTag"/"openTag" names and logos are not licensed under Apache-2.0
+(docs/product/trademarks.md); this copy is for BeFreed's own deployment and is not distributed or presented as the
+upstream product.
+
+Statement of changes (Apache-2.0, section 4(b)), against upstream tag v0.1.5 (606a58b0):
+the files listed in BEFREED.md were added or modified by BeFreed. Each modified upstream file carries, or is covered
+by, this statement; new files carry a header comment. The full list, the reason for each change and the rebase
+instructions are in BEFREED.md. The complete history is in this repository's git log.
