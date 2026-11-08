@@ -54,6 +54,7 @@ import { type McpGatewayRoutesOptions, registerMcpGatewayRoutes } from "./api/mc
 import { registerMcpOAuthRoutes } from "./api/mcp-oauth.js";
 import { registerMcpServerRoutes } from "./api/mcp-servers.js";
 import { registerMeRoutes } from "./api/me.js";
+import { type OperatorScheduleRoutesOptions, registerOperatorScheduleRoutes } from "./api/operator-schedules.js";
 import { registerPublicCatalogRoutes } from "./api/public-catalog.js";
 import { type PublicMcpCatalogRoutesOptions, registerPublicMcpCatalogRoutes } from "./api/public-mcp-catalog.js";
 import { RequestValidationError } from "./api/request-validation.js";
@@ -254,6 +255,11 @@ export interface CreateAppOptions {
   runtimeAgentSchedules?: RuntimeAgentScheduleRoutesOptions;
   /** Account-facing Schedule list/show/pause/resume/delete; no Account create or update exists. */
   agentSchedules?: AccountAgentScheduleRoutesOptions;
+  /**
+   * BeFreed fork: operator-only Schedule creation. Present only when `OPENTAG_OPERATOR_ROUTES_ENABLED=true`;
+   * absent means the route does not exist.
+   */
+  operatorSchedules?: OperatorScheduleRoutesOptions;
   runtimeDurableWork?: RuntimeDurableWorkRoutesOptions;
   /** Fixed runtime web routes; present only when the deployment enabled the web service. */
   runtimeWeb?: RuntimeWebRoutesOptions;
@@ -897,6 +903,8 @@ export function createApp(options: CreateAppOptions = {}) {
       );
     }
     registerAvailableAccountRoutes(app, authService, options, authOptions);
+    // BeFreed fork: a no-op unless the deployment enabled the operator routes.
+    registerOperatorScheduleRoutes(app, authService, options.operatorSchedules, authOptions);
     if (options.imBindingService) {
       registerImBindingRoutes(app, authService, options.imBindingService, options.feishuSetupService, authOptions);
     }

@@ -46,6 +46,7 @@ import {
   type ServiceLogger,
   shutdownTelemetry,
 } from "./observability/index.js";
+import { operatorSchedulesOption, parseOperatorRoutesConfig } from "./operator-routes-config.js";
 import { createPlatformRuntime } from "./platform-runtime.js";
 import { AgentRuntimeOptionsOwner } from "./runtime/agent-runtime-options-owner.js";
 import { AgentRuntimeTestOwner } from "./runtime/agent-runtime-test-owner.js";
@@ -645,6 +646,8 @@ export async function startServer(): Promise<void> {
 
   try {
     const config = parseServerConfig(process.env);
+    // BeFreed fork: default off; a bad value or an empty allow-list stops startup rather than guessing.
+    const operatorRoutes = parseOperatorRoutesConfig(process.env);
     knownSecrets.push(...cipherKeySecrets(config));
     const perfLogger = serverPerformanceLogger(config, () => app?.log);
     const instanceId = randomUUID();
@@ -1429,6 +1432,12 @@ export async function startServer(): Promise<void> {
       },
       runtimeAgentSchedules: { service: scheduleService },
       agentSchedules: { service: scheduleService },
+      ...operatorSchedulesOption(operatorRoutes, {
+        database,
+        sessions: sessionService,
+        schedules: scheduleService,
+        logger: serviceLogger("operator-schedules"),
+      }),
       runtimeSessions: {
         collaboration: sessionCollaborationService,
         proofs: sessionCliProofService,
