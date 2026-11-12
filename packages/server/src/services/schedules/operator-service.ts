@@ -6,11 +6,12 @@ import {
   type AgentSchedule,
   type AgentScheduleInput,
   type ImConversationKind,
+  type RuntimeUserTaskSource,
   SCHEDULE_ERROR_CODES,
 } from "@opentag/shared";
-import { and, eq, ne } from "drizzle-orm";
+import { and, desc, eq, isNotNull, ne } from "drizzle-orm";
 import type { DatabaseClient } from "../../db/client.js";
-import { agents, imBindings } from "../../db/schema/index.js";
+import { agents, imBindings, imMessageDeliveries, imMessages } from "../../db/schema/index.js";
 import { resourceNotFound } from "../agents/errors.js";
 import { type SessionService, SessionServiceError } from "../sessions/session-service.js";
 import { ScheduleServiceError } from "./errors.js";
@@ -46,6 +47,11 @@ export interface OperatorCreateScheduleInput {
   /** Run once, this many seconds after the database clock now. */
   runInSeconds?: number;
   enabled: boolean;
+  /**
+   * Create the Schedule on behalf of a real Slack human. The Server never trusts the caller for the
+   * provenance: it looks up an accepted inbound human message of this user in this channel itself.
+   */
+  onBehalfOf?: { slackUserId: string };
 }
 
 export interface OperatorScheduleServiceOptions {
@@ -74,7 +80,7 @@ export class OperatorScheduleService {
     if (!owned) throw resourceNotFound();
 
     const [binding] = await database
-      .select({ id: imBindings.id })
+      .select({ id: imBindings.id, provider: imBindings.provider, externalBotId: imBindings.externalBotId })
       .from(imBindings)
       .where(and(eq(imBindings.agentId, agentId), eq(imBindings.status, "active")))
       .limit(1);
@@ -108,7 +114,16 @@ export class OperatorScheduleService {
     }
     if (!schedule || !timezone) throw new Error("A schedule or runInSeconds is required");
 
-    const scope: AgentScheduleScope = { accountId, agentId, sessionId, sessionKind: "channel" };
+    const userTaskSource = input.onBehalfOf
+      ? await this.#resolveOnBehalfSource(binding, sessionId, input.channelId, input.onBehalfOf.slackUserId)
+      : undefined;
+    const scope: AgentScheduleScope = {
+      accountId,
+      agentId,
+      sessionId,
+      sessionKind: "channel",
+      ...(userTaskSource ? { userTaskSource } : {}),
+    };
     const created = await schedules.createForAgent(scope, {
       name: input.name,
       prompt: input.prompt,
@@ -117,5 +132,42 @@ export class OperatorScheduleService {
     });
     if (input.enabled) return created;
     return schedules.pauseForAgent(scope, created.id, created.revision);
+  }
+
+  /**
+   * Provenance for a Schedule created on behalf of a Slack user: the newest accepted inbound human message of
+   * that user in this very channel Session of this binding. Any miss is a 409; it never falls back to no source.
+   */
+  async #resolveOnBehalfSource(
+    binding: { id: string; provider: string; externalBotId: string | null },
+    sessionId: string,
+    channelId: string,
+    slackUserId: string,
+  ): Promise<RuntimeUserTaskSource> {
+    const notVerified = (reason: string) =>
+      new ScheduleServiceError(SCHEDULE_ERROR_CODES.ON_BEHALF_NOT_VERIFIED, `onBehalfOf is not verified: ${reason}`);
+    if (binding.provider !== "slack") throw notVerified("only Slack bindings are supported");
+    if (slackUserId === binding.externalBotId) throw notVerified("the user is the agent's own bot");
+    const [row] = await this.#options.database
+      .select({ deliveryId: imMessageDeliveries.id, turnId: imMessageDeliveries.turnId })
+      .from(imMessageDeliveries)
+      .innerJoin(imMessages, eq(imMessages.id, imMessageDeliveries.messageId))
+      .where(
+        and(
+          eq(imMessageDeliveries.sessionId, sessionId),
+          eq(imMessageDeliveries.state, "accepted"),
+          isNotNull(imMessageDeliveries.turnId),
+          eq(imMessages.imBindingId, binding.id),
+          eq(imMessages.channelId, channelId),
+          eq(imMessages.direction, "inbound"),
+          eq(imMessages.authorKind, "human"),
+          eq(imMessages.authorExternalId, slackUserId),
+
+        ),
+      )
+      .orderBy(desc(imMessages.occurredAt))
+      .limit(1);
+    if (!row?.turnId) throw notVerified("no accepted message from this user in this channel");
+    return { sessionId, source: { kind: "delivery", deliveryId: row.deliveryId, turnId: row.turnId } };
   }
 }

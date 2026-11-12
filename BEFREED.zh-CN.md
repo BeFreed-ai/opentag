@@ -31,6 +31,7 @@ S2 复用上游代码处理所有规则：`ScheduleService.createForAgent` 校�
 - 请求体：`channelId`、`conversationKind`（`channel|dm|group_dm`）、`name`、`prompt`，再加 `schedule`（`cron`、`at` 或 `every`）和 `timezone`，或者 `runInSeconds`（5..3600，按服务器数据库时钟计算，一次性，不能与 `enabled:false` 同用），以及可选的 `enabled`（默认 true；false 则创建后为暂停状态）。
 - 只创建。列出、读取、暂停、恢复、删除都用现有账号路由（`GET/POST/DELETE /api/v1/agents/:agentId/schedules...`）。
 - 审计：每次调用一行结构化日志（`operator.schedule.created|denied|failed`），含运营者用户 id、agent id、定时任务 id 和规则类型；绝不含提示词、令牌或任何请求头。上游自己的 `schedule.created` 事件也会记录。该日志不是持久审计链，持久审计请继续用 Host 侧的审计链。
+- 代某位 Slack 真人创建（可选 `onBehalfOf: {"slackUserId": "U..."}`）：服务器为任务记录来源，使定时任务的运行能取得 GitHub 凭证和 Context Tree 同步。调用方不能自己传 delivery id；服务器自己在该 agent 绑定的这个频道会话里，查找该 Slack 用户最近一条已被接受的真人入站消息，并把它记为来源。找不到、是机器人、是该 agent 自己的机器人、或不是 Slack 绑定，一律 409 `SCHEDULE_ON_BEHALF_NOT_VERIFIED`，绝不降级为无来源。证明依据是"该用户在此频道发过话且被接受"，不是实时的 Slack 成员查询（已退出频道的人仍可通过；从没发过话的成员会 409）。不带 `onBehalfOf` 时行为不变（无来源）。日志行同时带 `onBehalfOfSlackUserId`。凭证作用域不变（仅该 agent 已绑定的仓库）。
 - 已知限制：规则校验失败的请求（例如 cron 写错）可能留下一个空的频道会话（无害，下次同频道调用会复用）。`enabled:false` 是两步（先创建再暂停），所以马上到点的任务理论上可能运行一次；不要把它和马上触发的 `at` 一起用。
 - 拒绝 cookie 会话是防御性的第二道检查；见 PR 中的"未验证"一节。
 
