@@ -39,6 +39,20 @@ const required = {
 };
 
 describe("parseServerConfig", () => {
+  it("keeps the GitHub external Bearer connector off unless explicitly enabled", () => {
+    expect(parseServerConfig(required).githubExternalBearer).toEqual({
+      enabled: false,
+      serverName: "befreed-memory-github",
+    });
+    expect(
+      parseServerConfig({
+        ...required,
+        OPENTAG_GITHUB_EXTERNAL_BEARER_ENABLED: "true",
+        OPENTAG_GITHUB_EXTERNAL_BEARER_SERVER_NAME: "acme-github",
+      }).githubExternalBearer,
+    ).toEqual({ enabled: true, serverName: "acme-github" });
+  });
+
   it("defaults the database timeouts and accepts overrides", () => {
     expect(parseServerConfig(required).databaseTimeouts).toEqual({
       statementTimeoutMs: 30_000,
