@@ -354,6 +354,7 @@ export const SCHEDULE_ERROR_CODES = {
   TARGET_INVALID: "SCHEDULE_TARGET_INVALID",
   NO_FUTURE_OCCURRENCE: "SCHEDULE_NO_FUTURE_OCCURRENCE",
   REVISION_CONFLICT: "SCHEDULE_REVISION_CONFLICT",
+  ON_BEHALF_NOT_VERIFIED: "SCHEDULE_ON_BEHALF_NOT_VERIFIED",
 } as const;
 export type ScheduleErrorCode = (typeof SCHEDULE_ERROR_CODES)[keyof typeof SCHEDULE_ERROR_CODES];
 export type ScheduleErrorCategory = "validation" | "deterministic";
@@ -369,4 +370,5 @@ export const SCHEDULE_ERROR_CODE_METADATA: Readonly<
   [SCHEDULE_ERROR_CODES.TARGET_INVALID]: { category: "deterministic", statusCode: 409 },
   [SCHEDULE_ERROR_CODES.NO_FUTURE_OCCURRENCE]: { category: "deterministic", statusCode: 409 },
   [SCHEDULE_ERROR_CODES.REVISION_CONFLICT]: { category: "deterministic", statusCode: 409 },
+  [SCHEDULE_ERROR_CODES.ON_BEHALF_NOT_VERIFIED]: { category: "deterministic", statusCode: 409 },
 };

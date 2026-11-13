@@ -47,6 +47,14 @@ passed authentication, the operator allow-list and the ownership check. It never
 - Audit: one structured log line per call (`operator.schedule.created|denied|failed`) with the operator user id, agent
   id, schedule id and rule kind. Never the prompt, the token or any header. Upstream's own `schedule.created` event is
   logged as well. The log is not a durable audit trail; keep the Host-side audit chain for that.
+- On behalf of a Slack human (optional `onBehalfOf: {"slackUserId": "U..."}`): the Server records a task source so the
+  schedule's runs can obtain GitHub credentials and Context Tree sync. The caller never supplies a delivery id. The
+  Server itself looks up the newest accepted inbound human message of that Slack user in this channel Session of this
+  agent's binding and records that delivery as the source. No such message, a bot, the agent's own bot user, or a
+  non-Slack binding -> 409 `SCHEDULE_ON_BEHALF_NOT_VERIFIED`; it never falls back to no source. The proof is "the user has
+  spoken in this channel and the message was accepted", not a live Slack membership call (a user who left the channel
+  still passes; a member who never spoke gets 409). Without `onBehalfOf` the behavior is unchanged (no source). The log
+  line also carries `onBehalfOfSlackUserId`. Credential scope is unchanged (the agent's bound repositories only).
 - Known limits: a request that fails rule validation (for example a bad cron) can leave an empty channel session behind
   (harmless: the session is reused by the next call for the same channel). `enabled:false` is two steps (create, then
   pause), so a schedule due within milliseconds could in theory run once; do not combine it with an imminent `at`.
