@@ -344,6 +344,13 @@ const ServerEnvironmentSchema = z
      */
     OPENTAG_MCP_ALLOW_LOOPBACK: booleanString("false"),
     OPENTAG_MCP_OAUTH_REUSE: booleanString("false"),
+    /**
+     * Lets the Context Tree read GitHub through a Bearer connector that an external rotator keeps
+     * current, but only the one connector named below and only at the GitHub MCP endpoint. Off by
+     * default: with it off the Bearer kind is rejected exactly as before.
+     */
+    OPENTAG_GITHUB_EXTERNAL_BEARER_ENABLED: booleanString("false"),
+    OPENTAG_GITHUB_EXTERNAL_BEARER_SERVER_NAME: z.string().min(1).default("befreed-memory-github"),
     OPENTAG_MCP_GOOGLE_CLIENT_ID: z.string().min(1).optional(),
     OPENTAG_MCP_GOOGLE_CLIENT_SECRET: z.string().min(1).optional(),
     OPENTAG_MCP_CANVA_CLIENT_ID: z.string().min(1).optional(),
@@ -777,6 +784,7 @@ export interface ServerConfig {
    */
   mcpAllowLoopback: boolean;
   mcpOAuthReuse: boolean;
+  githubExternalBearer: { enabled: boolean; serverName: string };
   /**
    * The deployment's pre-registered Google Workspace MCP OAuth client, present only when both
    * variables are configured together. The flow offers it only to the Google-hosted MCP endpoints
@@ -935,6 +943,10 @@ export function parseServerConfig(environment: NodeJS.ProcessEnv): ServerConfig 
     OPENTAG_EMAIL_PASSWORD_AUTH_ENABLED: environment.OPENTAG_EMAIL_PASSWORD_AUTH_ENABLED,
     OPENTAG_MCP_ALLOW_LOOPBACK: environment.OPENTAG_MCP_ALLOW_LOOPBACK,
     OPENTAG_MCP_OAUTH_REUSE: environment.OPENTAG_MCP_OAUTH_REUSE,
+    OPENTAG_GITHUB_EXTERNAL_BEARER_ENABLED: environment.OPENTAG_GITHUB_EXTERNAL_BEARER_ENABLED,
+    OPENTAG_GITHUB_EXTERNAL_BEARER_SERVER_NAME: emptyToUndefined(
+      environment.OPENTAG_GITHUB_EXTERNAL_BEARER_SERVER_NAME,
+    ),
     OPENTAG_MCP_GOOGLE_CLIENT_ID: emptyToUndefined(environment.OPENTAG_MCP_GOOGLE_CLIENT_ID),
     OPENTAG_MCP_GOOGLE_CLIENT_SECRET: emptyToUndefined(environment.OPENTAG_MCP_GOOGLE_CLIENT_SECRET),
     OPENTAG_MCP_CANVA_CLIENT_ID: emptyToUndefined(environment.OPENTAG_MCP_CANVA_CLIENT_ID),
@@ -1046,6 +1058,10 @@ export function parseServerConfig(environment: NodeJS.ProcessEnv): ServerConfig 
     migrationsDirectory: parseDatabaseConfig(environment).migrationsDirectory,
     logLevel: parsed.OPENTAG_LOG_LEVEL,
     mcpOAuthReuse: parsed.OPENTAG_MCP_OAUTH_REUSE,
+    githubExternalBearer: {
+      enabled: parsed.OPENTAG_GITHUB_EXTERNAL_BEARER_ENABLED,
+      serverName: parsed.OPENTAG_GITHUB_EXTERNAL_BEARER_SERVER_NAME,
+    },
     mcpAllowLoopback: !isHostedEnvironment(parsed.OPENTAG_ENV) && parsed.OPENTAG_MCP_ALLOW_LOOPBACK,
     ...resolveMcpGoogleOAuth(parsed),
     ...resolveMcpStaticOAuth(parsed),

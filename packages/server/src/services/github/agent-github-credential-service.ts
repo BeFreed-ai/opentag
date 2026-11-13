@@ -1,6 +1,8 @@
 import type { DatabaseClient } from "../../db/client.js";
 import {
+  type GitHubExternalBearerOptions,
   type GitHubMcpAuthorityFence,
+  gitHubMcpExternalBearer,
   gitHubMcpFence,
   gitHubMcpReadOnly,
   readAgentGitHubMcp,
@@ -51,6 +53,8 @@ export class AgentGitHubCredentialService implements GitHubExecutionCredentialRe
       authorization: Pick<McpAuthorizationService, "resolveAccessCredential">;
       api: GitHubApiClient;
       configured: boolean;
+      /** Off by default. See `GitHubExternalBearerOptions`. */
+      externalBearer?: GitHubExternalBearerOptions;
       trustedClient(url: string, issuer: string, clientId: string | undefined, registrationId: string | null): boolean;
     },
   ) {
@@ -59,21 +63,25 @@ export class AgentGitHubCredentialService implements GitHubExecutionCredentialRe
 
   async #resolve(accountId: string, agentId: string) {
     if (!this.options.configured) return undefined;
-    const context = await readAgentGitHubMcp(this.options.database, accountId, agentId);
+    const external = this.options.externalBearer;
+    const context = await readAgentGitHubMcp(this.options.database, accountId, agentId, external);
     if (context && !context.binding.enabled) throw new AgentGitHubAuthorizationError("github_connector_disabled");
-    if (context?.authorization && context.authorization.kind !== "oauth")
+    const bearer = context ? gitHubMcpExternalBearer(context, external) : false;
+    if (context?.authorization && context.authorization.kind !== "oauth" && !bearer)
       throw new AgentGitHubAuthorizationError("github_connector_unsupported");
-    const fence = context && gitHubMcpFence(context);
+    const fence = context && gitHubMcpFence(context, external);
     if (!context || !fence) return undefined;
     const credential = this.options.authorization.resolveAccessCredential(context);
+    // A Bearer key has no OAuth client to vouch for, so only the OAuth path asks the client check.
     if (
       !credential ||
-      !this.options.trustedClient(
-        mcpEffectiveConfig(context.server, context.binding).url,
-        context.authorization?.authorizationServer ?? "",
-        credential.clientId,
-        context.authorization?.clientRegistrationId ?? null,
-      )
+      (!bearer &&
+        !this.options.trustedClient(
+          mcpEffectiveConfig(context.server, context.binding).url,
+          context.authorization?.authorizationServer ?? "",
+          credential.clientId,
+          context.authorization?.clientRegistrationId ?? null,
+        ))
     )
       return undefined;
     const connection: AgentGitHubConnection = {
@@ -84,7 +92,7 @@ export class AgentGitHubCredentialService implements GitHubExecutionCredentialRe
       readOnly: gitHubMcpReadOnly(context),
       fence,
     };
-    return { connection, accessToken: credential.accessToken };
+    return { connection, accessToken: credential.accessToken, bearer };
   }
 
   async getOverview(accountId: string, agentId: string) {
@@ -140,7 +148,11 @@ export class AgentGitHubCredentialService implements GitHubExecutionCredentialRe
         403,
         "This GitHub Connector is read-only",
       );
-    const target = await this.#admission.resolveRepository({ ...input, accessToken: current.accessToken });
+    const target = await this.#admission.resolveRepository({
+      ...input,
+      accessToken: current.accessToken,
+      ...(current.bearer ? { permissionsOptional: true } : {}),
+    });
     return { ...target, authorizationVersion: current.connection.authorizationVersion };
   }
 }

@@ -879,6 +879,7 @@ export async function startServer(): Promise<void> {
               authorization: mcpAuthorization,
               api,
               configured: true,
+              externalBearer: config.githubExternalBearer,
               trustedClient: (url, issuer, clientId, registrationId) =>
                 mcpFlows.reusableClient(url, issuer, clientId, registrationId),
             }),
