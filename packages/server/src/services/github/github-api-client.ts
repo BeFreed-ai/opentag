@@ -188,9 +188,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function parseRepository(value: unknown): GitHubRepository {
+function parseRepository(value: unknown, permissionsOptional = false): GitHubRepository {
   if (!isRecord(value)) throw invalidResponse("The GitHub API response repository is malformed");
-  const permissions = value.permissions;
+  // Only an external Bearer key (a single-repository installation token) may omit `permissions`; GitHub
+  // then enforces writes itself, so the omitted flags are read as pull and push allowed.
+  const permissions =
+    permissionsOptional && (value.permissions === undefined || value.permissions === null)
+      ? { admin: false, pull: true, push: true }
+      : value.permissions;
   if (
     !isRecord(permissions) ||
     typeof permissions.admin !== "boolean" ||
@@ -348,11 +353,15 @@ export class GitHubApiClient {
   async getRepository(input: {
     accessToken: string;
     fullName: string;
+    permissionsOptional?: boolean;
     signal?: AbortSignal;
   }): Promise<GitHubRepository> {
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(input.fullName) || input.fullName.includes(".."))
       throw requestError("Invalid repository name");
-    return parseRepository(await this.#sendApi("GET", `/repos/${input.fullName}`, input.accessToken, input.signal));
+    return parseRepository(
+      await this.#sendApi("GET", `/repos/${input.fullName}`, input.accessToken, input.signal),
+      input.permissionsOptional === true,
+    );
   }
 
   /** Creates an empty private repository; an existing repository is never reused or modified. */

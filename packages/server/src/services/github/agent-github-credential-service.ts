@@ -92,7 +92,7 @@ export class AgentGitHubCredentialService implements GitHubExecutionCredentialRe
       readOnly: gitHubMcpReadOnly(context),
       fence,
     };
-    return { connection, accessToken: credential.accessToken };
+    return { connection, accessToken: credential.accessToken, bearer };
   }
 
   async getOverview(accountId: string, agentId: string) {
@@ -148,7 +148,11 @@ export class AgentGitHubCredentialService implements GitHubExecutionCredentialRe
         403,
         "This GitHub Connector is read-only",
       );
-    const target = await this.#admission.resolveRepository({ ...input, accessToken: current.accessToken });
+    const target = await this.#admission.resolveRepository({
+      ...input,
+      accessToken: current.accessToken,
+      ...(current.bearer ? { permissionsOptional: true } : {}),
+    });
     return { ...target, authorizationVersion: current.connection.authorizationVersion };
   }
 }

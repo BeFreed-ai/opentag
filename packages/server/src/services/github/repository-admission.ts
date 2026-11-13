@@ -47,6 +47,7 @@ export class GitHubRepositoryAdmissionService {
     fullName: string;
     access: "read" | "write";
     publish?: "direct" | "pull_request";
+    permissionsOptional?: boolean;
     signal?: AbortSignal;
   }) {
     const repository = await this.options.api.getRepository(input);

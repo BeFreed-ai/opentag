@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { AgentGitHubCredentialService } from "../services/github/agent-github-credential-service.js";
+import { GITHUB_CONNECTION_ERROR_CODES } from "../services/github/errors.js";
+import { GitHubApiClient } from "../services/github/github-api-client.js";
 import { matchesGitHubMcpFence } from "../services/mcp/github-authorization.js";
 import { githubMcpFixture } from "./support/github-mcp.js";
 import { createUnitDatabase, type UnitDatabase } from "./support/unit-database.js";
@@ -14,12 +16,15 @@ beforeAll(async () => {
 afterAll(async () => unit?.close());
 beforeEach(async () => unit.reset());
 
-async function setup(options: { name?: string; url?: string; serverName?: string; enabled?: boolean } = {}) {
+async function setup(
+  options: { name?: string; url?: string; serverName?: string; enabled?: boolean; readOnly?: boolean } = {},
+) {
   const f = await githubMcpFixture(unit.database);
   const bearerServer = await f.servers.createServer(f.accountId, {
     name: options.name ?? NAME,
     url: options.url ?? GITHUB_MCP,
     defaultAuthKind: "bearer",
+    ...(options.readOnly ? { extraHeaders: { "x-mcp-readonly": "true" } } : {}),
   });
   // By default the Agent's only GitHub mount is the Bearer connector; `keepShared` leaves the older OAuth mount.
   const mount = async (agentId: string, key: string, keepShared = false) => {
@@ -27,11 +32,11 @@ async function setup(options: { name?: string; url?: string; serverName?: string
     await f.servers.attachServer(f.accountId, agentId, bearerServer.id, true);
     await f.auth.setBearerOrNone(f.accountId, agentId, bearerServer.id, { kind: "bearer", bearerKey: key });
   };
-  const service = (enabled: boolean, serverName = options.serverName ?? NAME) =>
+  const service = (enabled: boolean, serverName = options.serverName ?? NAME, api: GitHubApiClient = f.api) =>
     new AgentGitHubCredentialService({
       database: unit.database,
       authorization: f.auth,
-      api: f.api,
+      api,
       configured: true,
       externalBearer: { enabled, serverName },
       // A Bearer key has no OAuth client, so this real check would refuse it: the Bearer path must bypass it.
@@ -174,5 +179,76 @@ describe("external Bearer GitHub connector (off by default)", () => {
     const after = (await service(true).getOverview(f.accountId, agentId)).connection;
     expect(after?.authorizationVersion).not.toBe(before?.authorizationVersion);
     expect(after?.readOnly).toBe(true);
+  });
+
+  describe("repository permissions that GitHub omits", () => {
+    const repo = (permissions?: unknown) => ({
+      id: 77,
+      full_name: "acme/memory",
+      private: true,
+      default_branch: "main",
+      ...(permissions === undefined ? {} : { permissions }),
+    });
+    const apiReturning = (body: unknown) =>
+      new GitHubApiClient({
+        clientId: "github-client",
+        clientSecret: "test-secret",
+        redirectUri: "https://opentag.example.test/callback",
+        fetch: async () =>
+          new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } }),
+      });
+    const resolve = async (
+      github: AgentGitHubCredentialService,
+      accountId: string,
+      agentId: string,
+      access: "read" | "write",
+    ) => {
+      const { connection } = await github.getOverview(accountId, agentId);
+      if (!connection) throw new Error("Missing connection");
+      return github.resolveRepository({
+        accountId,
+        agentId,
+        connectionId: connection.id,
+        expectedAuthorizationVersion: connection.authorizationVersion,
+        fullName: "acme/memory",
+        access,
+      });
+    };
+
+    it("lets a Bearer key read and leaves writes to GitHub when the response has no permissions", async () => {
+      const { f, mount, service } = await setup();
+      const agentId = f.ids[2] as string;
+      await mount(agentId, "ghs_first");
+      const github = service(true, NAME, apiReturning(repo()));
+      expect(await resolve(github, f.accountId, agentId, "read")).toMatchObject({ fullName: "acme/memory" });
+      expect(await resolve(github, f.accountId, agentId, "write")).toMatchObject({ fullName: "acme/memory" });
+    });
+
+    it("still blocks writes on a read-only Bearer connector when the response has no permissions", async () => {
+      const { f, mount, service } = await setup({ readOnly: true });
+      const agentId = f.ids[3] as string; // mirror: another Agent
+      await mount(agentId, "ghs_first");
+      const github = service(true, NAME, apiReturning(repo()));
+      expect(await resolve(github, f.accountId, agentId, "read")).toMatchObject({ fullName: "acme/memory" });
+      await expect(resolve(github, f.accountId, agentId, "write")).rejects.toMatchObject({
+        code: GITHUB_CONNECTION_ERROR_CODES.ADMISSION_PERMISSION_INSUFFICIENT,
+      });
+    });
+
+    it("still rejects present-but-malformed permissions on a Bearer key", async () => {
+      const { f, mount, service } = await setup();
+      const agentId = f.ids[2] as string;
+      await mount(agentId, "ghs_first");
+      const github = service(true, NAME, apiReturning(repo("yes")));
+      await expect(resolve(github, f.accountId, agentId, "read")).rejects.toThrow(/permissions are malformed/);
+    });
+
+    it("keeps the OAuth path strict: missing permissions is still the original error", async () => {
+      const { f, service } = await setup();
+      for (const enabled of [true, false])
+        await expect(
+          resolve(service(enabled, NAME, apiReturning(repo())), f.accountId, f.ids[0] as string, "read"),
+        ).rejects.toThrow(/permissions are malformed/);
+    });
   });
 });
