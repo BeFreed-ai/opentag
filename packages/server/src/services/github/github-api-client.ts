@@ -190,12 +190,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function parseRepository(value: unknown, permissionsOptional = false): GitHubRepository {
   if (!isRecord(value)) throw invalidResponse("The GitHub API response repository is malformed");
-  // Only an external Bearer key (a single-repository installation token) may omit `permissions`; GitHub
-  // then enforces writes itself, so the omitted flags are read as pull and push allowed.
-  const permissions =
-    permissionsOptional && (value.permissions === undefined || value.permissions === null)
-      ? { admin: false, pull: true, push: true }
-      : value.permissions;
+  // Only an external Bearer key (a single-repository installation token) may leave `permissions` unknown;
+  // GitHub then enforces access itself, so the unknown flags are read as pull and push allowed. "Unknown"
+  // means the field is omitted or null, or GitHub returned it with every flag false: installation tokens do
+  // not carry per-user permissions, so an all-false object is not a denial (the 200 on this very request
+  // already proves the token can read the repository). A denial is a 403/404 from GitHub, never this object.
+  const unknownPermissions =
+    permissionsOptional &&
+    (value.permissions === undefined ||
+      value.permissions === null ||
+      (isRecord(value.permissions) &&
+        value.permissions.admin === false &&
+        value.permissions.pull === false &&
+        value.permissions.push === false));
+  const permissions = unknownPermissions ? { admin: false, pull: true, push: true } : value.permissions;
   if (
     !isRecord(permissions) ||
     typeof permissions.admin !== "boolean" ||

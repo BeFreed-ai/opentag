@@ -4,6 +4,7 @@ import {
   GitHubApiClient,
   GitHubApiClientError,
 } from "../services/github/github-api-client.js";
+import { GitHubRepositoryAdmissionService } from "../services/github/repository-admission.js";
 
 const REDIRECT_URI = "https://opentag.example.com/api/v2/integrations/github/oauth/callback";
 
@@ -776,5 +777,58 @@ describe("OAuth client and repository scope verification", () => {
         page: 1,
       }),
     ).rejects.toMatchObject({ code: GITHUB_API_CLIENT_ERROR_CODES.RESPONSE_INVALID });
+  });
+});
+
+describe("external Bearer repository admission with installation-token permissions", () => {
+  const repoBody = (permissions: unknown) => ({
+    id: 123,
+    full_name: "owner/memory",
+    private: true,
+    default_branch: "main",
+    ...(permissions === undefined ? {} : { permissions }),
+  });
+  const ALL_FALSE = { admin: false, maintain: false, push: false, triage: false, pull: false };
+  function admission(status: number, body: unknown) {
+    const fetcher = vi.fn(async () => jsonResponse(status, body));
+    return new GitHubRepositoryAdmissionService({ api: clientWithFetch(fetcher) });
+  }
+  const resolve = (service: GitHubRepositoryAdmissionService, bearer: boolean, access: "read" | "write" = "read") =>
+    service.resolveRepository({
+      accessToken: "ghs_installation",
+      fullName: "owner/memory",
+      access,
+      ...(bearer ? { permissionsOptional: true } : {}),
+    });
+
+  it("treats all-false permissions from an installation token as unknown when the repository read succeeded", async () => {
+    await expect(resolve(admission(200, repoBody(ALL_FALSE)), true)).resolves.toMatchObject({
+      repositoryId: "123",
+      defaultBranch: "main",
+    });
+  });
+  it("handles all-false permissions exactly like omitted permissions on the Bearer path", async () => {
+    const omitted = await resolve(admission(200, repoBody(undefined)), true, "write");
+    const allFalse = await resolve(admission(200, repoBody(ALL_FALSE)), true, "write");
+    expect(allFalse).toEqual(omitted);
+  });
+  it.each([403, 404])("still refuses a Bearer token whose repository read fails with %s", async (status) => {
+    await expect(resolve(admission(status, { message: "nope" }), true)).rejects.toThrow();
+    await expect(resolve(admission(status, repoBody(ALL_FALSE)), true)).rejects.toThrow();
+  });
+  it("keeps a partially true permissions object authoritative on the Bearer path", async () => {
+    const readOnly = () => admission(200, repoBody({ admin: false, pull: true, push: false }));
+    await expect(resolve(readOnly(), true)).resolves.toMatchObject({ repositoryId: "123" });
+    await expect(resolve(readOnly(), true, "write")).rejects.toMatchObject({
+      code: "GITHUB_ADMISSION_PERMISSION_INSUFFICIENT",
+    });
+  });
+  it("keeps the built-in OAuth path unchanged: all-false permissions are still refused", async () => {
+    await expect(resolve(admission(200, repoBody(ALL_FALSE)), false)).rejects.toMatchObject({
+      code: "GITHUB_ADMISSION_PERMISSION_INSUFFICIENT",
+    });
+  });
+  it("keeps the OAuth path strict about omitted permissions", async () => {
+    await expect(resolve(admission(200, repoBody(undefined)), false)).rejects.toThrow();
   });
 });
