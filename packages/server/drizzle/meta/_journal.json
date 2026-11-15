@@ -512,6 +512,13 @@
       "when": 1793157286147,
       "tag": "0072_self_configuration_default_enabled",
       "breakpoints": true
+    },
+    {
+      "idx": 73,
+      "version": "7",
+      "when": 1794698594200,
+      "tag": "0073_agent_schedules_fresh_session",
+      "breakpoints": true
     }
   ]
 }

@@ -1133,6 +1133,58 @@ describe("SessionRuntimeManager", () => {
     },
   );
 
+  it("runs a fresh scheduled conversation without touching the Session's durable binding (BeFreed fork)", async () => {
+    const home = await mkdtemp(resolve(tmpdir(), "opentag-fresh-session-"));
+    homes.push(home);
+    const store = new SessionBindingStore({ home, providerArtifactIdentity: () => "a".repeat(64) });
+    const factory = new FakeFactory();
+    const computerId = randomUUID();
+    const manager = new SessionRuntimeManager({
+      bindingStore: store,
+      providers: await providerRegistry(factory),
+      providerEnvironmentPath: () => "/tmp/provider-env.sh",
+      workspace: new AgentWorkspaceManager({ home, bindingStore: store }),
+    });
+    const request = reconcile(computerId, snapshot(1));
+    await new SessionReconciler({ installationId: computerId, preparation: manager, localPolicy: manager }).reconcile(
+      request,
+    );
+    try {
+      // People's conversation starts and its binding is stored.
+      await manager.ensureRuntime("session-1");
+      expect((await store.read("agent-1", "session-1"))?.runtimeBinding).toEqual(binding("thread-1"));
+
+      // A fresh scheduled run: a NEW provider conversation (create, never resume), people's process closed.
+      const fresh = await manager.ensureFreshRuntime("session-1");
+      expect(factory.created).toHaveLength(2);
+      expect(factory.resumed).toEqual([]);
+      expect(fresh).toBe(factory.runtimes[1]);
+      expect(factory.runtimes[0]?.closed).toBe(true);
+      // The fresh conversation reports its binding; the durable binding must not move.
+      await factory.runtimes[1]?.emit({ type: "binding_changed", binding: binding("thread-2") });
+      expect((await store.read("agent-1", "session-1"))?.runtimeBinding).toEqual(binding("thread-1"));
+      // A human turn can never be handed the throw-away conversation.
+      await expect(manager.ensureRuntime("session-1")).rejects.toThrow("fresh scheduled run");
+
+      await manager.releaseFreshRuntime("session-1");
+      await manager.releaseFreshRuntime("session-1");
+      expect(factory.runtimes[1]?.closed).toBe(true);
+
+      // People's next message resumes THEIR conversation (thread-1), not the scheduled one.
+      await manager.ensureRuntime("session-1");
+      expect(factory.resumed).toEqual([binding("thread-1")]);
+      expect(factory.created).toHaveLength(2);
+      expect((await store.read("agent-1", "session-1"))?.runtimeBinding).toEqual(binding("thread-1"));
+
+      // Every scheduled run is fresh again, not a continuation of the previous scheduled run.
+      await manager.ensureFreshRuntime("session-1");
+      expect(factory.created).toHaveLength(3);
+      await manager.releaseFreshRuntime("session-1");
+    } finally {
+      await manager.close();
+    }
+  });
+
   it("prepares a new native conversation when only the Agent revision advances in a warm Session", async () => {
     const f = await legacyRuntimeFixture("0.1.0", "codex", false);
     const factory = new FakeFactory();

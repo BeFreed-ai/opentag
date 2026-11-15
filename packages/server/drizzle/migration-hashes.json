@@ -365,6 +365,11 @@
       "idx": 72,
       "tag": "0072_self_configuration_default_enabled",
       "sha256": "936ba197d58227fbf7986dc4a9ce3bccb7f83e715d46f8b8745080aa41055fdd"
+    },
+    {
+      "idx": 73,
+      "tag": "0073_agent_schedules_fresh_session",
+      "sha256": "0e52ae2f4603384a99d4faa08f0da153df5e6e8fd08192338eecdd3ac706d5d3"
     }
   ]
 }

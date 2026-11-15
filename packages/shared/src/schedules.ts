@@ -123,6 +123,12 @@ export const SessionMessageScheduledOriginSchema = z
     timezone: z.string().min(1).max(AGENT_SCHEDULE_TIMEZONE_MAX_LENGTH),
     /** Snapshot of the Schedule name at claim time. */
     name: z.string().min(1).max(AGENT_SCHEDULE_NAME_MAX_CODE_POINTS),
+    /**
+     * BeFreed fork: present (and only ever `true`) when the Schedule runs every occurrence in a brand-new
+     * provider conversation. Absent means "continue the Session's conversation", the upstream behavior, and
+     * keeps the wire shape byte-identical for every Schedule that does not opt in.
+     */
+    freshSession: z.literal(true).optional(),
   })
   .strict();
 export type SessionMessageScheduledOrigin = z.infer<typeof SessionMessageScheduledOriginSchema>;
@@ -235,6 +241,8 @@ export const AgentScheduleSchema = z
     schedule: AgentScheduleRuleSchema,
     timezone: z.string().min(1).max(AGENT_SCHEDULE_TIMEZONE_MAX_LENGTH),
     enabled: z.boolean(),
+    /** BeFreed fork: emitted only when `true` (every run starts a fresh conversation); absent means false. */
+    freshSession: z.literal(true).optional(),
     nextTriggerAt: ScheduleUtcInstantSchema.nullable(),
     revision: z.number().int().min(1).safe(),
     lastDispatch: AgentScheduleLastDispatchSchema.nullable(),

@@ -47,6 +47,8 @@ export interface OperatorCreateScheduleInput {
   /** Run once, this many seconds after the database clock now. */
   runInSeconds?: number;
   enabled: boolean;
+  /** Every occurrence starts a fresh provider conversation; default false (omitted by older callers). */
+  freshSession?: boolean;
   /**
    * Create the Schedule on behalf of a real Slack human. The Server never trusts the caller for the
    * provenance: it looks up an accepted inbound human message of this user in this channel itself.
@@ -124,12 +126,12 @@ export class OperatorScheduleService {
       sessionKind: "channel",
       ...(userTaskSource ? { userTaskSource } : {}),
     };
-    const created = await schedules.createForAgent(scope, {
-      name: input.name,
-      prompt: input.prompt,
-      schedule,
-      timezone,
-    });
+    const request = { name: input.name, prompt: input.prompt, schedule, timezone };
+    // The third argument is only passed for an opted-in Schedule, so every other call is byte-identical to before.
+    const created =
+      input.freshSession === true
+        ? await schedules.createForAgent(scope, request, { freshSession: true })
+        : await schedules.createForAgent(scope, request);
     if (input.enabled) return created;
     return schedules.pauseForAgent(scope, created.id, created.revision);
   }

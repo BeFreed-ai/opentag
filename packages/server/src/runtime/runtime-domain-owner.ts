@@ -51,7 +51,9 @@ export type AnySessionMessageDeliveryRequest = SessionMessageDeliveryRequest | S
 function sessionMessageRequestOriginKey(request: AnySessionMessageDeliveryRequest): unknown {
   if ("scheduledOrigin" in request && request.scheduledOrigin !== undefined) {
     const origin = request.scheduledOrigin;
-    return ["scheduled", origin.scheduleId, origin.scheduledFor, origin.timezone, origin.name];
+    const key = ["scheduled", origin.scheduleId, origin.scheduledFor, origin.timezone, origin.name];
+    // Appended only when set, so the identity of every non-fresh message is unchanged.
+    return origin.freshSession ? [...key, "fresh"] : key;
   }
   return request.sourceSessionId;
 }

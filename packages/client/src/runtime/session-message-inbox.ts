@@ -83,6 +83,7 @@ export interface SessionMessageInboxOptions {
     "checkSessionMessageDelivery" | "clearActivity" | "setActivity" | "withAgentLock"
   >;
   runtimeManager: Pick<SessionRuntimeManager, "ensureRuntime" | "sessionKind"> &
+    Partial<Pick<SessionRuntimeManager, "ensureFreshRuntime" | "releaseFreshRuntime">> &
     Partial<Pick<SessionRuntimeManager, "providerId">>;
 }
 
@@ -376,7 +377,7 @@ export class SessionMessageInbox {
       phase = "runtime";
       const runtimeSignal = sessionKind === "visible" ? ensureRunSignal() : this.#abort.signal;
       runtimeSignal.throwIfAborted();
-      const runtime = await this.#runtimeManager.ensureRuntime(sessionId, runtimeSignal);
+      const runtime = await this.#acquireRuntime(sessionId, next.request, runtimeSignal);
       await runtime.waitForIdle();
       phase = "prompt";
       ensureRunSignal().throwIfAborted();
@@ -411,6 +412,7 @@ export class SessionMessageInbox {
       if (current) await this.#handleFailure(current, next.hash, phase, error);
     } finally {
       timer?.cancel();
+      await this.#releaseRuntime(sessionId, next.request);
       await this.#cleanupTurnPlan(turnPlanInput);
       if (credentialPrepared) {
         await this.#credentialEnvironment.cleanup(sessionId, preparedExecutionId).catch(() => undefined);
@@ -420,6 +422,24 @@ export class SessionMessageInbox {
         reservation.release();
       });
     }
+  }
+
+  /**
+   * BeFreed fork: a Schedule with `freshSession` runs every occurrence in a brand-new provider conversation
+   * (the Session's own conversation, and its stored binding, are left alone); everything else uses the
+   * Session's runtime exactly as before.
+   */
+  async #acquireRuntime(sessionId: string, request: SessionMessageDeliveryRequestV3, signal: AbortSignal) {
+    if (request.scheduledOrigin?.freshSession !== true) return this.#runtimeManager.ensureRuntime(sessionId, signal);
+    const { ensureFreshRuntime } = this.#runtimeManager;
+    if (!ensureFreshRuntime) throw new Error("This Runtime manager cannot start a fresh Session conversation");
+    return ensureFreshRuntime.call(this.#runtimeManager, sessionId, signal);
+  }
+
+  /** Drop a freshSession Run's throw-away runtime so people's next message resumes their own conversation. */
+  async #releaseRuntime(sessionId: string, request: SessionMessageDeliveryRequestV3): Promise<void> {
+    if (request.scheduledOrigin?.freshSession !== true) return;
+    await this.#runtimeManager.releaseFreshRuntime?.(sessionId).catch(() => undefined);
   }
 
   /**
@@ -693,7 +713,7 @@ export type SessionMessageTurnContext =
 export function sessionMessageSemanticHash(request: SessionMessageDeliveryRequestV3): string {
   const origin = request.scheduledOrigin;
   if (origin) {
-    return hashTuple([
+    const tuple: unknown[] = [
       2,
       origin.scheduleId,
       origin.scheduledFor,
@@ -702,7 +722,10 @@ export function sessionMessageSemanticHash(request: SessionMessageDeliveryReques
       request.targetSessionId,
       request.agentId,
       request.content,
-    ]);
+    ];
+    // Appended only when set, so records persisted before this flag keep their exact hash.
+    if (origin.freshSession) tuple.push("fresh");
+    return hashTuple(tuple);
   }
   return hashTuple([request.sourceSessionId, request.targetSessionId, request.agentId, request.content]);
 }

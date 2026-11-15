@@ -143,6 +143,7 @@ describe("operator schedule route", () => {
       name: "Daily SEO",
       prompt: SECRET_PROMPT,
       enabled: true,
+      freshSession: false,
       schedule: { kind: "cron", expression: "0 9 * * *" },
       timezone: "America/Los_Angeles",
     });
@@ -151,6 +152,32 @@ describe("operator schedule route", () => {
     expect(line).toContain("operator.schedule.created");
     expect(line).not.toContain(SECRET_PROMPT);
     expect(line).not.toContain("operator-token");
+  });
+
+  it("accepts freshSession:true and rejects a non-boolean freshSession (BeFreed fork)", async () => {
+    const { app, service } = fixture();
+    const ok = await app.inject({
+      method: "POST",
+      url,
+      headers: bearer("operator-token"),
+      payload: { ...validBody, freshSession: true },
+    });
+    expect(ok.statusCode).toBe(201);
+    expect(service.createSchedule).toHaveBeenCalledWith(
+      operatorId,
+      agentId,
+      expect.objectContaining({ freshSession: true }),
+    );
+    for (const bad of ["yes", 1, null]) {
+      const response = await app.inject({
+        method: "POST",
+        url,
+        headers: bearer("operator-token"),
+        payload: { ...validBody, freshSession: bad },
+      });
+      expect(response.statusCode).toBe(400);
+    }
+    expect(service.createSchedule).toHaveBeenCalledTimes(1);
   });
 
   it("accepts a one-time at rule and the run-now parameter (mirror cases)", async () => {

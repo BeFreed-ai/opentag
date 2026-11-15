@@ -366,6 +366,7 @@ export class ScheduleScheduler {
       scheduledFor: scheduledFor.toISOString(),
       timezone: row.timezone,
       name: row.name,
+      ...(row.freshSession ? { freshSession: true as const } : {}),
     };
     const contentHash = createHash("sha256").update(row.prompt, "utf8").digest("hex");
     const [inserted] = await transaction
@@ -542,6 +543,7 @@ function scheduledMessageIdentityMatches(
     stored.scheduledFor === origin.scheduledFor &&
     stored.timezone === origin.timezone &&
     stored.name === origin.name &&
+    stored.freshSession === origin.freshSession &&
     existing.targetSessionId === row.targetSessionId &&
     existing.content === row.prompt &&
     existing.contentHash === contentHash &&

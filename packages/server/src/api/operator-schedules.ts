@@ -52,6 +52,8 @@ export const OperatorCreateScheduleRequestSchema = z
     /** "Run now": one run this many seconds from now, computed on the Server's database clock. */
     runInSeconds: z.number().int().min(OPERATOR_RUN_IN_SECONDS_MIN).max(OPERATOR_RUN_IN_SECONDS_MAX).optional(),
     enabled: z.boolean().default(true),
+    /** Run every occurrence in a brand-new provider conversation (needs a client that supports it). */
+    freshSession: z.boolean().default(false),
     /** Create on behalf of a real Slack human who has spoken in this channel; verified by the Server. */
     onBehalfOf: z
       .object({ slackUserId: z.string().regex(/^[UW][A-Z0-9]{2,31}$/) })
