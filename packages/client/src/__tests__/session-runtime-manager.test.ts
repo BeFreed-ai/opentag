@@ -1212,6 +1212,9 @@ describe("SessionRuntimeManager", () => {
       request,
     );
     try {
+      await expect(manager.ensureFreshRuntime("missing-session")).rejects.toBeInstanceOf(
+        SessionRuntimeNotPreparedError,
+      );
       await manager.ensureRuntime("session-1");
       failCreate = true;
       await expect(manager.ensureFreshRuntime("session-1")).rejects.toThrow();

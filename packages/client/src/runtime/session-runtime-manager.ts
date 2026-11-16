@@ -321,6 +321,7 @@ export class SessionRuntimeManager implements RuntimePreparation, RuntimeLocalPo
     await this.#closeManaged(managed);
     managed.freshRun = true;
     const start = this.#startRuntime(managed, contextTreeEnvironment, true).finally(() => {
+      /* v8 ignore else -- only the owning start clears its own slot. */
       if (managed.start === start) managed.start = undefined;
       this.#starts.delete(start);
     });
