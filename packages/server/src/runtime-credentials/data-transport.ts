@@ -29,6 +29,25 @@ import type { RuntimeExecutionRegistry } from "./execution-registry.js";
 import type { ProviderProxyAdapter, ProviderProxyRequest } from "./provider-proxy-adapter.js";
 import type { RuntimeProxyTicketStore } from "./ticket-store.js";
 
+/**
+ * Server→client WebSocket ping cadence on an authenticated data connection.
+ *
+ * Nothing else guarantees origin→client bytes on this socket: a turn whose tool call keeps the
+ * stream idle (a long model step, a slow shell command) sends no frames at all. Proxies in front of
+ * the Server close such sockets — CloudFront's WebSocket origin idle timeout is 10 minutes ("If
+ * CloudFront hasn't detected any bytes sent from the origin to the client within the past 10
+ * minutes, the connection is assumed to be idle and is closed"). A closed data connection makes
+ * the client relay abort the whole execution. 30 seconds leaves a 20x margin under that limit and
+ * under the more common 60-second load-balancer defaults, while costing a few bytes per interval.
+ */
+export const PROVIDER_PROXY_KEEPALIVE_INTERVAL_MS = 30_000;
+/**
+ * Consecutive keepalive intervals without a pong before the Server treats the peer as gone and
+ * closes the connection (60–90 seconds at the default cadence). Standard WebSocket clients,
+ * including the `ws` client the runtime uses, answer pings automatically.
+ */
+export const PROVIDER_PROXY_KEEPALIVE_MAX_MISSED_PONGS = 2;
+
 interface ResolvedTransportLimits {
   authTimeoutMs: number;
   headerMaxBytes: number;
@@ -36,6 +55,7 @@ interface ResolvedTransportLimits {
   initialCreditBytes: number;
   maxStreams: number;
   revalidateIntervalMs: number;
+  keepaliveIntervalMs: number;
 }
 
 export interface RuntimeProviderProxyTransportOptions {
@@ -53,6 +73,8 @@ export interface RuntimeProviderProxyTransportOptions {
   initialCreditBytes?: number;
   maxStreams?: number;
   revalidateIntervalMs?: number;
+  /** Server→client ping cadence after auth; see PROVIDER_PROXY_KEEPALIVE_INTERVAL_MS. */
+  keepaliveIntervalMs?: number;
 }
 
 interface ProxyStream {
@@ -90,6 +112,7 @@ export class RuntimeProviderProxyTransport {
       initialCreditBytes: options.initialCreditBytes ?? PROVIDER_PROXY_INITIAL_CREDIT_BYTES,
       maxStreams: options.maxStreams ?? PROVIDER_PROXY_MAX_STREAMS_PER_EXECUTION,
       revalidateIntervalMs: options.revalidateIntervalMs ?? PROVIDER_PROXY_STREAM_REVALIDATE_INTERVAL_MS,
+      keepaliveIntervalMs: options.keepaliveIntervalMs ?? PROVIDER_PROXY_KEEPALIVE_INTERVAL_MS,
     };
   }
 
@@ -112,6 +135,8 @@ class ProxyDataConnection {
   #unsubscribeClose?: () => void;
   #revalidateTimer?: ReturnType<typeof setInterval>;
   #authTimer?: ReturnType<typeof setTimeout>;
+  #keepaliveTimer?: ReturnType<typeof setInterval>;
+  #missedPongs = 0;
 
   constructor(socket: WebSocket, options: RuntimeProviderProxyTransportOptions, limits: ResolvedTransportLimits) {
     this.#socket = socket;
@@ -136,6 +161,30 @@ class ProxyDataConnection {
     this.#socket.on("message", (data, isBinary) => this.#onMessage(data, isBinary));
     this.#socket.on("close", () => this.#destroy());
     this.#socket.on("error", () => this.#destroy());
+    this.#socket.on("pong", () => {
+      this.#missedPongs = 0;
+    });
+  }
+
+  #startKeepalive(): void {
+    this.#keepaliveTimer = setInterval(() => this.#keepalive(), this.#limits.keepaliveIntervalMs);
+    this.#keepaliveTimer.unref?.();
+  }
+
+  #keepalive(): void {
+    if (this.#state !== "ready") return;
+    if (this.#missedPongs >= PROVIDER_PROXY_KEEPALIVE_MAX_MISSED_PONGS) {
+      this.#fail(4408, "proxy_keepalive_timeout");
+      // The peer stopped answering, so a close handshake would only wait out ws's close timeout.
+      this.#socket.terminate();
+      return;
+    }
+    this.#missedPongs += 1;
+    try {
+      this.#socket.ping();
+    } catch {
+      // The socket is already closing; its close event tears the connection down.
+    }
   }
 
   #onMessage(data: RawData, isBinary: boolean): void {
@@ -194,6 +243,7 @@ class ProxyDataConnection {
     });
     this.#revalidateTimer = setInterval(() => void this.#revalidateStreams(), this.#limits.revalidateIntervalMs);
     this.#revalidateTimer.unref?.();
+    this.#startKeepalive();
     this.#sendJson({
       type: "ready",
       executionId: execution.executionId,
@@ -540,6 +590,7 @@ class ProxyDataConnection {
     this.#state = "closed";
     if (this.#authTimer) clearTimeout(this.#authTimer);
     if (this.#revalidateTimer) clearInterval(this.#revalidateTimer);
+    if (this.#keepaliveTimer) clearInterval(this.#keepaliveTimer);
     this.#unsubscribeClose?.();
     for (const stream of this.#streams.values()) this.#abortStream(stream);
     this.#retired.clear();

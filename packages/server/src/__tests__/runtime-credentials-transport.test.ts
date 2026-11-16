@@ -142,6 +142,7 @@ async function setup(
     capabilityTtlMs?: number;
     chunkMaxBytes?: number;
     initialCreditBytes?: number;
+    keepaliveIntervalMs?: number;
   } = {},
 ) {
   const executions = new RuntimeExecutionRegistry();
@@ -204,18 +205,39 @@ async function setup(
     revalidateIntervalMs: options.revalidateIntervalMs ?? 60_000,
     ...(options.chunkMaxBytes !== undefined ? { chunkMaxBytes: options.chunkMaxBytes } : {}),
     ...(options.initialCreditBytes !== undefined ? { initialCreditBytes: options.initialCreditBytes } : {}),
+    ...(options.keepaliveIntervalMs !== undefined ? { keepaliveIntervalMs: options.keepaliveIntervalMs } : {}),
   });
   const server = new WebSocketServer({ port: 0 });
   servers.push(server);
   const connections: ReturnType<typeof transport.attach>[] = [];
-  server.on("connection", (socket) => connections.push(transport.attach(socket)));
+  const serverSockets: WebSocket[] = [];
+  server.on("connection", (socket) => {
+    serverSockets.push(socket);
+    connections.push(transport.attach(socket));
+  });
   await once(server, "listening");
   const port = (server.address() as AddressInfo).port;
-  return { port, record, grant, tickets, executions, capabilities, transport, server, broker, connections };
+  return {
+    port,
+    record,
+    grant,
+    tickets,
+    executions,
+    capabilities,
+    transport,
+    server,
+    broker,
+    connections,
+    serverSockets,
+  };
 }
 
-async function connect(port: number, ticket: string): Promise<{ socket: WebSocket; queue: MessageQueue }> {
-  const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+async function connect(
+  port: number,
+  ticket: string,
+  socketOptions: WebSocket.ClientOptions = {},
+): Promise<{ socket: WebSocket; queue: MessageQueue }> {
+  const socket = new WebSocket(`ws://127.0.0.1:${port}`, socketOptions);
   sockets.push(socket);
   const queue = new MessageQueue(socket);
   await once(socket, "open");
@@ -975,5 +997,93 @@ describe("Provider stream failure diagnostics", () => {
     expect(JSON.stringify(logs)).not.toContain("private");
     expect(JSON.stringify(logs)).not.toContain(state.record.executionId);
     socket.close();
+  });
+});
+
+describe("RuntimeProviderProxyTransport server keepalive", () => {
+  function issueTicket(state: Awaited<ReturnType<typeof setup>>): string {
+    return state.tickets.issue({
+      executionId: state.record.executionId,
+      computerId: COMPUTER,
+      instanceId: "instance-1",
+      connectionId: "connection-1",
+    }).ticket;
+  }
+
+  it("pings an authenticated, otherwise idle data connection on a fixed cadence", async () => {
+    const state = await setup(echoAdapter(), { keepaliveIntervalMs: 40 });
+    const { socket, queue } = await connect(state.port, issueTicket(state));
+    expect(await queue.nextJson()).toMatchObject({ type: "ready" });
+    let pings = 0;
+    socket.on("ping", () => {
+      pings += 1;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    // ~7 intervals elapse; require several pings so a single stray frame cannot pass.
+    expect(pings).toBeGreaterThanOrEqual(3);
+    // The ws client answers pings automatically, so a live peer is never closed by keepalive.
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+    expect(queue.hasMessages()).toBe(false);
+  });
+
+  it("does not ping before the first-frame ticket is authenticated", async () => {
+    const state = await setup(echoAdapter(), { keepaliveIntervalMs: 20 });
+    const socket = new WebSocket(`ws://127.0.0.1:${state.port}`);
+    sockets.push(socket);
+    let pings = 0;
+    socket.on("ping", () => {
+      pings += 1;
+    });
+    await once(socket, "open");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(pings).toBe(0);
+  });
+
+  it("clears the keepalive timer and stops pinging once the data connection closes", async () => {
+    const keepaliveTimers: unknown[] = [];
+    const realSetInterval = globalThis.setInterval;
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((handler: () => void, ms?: number) => {
+      const timer = realSetInterval(handler, ms);
+      if (ms === 30) keepaliveTimers.push(timer);
+      return timer;
+    }) as typeof setInterval);
+    const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+    cleanups.push(() => vi.restoreAllMocks());
+    const state = await setup(echoAdapter(), { keepaliveIntervalMs: 30 });
+    const { socket, queue } = await connect(state.port, issueTicket(state));
+    expect(await queue.nextJson()).toMatchObject({ type: "ready" });
+    const serverSocket = state.serverSockets[0];
+    if (!serverSocket) throw new Error("missing server socket");
+    const ping = vi.spyOn(serverSocket, "ping");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(ping.mock.calls.length).toBeGreaterThan(0);
+    socket.close();
+    await once(serverSocket, "close");
+    expect(keepaliveTimers).toHaveLength(1);
+    expect(clearIntervalSpy).toHaveBeenCalledWith(keepaliveTimers[0]);
+    const afterClose = ping.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(ping.mock.calls.length).toBe(afterClose);
+  });
+
+  it("closes a data connection whose peer stops answering pings", async () => {
+    const warnings: Array<Record<string, unknown>> = [];
+    const state = await setup(echoAdapter(), {
+      keepaliveIntervalMs: 30,
+      logger: { warn: (record) => warnings.push(record) },
+    });
+    const { socket, queue } = await connect(state.port, issueTicket(state), { autoPong: false });
+    expect(await queue.nextJson()).toMatchObject({ type: "ready" });
+    const closed = once(socket, "close");
+    await expect(
+      Promise.race([
+        closed,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("keepalive never closed")), 1_000)),
+      ]),
+    ).resolves.toBeDefined();
+    expect(warnings).toContainEqual(
+      expect.objectContaining({ code: 4408, reason: "proxy_keepalive_timeout", executionId: state.record.executionId }),
+    );
+    expect(state.connections[0]?.snapshot().active).toBe(0);
   });
 });
