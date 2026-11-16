@@ -1074,6 +1074,10 @@ describe("RuntimeProviderProxyTransport server keepalive", () => {
     });
     const { socket, queue } = await connect(state.port, issueTicket(state), { autoPong: false });
     expect(await queue.nextJson()).toMatchObject({ type: "ready" });
+    const serverSocket = state.serverSockets[0];
+    if (!serverSocket) throw new Error("missing server socket");
+    // A silent peer would never answer a close handshake, so the Server must hard-terminate.
+    const terminate = vi.spyOn(serverSocket, "terminate");
     const closed = once(socket, "close");
     await expect(
       Promise.race([
@@ -1085,5 +1089,26 @@ describe("RuntimeProviderProxyTransport server keepalive", () => {
       expect.objectContaining({ code: 4408, reason: "proxy_keepalive_timeout", executionId: state.record.executionId }),
     );
     expect(state.connections[0]?.snapshot().active).toBe(0);
+    expect(terminate).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats any inbound frame as proof of life even when the peer does not answer pings", async () => {
+    const state = await setup(echoAdapter(), { keepaliveIntervalMs: 30 });
+    const { socket, queue } = await connect(state.port, issueTicket(state), { autoPong: false });
+    expect(await queue.nextJson()).toMatchObject({ type: "ready" });
+    socket.send(openFrame(1, state.grant.token));
+    socket.send(JSON.stringify({ type: "end", streamId: 1 }));
+    expect(await queue.nextJson()).toMatchObject({ type: "response", streamId: 1 });
+    expect(await queue.nextJson()).toEqual({ type: "end", streamId: 1 });
+    // A late cancel for a completed stream is inert, so it exercises only the liveness signal.
+    const chatter = setInterval(
+      () => socket.send(JSON.stringify({ type: "cancel", streamId: 1, code: "consumer_closed" })),
+      15,
+    );
+    cleanups.push(() => clearInterval(chatter));
+    // ~10 intervals: without inbound-frame liveness this closes after the third missed pong.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    clearInterval(chatter);
+    expect(socket.readyState).toBe(WebSocket.OPEN);
   });
 });

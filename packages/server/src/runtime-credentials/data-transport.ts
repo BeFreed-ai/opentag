@@ -189,6 +189,8 @@ class ProxyDataConnection {
 
   #onMessage(data: RawData, isBinary: boolean): void {
     if (this.#state === "closed") return;
+    // Any inbound frame proves the peer is alive, so it counts as a keepalive answer too.
+    this.#missedPongs = 0;
     if (isBinary) {
       this.#onBinary(rawBuffer(data));
       return;
