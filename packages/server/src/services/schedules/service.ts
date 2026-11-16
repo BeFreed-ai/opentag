@@ -170,7 +170,11 @@ export class ScheduleService {
    * Runtime Agent surface (proof-authenticated; the proof's Agent manages its own schedules)
    * ---------------------------------------------------------------------------------------- */
 
-  async createForAgent(scope: AgentScheduleScope, input: CreateAgentScheduleRequest): Promise<AgentSchedule> {
+  async createForAgent(
+    scope: AgentScheduleScope,
+    input: CreateAgentScheduleRequest,
+    options: { freshSession?: boolean } = {},
+  ): Promise<AgentSchedule> {
     const created = await this.#options.database.transaction(async (transaction) => {
       const now = await this.#clock.now(transaction);
       const target = await this.#resolveCreateTarget(transaction, scope);
@@ -187,6 +191,7 @@ export class ScheduleService {
           schedule: rule,
           timezone,
           enabled: true,
+          freshSession: options.freshSession === true,
           nextTriggerAt: next,
           revision: 1,
           createdAt: now,
@@ -661,6 +666,7 @@ export class ScheduleService {
       schedule: row.schedule,
       timezone: row.timezone,
       enabled: row.enabled,
+      ...(row.freshSession ? { freshSession: true as const } : {}),
       nextTriggerAt: row.nextTriggerAt ? toIso(row.nextTriggerAt) : null,
       revision: row.revision,
       lastDispatch: row.lastDispatch ?? null,

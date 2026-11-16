@@ -191,6 +191,17 @@ describe("OperatorScheduleService.createSchedule (BeFreed fork)", () => {
     });
   });
 
+  it("passes freshSession to createForAgent only when it is true (the default call is unchanged)", async () => {
+    const { accountId, agentId } = await seed();
+    const h = harness();
+    await h.service.createSchedule(accountId, agentId, { ...cronInput, freshSession: true });
+    expect(h.createForAgent).toHaveBeenLastCalledWith(expect.anything(), expect.anything(), { freshSession: true });
+    await h.service.createSchedule(accountId, agentId, { ...cronInput, freshSession: false });
+    expect(h.createForAgent.mock.calls.at(-1)).toHaveLength(2);
+    await h.service.createSchedule(accountId, agentId, cronInput);
+    expect(h.createForAgent.mock.calls.at(-1)).toHaveLength(2);
+  });
+
   it("fails closed when neither a schedule nor runInSeconds is given", async () => {
     const { accountId, agentId } = await seed();
     const h = harness();

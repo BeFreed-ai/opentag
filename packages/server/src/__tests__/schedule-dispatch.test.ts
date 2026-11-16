@@ -503,6 +503,67 @@ describe("claim crash and rollback semantics (D05, D06, D08)", () => {
   });
 });
 
+describe("freshSession flag (BeFreed fork)", () => {
+  const rule = (anchor: Date) =>
+    ({ kind: "every", intervalSeconds: 60, anchorAt: new Date(anchor.getTime() - 60_000).toISOString() }) as const;
+
+  it("stamps the claim snapshot and the stored message origin only for an opted-in schedule", async () => {
+    const seed = await seedStack();
+    const stack = makeStack(seed);
+    // Created through the real ScheduleService path, with and without the option.
+    const fresh = await stack.management.createForAgent(
+      managementScope(seed),
+      { name: "Fresh", prompt: "Run fresh.", schedule: { kind: "every", intervalSeconds: 60 }, timezone: "UTC" },
+      { freshSession: true },
+    );
+    const plain = await stack.management.createForAgent(managementScope(seed), {
+      name: "Plain",
+      prompt: "Run plain.",
+      schedule: { kind: "every", intervalSeconds: 60 },
+      timezone: "UTC",
+    });
+    // Read-back surfaces: the flag appears only when true; legacy shape is untouched.
+    expect(fresh.freshSession).toBe(true);
+    expect("freshSession" in plain).toBe(false);
+    expect((await scheduleRow(plain.id))?.freshSession).toBe(false);
+
+    for (const [created, expectFresh] of [
+      [fresh, true],
+      [plain, false],
+    ] as const) {
+      await db.database
+        .update(agentSchedules)
+        .set({ nextTriggerAt: T0, schedule: rule(T0) })
+        .where(eq(agentSchedules.id, created.id));
+      currentTime = T0;
+      const claimed = await claimOf(stack, created.id);
+      if (claimed.kind !== "claimed") throw new Error(`expected claimed, got ${claimed.kind}`);
+      expect("freshSession" in claimed.snapshot.origin).toBe(expectFresh);
+      const stored = (await messageRow(claimed.snapshot.messageId))?.scheduledOrigin;
+      expect(stored?.freshSession).toBe(expectFresh ? true : undefined);
+      expect(stored !== null && stored !== undefined && "freshSession" in stored).toBe(expectFresh);
+    }
+  });
+
+  it("treats a stored origin without the flag as a different identity from a flagged claim", async () => {
+    const seed = await seedStack();
+    const stack = makeStack(seed);
+    const row = await insertSchedule(seed, { schedule: rule(T0), nextTriggerAt: T0 });
+    await db.database.update(agentSchedules).set({ freshSession: true }).where(eq(agentSchedules.id, row.id));
+    await db.database.insert(sessionMessages).values({
+      id: scheduledMessageId(row.id, T0),
+      scheduledOrigin: { scheduleId: row.id, scheduledFor: T0.toISOString(), timezone: "UTC", name: "Daily check" },
+      targetSessionId: seed.targetSessionId,
+      content: "Check the build.",
+      contentHash: "568cb1de2296e8dbdca62071d5241230ac71901d3a19dcd2d3c16db13aa3245a",
+      createdAt: T0,
+      updatedAt: T0,
+    });
+    currentTime = T0;
+    expect(await claimOf(stack, row.id)).toEqual({ kind: "disabled", code: "message_identity_conflict" });
+  });
+});
+
 describe("message identity (D12, D13)", () => {
   it("never redispatches an identical existing message and disables on an identity conflict", async () => {
     const seed = await seedStack();

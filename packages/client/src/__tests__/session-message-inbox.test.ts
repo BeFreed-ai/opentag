@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { lstat, rm } from "node:fs/promises";
 import { join } from "node:path";
-import type {
-  InputRejectReason,
-  SessionMessageDeliveryRequest,
-  SessionMessageDeliveryRequestV3,
-  SessionReconcileRequest,
+import {
+  type InputRejectReason,
+  type SessionMessageDeliveryRequest,
+  type SessionMessageDeliveryRequestV3,
+  SessionMessageDeliveryRequestV3Schema,
+  type SessionReconcileRequest,
 } from "@opentag/shared";
 import { describe, expect, it, vi } from "vitest";
 import { executeProviderCliTurnPlan } from "../index.js";
@@ -19,7 +20,11 @@ import {
   RuntimeDurabilityMetrics,
   type RuntimeRetryScheduler,
 } from "../runtime/runtime-durability.js";
-import { buildSessionMessageInput, SessionMessageInbox } from "../runtime/session-message-inbox.js";
+import {
+  buildSessionMessageInput,
+  SessionMessageInbox,
+  sessionMessageSemanticHash,
+} from "../runtime/session-message-inbox.js";
 import { SessionReconciler } from "../runtime/session-reconciler.js";
 import { UpdateManager, type UpdaterStateSnapshot } from "../runtime/update-manager.js";
 import {
@@ -104,6 +109,120 @@ describe("SessionMessageInbox", () => {
     expect(input?.items[2]?.text).toBe(request.content.text);
     await inbox.settled();
     inbox.stop();
+  });
+
+  describe("freshSession scheduled Run (BeFreed fork)", () => {
+    function freshHarness(options: { promptFails?: boolean } = {}) {
+      const calls: string[] = [];
+      const mkRuntime = (label: string) => ({
+        waitForIdle: vi.fn(async () => undefined),
+        prompt: vi.fn(async () => {
+          calls.push(`prompt:${label}`);
+          if (options.promptFails) throw new Error("provider exploded");
+          return { runId: "run", status: "completed" as const, output: [] };
+        }),
+      });
+      const normal = mkRuntime("normal");
+      const fresh = mkRuntime("fresh");
+      const runtimeManager = {
+        ensureRuntime: vi.fn(async () => {
+          calls.push("ensureRuntime");
+          return normal as never;
+        }),
+        ensureFreshRuntime: vi.fn(async () => {
+          calls.push("ensureFreshRuntime");
+          return fresh as never;
+        }),
+        releaseFreshRuntime: vi.fn(async () => {
+          calls.push("releaseFreshRuntime");
+        }),
+        sessionKind: () => "visible" as const,
+      };
+      const inbox = new SessionMessageInbox({
+        admission: new AdmissionController(),
+        credentialEnvironment: {
+          prepare: vi.fn(async () => ({
+            path: "/tmp/provider-env.sh",
+            provider: "feishu" as const,
+            outboxContext: { provider: "feishu" as const, sessionKind: "channel" as const, chatId: "oc_visible" },
+          })),
+          cleanup: vi.fn(async () => undefined),
+        },
+        imCredentialGrantVersion: () => 2,
+        sessionCollaborationVersion: () => 3,
+        now: () => Date.parse("2026-09-28T01:00:01.000Z"),
+        reconciler: inboxReconciler(),
+        runtimeManager,
+      });
+      return { inbox, runtimeManager, calls };
+    }
+
+    const withFresh = (request: SessionMessageDeliveryRequestV3, fresh: boolean): SessionMessageDeliveryRequestV3 =>
+      fresh && request.scheduledOrigin
+        ? { ...request, scheduledOrigin: { ...request.scheduledOrigin, freshSession: true } }
+        : request;
+
+    it("runs a flagged scheduled message in a fresh conversation and releases it afterwards", async () => {
+      const h = freshHarness();
+      await expect(h.inbox.accept(withFresh(scheduledDelivery(), true))).resolves.toMatchObject({
+        status: "accepted",
+      });
+      await h.inbox.settled();
+      expect(h.calls).toEqual(["ensureFreshRuntime", "prompt:fresh", "releaseFreshRuntime"]);
+      expect(h.runtimeManager.ensureRuntime).not.toHaveBeenCalled();
+      h.inbox.stop();
+    });
+
+    it("releases the fresh conversation even when the Run fails", async () => {
+      const h = freshHarness({ promptFails: true });
+      await h.inbox.accept(withFresh(scheduledDelivery(), true));
+      await h.inbox.settled();
+      expect(h.calls).toContain("releaseFreshRuntime");
+      expect(h.calls.at(-1)).toBe("releaseFreshRuntime");
+      h.inbox.stop();
+    });
+
+    it("keeps an unflagged scheduled message on the Session's conversation (legacy behavior)", async () => {
+      const h = freshHarness();
+      await h.inbox.accept(scheduledDelivery());
+      await h.inbox.settled();
+      expect(h.calls).toEqual(["ensureRuntime", "prompt:normal"]);
+      expect(h.runtimeManager.ensureFreshRuntime).not.toHaveBeenCalled();
+      expect(h.runtimeManager.releaseFreshRuntime).not.toHaveBeenCalled();
+      h.inbox.stop();
+    });
+
+    it("keeps an ordinary Session message on the Session's conversation", async () => {
+      const h = freshHarness();
+      await h.inbox.accept(delivery({}));
+      await h.inbox.settled();
+      expect(h.runtimeManager.ensureFreshRuntime).not.toHaveBeenCalled();
+      h.inbox.stop();
+    });
+
+    it("gives a flagged occurrence a different semantic identity, and leaves unflagged identity unchanged", () => {
+      const plain = scheduledDelivery();
+      const flagged = withFresh(plain, true);
+      expect(sessionMessageSemanticHash(flagged)).not.toBe(sessionMessageSemanticHash(plain));
+      const explicitlyUnset = {
+        ...plain,
+        scheduledOrigin: { ...(plain.scheduledOrigin as object), freshSession: undefined },
+      } as SessionMessageDeliveryRequestV3;
+      expect(sessionMessageSemanticHash(explicitlyUnset)).toBe(sessionMessageSemanticHash(plain));
+    });
+
+    it("rejects an invalid freshSession value at the wire schema", () => {
+      const plain = scheduledDelivery();
+      for (const bad of [false, "true", 1, null]) {
+        const result = SessionMessageDeliveryRequestV3Schema.safeParse({
+          ...plain,
+          scheduledOrigin: { ...(plain.scheduledOrigin as object), freshSession: bad },
+        });
+        expect(result.success).toBe(false);
+      }
+      expect(SessionMessageDeliveryRequestV3Schema.safeParse(withFresh(plain, true)).success).toBe(true);
+      expect(SessionMessageDeliveryRequestV3Schema.safeParse(plain).success).toBe(true);
+    });
   });
 
   describe("provider launch configuration of a scheduled Run", () => {

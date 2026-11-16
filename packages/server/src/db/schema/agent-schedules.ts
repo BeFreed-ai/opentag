@@ -27,6 +27,7 @@ export const agentSchedules = pgTable(
     schedule: jsonb("schedule").$type<AgentScheduleRule>().notNull(),
     timezone: text("timezone").notNull(),
     enabled: boolean("enabled").notNull().default(true),
+    freshSession: boolean("fresh_session").notNull().default(false),
     nextTriggerAt: timestamp("next_trigger_at", { withTimezone: true }),
     revision: bigint("revision", { mode: "number" }).notNull().default(1),
     lastDispatch: jsonb("last_dispatch").$type<AgentScheduleLastDispatch>(),

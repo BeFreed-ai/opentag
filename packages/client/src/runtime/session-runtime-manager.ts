@@ -6,7 +6,12 @@ import type {
   RuntimeSnapshotHashes,
   SessionReconcileRequest,
 } from "@opentag/shared";
-import type { AgentRuntime, AgentRuntimeEventSink } from "../agent-runtime/types.js";
+import type {
+  AgentRuntime,
+  AgentRuntimeBinding,
+  AgentRuntimeEventSink,
+  CreateAgentRuntimeRequest,
+} from "../agent-runtime/types.js";
 import { createLogger } from "../observability/logger.js";
 import type { SkillSyncManager } from "../skills/skill-sync.js";
 import { prepareContextTreeHome } from "../storage/context-tree-home.js";
@@ -36,6 +41,8 @@ interface ManagedSessionRuntime {
   eventSink?: AgentRuntimeEventSink;
   runtime?: AgentRuntime;
   start?: Promise<AgentRuntime>;
+  /** BeFreed fork: the live runtime is a throw-away fresh conversation (a freshSession scheduled run). */
+  freshRun?: boolean;
 }
 
 export class ClientRuntimeProviderStartError extends Error {
@@ -276,6 +283,8 @@ export class SessionRuntimeManager implements RuntimePreparation, RuntimeLocalPo
       cwd: managed.cwd,
       sources: managed.snapshot.contextTrees,
     });
+    // A human turn must never be handed the throw-away conversation of a freshSession scheduled run.
+    if (managed.freshRun) throw new Error("A fresh scheduled run is using this Session's runtime");
     if (managed.runtime && managed.runtime.state.phase !== "closed") return managed.runtime;
     if (managed.start) return waitForStart(managed.start, signal);
 
@@ -292,6 +301,50 @@ export class SessionRuntimeManager implements RuntimePreparation, RuntimeLocalPo
     return waitForStart(start, signal);
   }
 
+  /**
+   * BeFreed fork: start a brand-new provider conversation for ONE scheduled run, without touching the
+   * Session's durable binding. Any live runtime (the people's conversation process) is closed first; its
+   * binding stays in the store, so the next `ensureRuntime` after `releaseFreshRuntime` resumes the people's
+   * conversation exactly as before. The caller holds the Session's admission reservation, so no other turn
+   * can be running for this Session.
+   */
+  async ensureFreshRuntime(sessionId: string, signal?: AbortSignal): Promise<AgentRuntime> {
+    this.#assertOpen();
+    const managed = this.#sessions.get(sessionId);
+    if (!managed) throw new SessionRuntimeNotPreparedError();
+    await this.#ensureProviderReady(managed.providerId, signal);
+    this.#assertOpen();
+    const contextTreeEnvironment = this.#contextTreeEnvironment?.(sessionId, {
+      cwd: managed.cwd,
+      sources: managed.snapshot.contextTrees,
+    });
+    await this.#closeManaged(managed);
+    managed.freshRun = true;
+    const start = this.#startRuntime(managed, contextTreeEnvironment, true).finally(() => {
+      /* v8 ignore else -- only the owning start clears its own slot. */
+      if (managed.start === start) managed.start = undefined;
+      this.#starts.delete(start);
+    });
+    managed.start = start;
+    this.#starts.add(start);
+    void start.catch((error: unknown) => {
+      managed.freshRun = false;
+      logger.debug({ code: "runtime_start_failed", error: String(error) }, "Fresh Session Runtime start failed");
+    });
+    return waitForStart(start, signal);
+  }
+
+  /** Close the throw-away fresh runtime (if any). The durable binding was never changed. Safe to call twice. */
+  async releaseFreshRuntime(sessionId: string): Promise<void> {
+    const managed = this.#sessions.get(sessionId);
+    if (!managed?.freshRun) return;
+    try {
+      await this.#closeManaged(managed);
+    } finally {
+      managed.freshRun = false;
+    }
+  }
+
   sessionKind(sessionId: string): "visible" | "internal" {
     const managed = this.#sessions.get(sessionId);
     if (!managed) throw new SessionRuntimeNotPreparedError();
@@ -306,13 +359,15 @@ export class SessionRuntimeManager implements RuntimePreparation, RuntimeLocalPo
   async #startRuntime(
     managed: ManagedSessionRuntime,
     contextTreeEnvironment: Readonly<Record<string, string | undefined>> | undefined,
+    fresh = false,
   ): Promise<AgentRuntime> {
     const provider = this.#providers.registration(managed.providerId);
     /* v8 ignore next -- registrations are immutable for the lifetime of a managed Session. */
     if (!provider) throw new Error(`Agent Runtime provider is not registered: ${managed.providerId}`);
-    let bindingPersisted = false;
+    let bindingPersisted = fresh;
     const eventSink: AgentRuntimeEventSink = async (event) => {
-      if (event.type === "binding_changed") {
+      // A fresh scheduled run never rewrites the Session's durable binding (see ensureFreshRuntime).
+      if (event.type === "binding_changed" && !fresh) {
         this.#assertOpen();
         const binding = await this.#bindingStore.saveRuntimeBinding(
           managed.agentId,
@@ -394,13 +449,7 @@ export class SessionRuntimeManager implements RuntimePreparation, RuntimeLocalPo
     let runtime: AgentRuntime | undefined;
     try {
       try {
-        const runtimeBinding = managed.binding.runtimeBinding;
-        const replaceBinding =
-          runtimeBinding && provider.requiresBindingReplacement?.(runtimeBinding, undefined) === true;
-        runtime =
-          runtimeBinding && !replaceBinding
-            ? await provider.factory.resume({ ...common, binding: runtimeBinding })
-            : await provider.factory.create(common);
+        runtime = await openProviderRuntime(provider, common, fresh ? undefined : managed.binding.runtimeBinding);
       } catch (error) {
         logger.debug(
           {
@@ -613,6 +662,20 @@ function visibleSlackWritableRoots(
   const configDir = resolveSlackConfig(sessionId);
   if (!configDir) return [cwd];
   return [cwd, configDir];
+}
+
+type RegisteredProvider = NonNullable<ReturnType<AgentRuntimeProviderRegistry["registration"]>>;
+
+/** Resume the stored provider conversation when there is a usable binding; otherwise start a new one. */
+async function openProviderRuntime(
+  provider: RegisteredProvider,
+  common: CreateAgentRuntimeRequest,
+  runtimeBinding: AgentRuntimeBinding | undefined,
+): Promise<AgentRuntime> {
+  const replaceBinding = runtimeBinding && provider.requiresBindingReplacement?.(runtimeBinding, undefined) === true;
+  return runtimeBinding && !replaceBinding
+    ? provider.factory.resume({ ...common, binding: runtimeBinding })
+    : provider.factory.create(common);
 }
 
 async function waitForStart(start: Promise<AgentRuntime>, signal?: AbortSignal): Promise<AgentRuntime> {

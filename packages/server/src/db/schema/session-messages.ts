@@ -47,7 +47,8 @@ export const sessionMessages = pgTable(
           and ${table.scheduledOrigin} is not null
           and jsonb_typeof(${table.scheduledOrigin}) = 'object'
           and ${table.scheduledOrigin} ?& array['scheduleId', 'scheduledFor', 'timezone', 'name']
-          and (${table.scheduledOrigin} - 'scheduleId' - 'scheduledFor' - 'timezone' - 'name') = '{}'::jsonb
+          and (${table.scheduledOrigin} - 'scheduleId' - 'scheduledFor' - 'timezone' - 'name' - 'freshSession') = '{}'::jsonb
+          and (not (${table.scheduledOrigin} ? 'freshSession') or ${table.scheduledOrigin}->'freshSession' = 'true'::jsonb)
           and jsonb_typeof(${table.scheduledOrigin}->'scheduleId') = 'string'
           and ${table.scheduledOrigin}->>'scheduleId' ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
           and jsonb_typeof(${table.scheduledOrigin}->'scheduledFor') = 'string'
