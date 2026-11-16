@@ -162,7 +162,6 @@ export class OperatorScheduleService {
           eq(imMessages.direction, "inbound"),
           eq(imMessages.authorKind, "human"),
           eq(imMessages.authorExternalId, slackUserId),
-
         ),
       )
       .orderBy(desc(imMessages.occurredAt))
