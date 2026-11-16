@@ -1185,6 +1185,46 @@ describe("SessionRuntimeManager", () => {
     }
   });
 
+  it("clears the fresh-run guard when the fresh conversation fails to start (BeFreed fork)", async () => {
+    const home = await mkdtemp(resolve(tmpdir(), "opentag-fresh-session-fail-"));
+    homes.push(home);
+    const store = new SessionBindingStore({ home, providerArtifactIdentity: () => "a".repeat(64) });
+    const base = new FakeFactory();
+    let failCreate = false;
+    const factory = {
+      manifest: base.manifest,
+      probe: () => base.probe(),
+      create: async (request: CreateAgentRuntimeRequest) => {
+        if (failCreate) throw new Error("fresh start failed");
+        return base.create(request);
+      },
+      resume: (request: ResumeAgentRuntimeRequest) => base.resume(request),
+    } satisfies AgentRuntimeFactory;
+    const computerId = randomUUID();
+    const manager = new SessionRuntimeManager({
+      bindingStore: store,
+      providers: await providerRegistry(factory),
+      providerEnvironmentPath: () => "/tmp/provider-env.sh",
+      workspace: new AgentWorkspaceManager({ home, bindingStore: store }),
+    });
+    const request = reconcile(computerId, snapshot(1));
+    await new SessionReconciler({ installationId: computerId, preparation: manager, localPolicy: manager }).reconcile(
+      request,
+    );
+    try {
+      await manager.ensureRuntime("session-1");
+      failCreate = true;
+      await expect(manager.ensureFreshRuntime("session-1")).rejects.toThrow();
+      // The failed fresh start must not leave the Session refusing people's turns (no release call needed).
+      const resumed = await manager.ensureRuntime("session-1");
+      expect(resumed).toBe(base.runtimes[1]);
+      expect(base.resumed).toEqual([binding("thread-1")]);
+      expect((await store.read("agent-1", "session-1"))?.runtimeBinding).toEqual(binding("thread-1"));
+    } finally {
+      await manager.close();
+    }
+  });
+
   it("prepares a new native conversation when only the Agent revision advances in a warm Session", async () => {
     const f = await legacyRuntimeFixture("0.1.0", "codex", false);
     const factory = new FakeFactory();
