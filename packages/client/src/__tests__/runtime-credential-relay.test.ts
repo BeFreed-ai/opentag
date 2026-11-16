@@ -548,6 +548,38 @@ describe("RuntimeCredentialRelay", () => {
     }
   });
 
+  it("warns when a lost data connection aborts the execution", async () => {
+    const entries: RecordedLog[] = [];
+    const harness = relayHarness({ providers: ["feishu"] });
+    const relay = await RuntimeCredentialRelay.open(
+      { ...harness.relayOptions, logger: recordingLogger(entries) },
+      harness.subject,
+    );
+    // The Server (or a proxy in front of it) closes the data socket; the relay did not ask for it.
+    await harness.dataConnection.close();
+    await tick();
+    expect(relay.closed).toBe(true);
+    expect(relay.signal.aborted).toBe(true);
+    expect(entries).toContainEqual(
+      expect.objectContaining({
+        level: "warn",
+        fields: expect.objectContaining({ code: "data_connection_lost", executionId: EXECUTION_ID }),
+      }),
+    );
+  });
+
+  it("does not warn about the data connection when the relay closes it itself", async () => {
+    const entries: RecordedLog[] = [];
+    const harness = relayHarness({ providers: ["feishu"] });
+    const relay = await RuntimeCredentialRelay.open(
+      { ...harness.relayOptions, logger: recordingLogger(entries) },
+      harness.subject,
+    );
+    await relay.close("test");
+    await tick();
+    expect(entries.filter((entry) => entry.fields.code === "data_connection_lost")).toEqual([]);
+  });
+
   it("logs renewal failures without capability or ticket material", async () => {
     const entries: RecordedLog[] = [];
     const harness = relayHarness({
