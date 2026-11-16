@@ -650,7 +650,14 @@ export class RuntimeCredentialRelay {
     this.#data = data;
     // Server owner loss closes the data channel; this execution never migrates.
     void data.settled().then(() => {
-      if (!this.#closed) void this.#closeInternal("data_connection_lost", false).catch(() => undefined);
+      if (this.#closed) return;
+      // Losing the data connection aborts the whole execution (and the running turn), so this
+      // must be visible at the default log level, not only as an abort reason.
+      this.#logger.warn(
+        { code: "data_connection_lost", executionId: this.#executionId },
+        "Execution data connection lost; aborting the execution Relay",
+      );
+      void this.#closeInternal("data_connection_lost", false).catch(() => undefined);
     });
   }
 
