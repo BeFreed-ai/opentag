@@ -322,9 +322,10 @@ describe("runtime proxy network scope", () => {
     // Negative control: applying the provider scope ambiently is exactly the audited failure.
     // The adapter refuses to CONNECT to a non-platform destination, so the platform proxy can
     // never be a generic forwarding proxy.
+    // curl versions classify a refused CONNECT as either connection failure (7) or receive failure (56).
     await expect(curl({ ...environment, ...providerRoutingEnvironment(environment) })).rejects.toMatchObject({
-      code: 56,
-      stderr: expect.stringContaining("403"),
+      code: expect.toBeOneOf([7, 56]),
+      stderr: expect.stringContaining("CONNECT tunnel failed, response 403"),
     });
     expect(fixture.hits).toBe(1);
     expect(openStream).not.toHaveBeenCalled();
