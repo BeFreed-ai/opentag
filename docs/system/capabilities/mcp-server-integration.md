@@ -1177,6 +1177,11 @@ or `resultType` responses, so it must not advertise that revision. Discovery lis
 legacy revisions, allowing an automatically negotiating client to fall back to `initialize` before
 listing or calling tools.
 
+Modern upstreams can return any JSON value in `structuredContent`; the legacy gateway revisions
+require an object. The gateway preserves object values and wraps arrays, scalars, and null as
+`{ "value": <original value> }`. Text and other content blocks, error flags, and metadata are retained.
+This adaptation applies only to the inbound runtime gateway, not to its upstream transport.
+
 | Method | Answer |
 | --- | --- |
 | `initialize` + `notifications/initialized` | The legacy handshake. A supported requested revision is echoed; an unsupported or modern revision selects the newest supported legacy revision |
