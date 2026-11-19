@@ -282,6 +282,172 @@ describe("ImDeliveryWorker database workflow", () => {
     expect(await custody.getDelivery(fixture.deliveryId)).toMatchObject({ turnId: "turn-1" });
   });
 
+  it("admits different Local Sessions only after the live capability and Computer limit both agree", async () => {
+    const fixture = await workerFixture(unit);
+    const sibling = await addSiblingDelivery(unit, fixture);
+    const connectionId = randomUUID();
+    await fixture.registry.register(
+      {
+        computerId: fixture.computerId,
+        installationId: randomUUID(),
+        instanceId: fixture.instanceId,
+        connectionId,
+        clientVersion: "0.1.1",
+        lastHeartbeatAt: Date.now(),
+        negotiatedCapabilities: { [RUNTIME_CAPABILITY.localSessionConcurrency]: 1 },
+        socket: { close: vi.fn(), terminate: vi.fn() } as never,
+      },
+      async () => undefined,
+    );
+    const custody = new PostgresRuntimeCustodyStore(unit.database);
+    const domain = fakeDomain(custody, fixture);
+    const worker = new ImDeliveryWorker({
+      database: unit.database,
+      domain: domain as never,
+      assembler: { assembleForSession: vi.fn().mockResolvedValue(fixture.runtime) },
+      registry: fixture.registry,
+      localSessionConcurrencyLimits: new Map([[fixture.computerId, 3]]),
+    });
+
+    await worker.runOnce();
+    await worker.runOnce();
+
+    const [siblingRow] = await unit.database
+      .select({ state: imMessageDeliveries.state, code: imMessageDeliveries.lastErrorCode })
+      .from(imMessageDeliveries)
+      .where(eq(imMessageDeliveries.id, sibling.deliveryId));
+    expect(domain.requestDelivery).toHaveBeenCalledTimes(2);
+    expect(domain.requestDelivery.mock.calls[0]?.[4]).toBe(connectionId);
+    expect(siblingRow?.code).not.toBe("IM_DELIVERY_AGENT_CUSTODY_FENCED");
+    expect(await custody.getDelivery(fixture.deliveryId)).toMatchObject({ turnId: "turn-1" });
+    await worker.stop();
+  });
+
+  it("falls back to Local Agent serialization when capability is lost during reconcile", async () => {
+    const fixture = await workerFixture(unit);
+    const sibling = await addSiblingDelivery(unit, fixture);
+    await fixture.registry.register(
+      {
+        computerId: fixture.computerId,
+        installationId: randomUUID(),
+        instanceId: fixture.instanceId,
+        connectionId: randomUUID(),
+        clientVersion: "0.1.1",
+        lastHeartbeatAt: Date.now(),
+        negotiatedCapabilities: { [RUNTIME_CAPABILITY.localSessionConcurrency]: 1 },
+        socket: { close: vi.fn(), terminate: vi.fn() } as never,
+      },
+      async () => undefined,
+    );
+    const custody = new PostgresRuntimeCustodyStore(unit.database);
+    let reconciles = 0;
+    const domain = fakeDomain(custody, fixture, {
+      onReconcile: async () => {
+        if (++reconciles !== 2) return;
+        await fixture.registry.register(
+          {
+            computerId: fixture.computerId,
+            installationId: randomUUID(),
+            instanceId: fixture.instanceId,
+            connectionId: randomUUID(),
+            clientVersion: "0.1.1",
+            lastHeartbeatAt: Date.now(),
+            socket: { close: vi.fn(), terminate: vi.fn() } as never,
+          },
+          async () => undefined,
+        );
+      },
+    });
+    const worker = new ImDeliveryWorker({
+      database: unit.database,
+      domain: domain as never,
+      assembler: { assembleForSession: vi.fn().mockResolvedValue(fixture.runtime) },
+      registry: fixture.registry,
+      localSessionConcurrencyLimits: new Map([[fixture.computerId, 3]]),
+    });
+
+    await worker.runOnce();
+    await worker.runOnce();
+
+    const [siblingRow] = await unit.database
+      .select({ code: imMessageDeliveries.lastErrorCode })
+      .from(imMessageDeliveries)
+      .where(eq(imMessageDeliveries.id, sibling.deliveryId));
+    expect(domain.requestDelivery).toHaveBeenCalledTimes(1);
+    expect(siblingRow?.code).toBe("IM_DELIVERY_AGENT_CUSTODY_FENCED");
+    await worker.stop();
+  });
+
+  it("keeps a configured Local Computer serial when its live connection lacks the capability", async () => {
+    const fixture = await workerFixture(unit);
+    const sibling = await addSiblingDelivery(unit, fixture);
+    const custody = new PostgresRuntimeCustodyStore(unit.database);
+    const domain = fakeDomain(custody, fixture);
+    const worker = new ImDeliveryWorker({
+      database: unit.database,
+      domain: domain as never,
+      assembler: { assembleForSession: vi.fn().mockResolvedValue(fixture.runtime) },
+      registry: fixture.registry,
+      localSessionConcurrencyLimits: new Map([[fixture.computerId, 3]]),
+    });
+
+    await worker.runOnce();
+    await worker.runOnce();
+
+    expect(domain.requestDelivery).toHaveBeenCalledTimes(1);
+    const [siblingRow] = await unit.database
+      .select({ code: imMessageDeliveries.lastErrorCode })
+      .from(imMessageDeliveries)
+      .where(eq(imMessageDeliveries.id, sibling.deliveryId));
+    expect(siblingRow?.code).toBeNull();
+    await worker.stop();
+  });
+
+  it("falls back to serial Local custody when the live instance no longer matches placement", async () => {
+    const fixture = await workerFixture(unit);
+    await addSiblingDelivery(unit, fixture);
+    await fixture.registry.register(
+      {
+        computerId: fixture.computerId,
+        installationId: randomUUID(),
+        instanceId: fixture.instanceId,
+        connectionId: randomUUID(),
+        clientVersion: "0.1.1",
+        lastHeartbeatAt: Date.now(),
+        negotiatedCapabilities: { [RUNTIME_CAPABILITY.localSessionConcurrency]: 1 },
+        socket: { close: vi.fn(), terminate: vi.fn() } as never,
+      },
+      async () => undefined,
+    );
+    const custody = new PostgresRuntimeCustodyStore(unit.database);
+    const domain = fakeDomain(custody, fixture);
+    const worker = new ImDeliveryWorker({
+      database: unit.database,
+      domain: domain as never,
+      assembler: { assembleForSession: vi.fn().mockResolvedValue(fixture.runtime) },
+      registry: fixture.registry,
+      localSessionConcurrencyLimits: new Map([[fixture.computerId, 3]]),
+    });
+    await worker.runOnce();
+    await fixture.registry.register(
+      {
+        computerId: fixture.computerId,
+        installationId: randomUUID(),
+        instanceId: randomUUID(),
+        clientVersion: "0.1.1",
+        lastHeartbeatAt: Date.now(),
+        negotiatedCapabilities: { [RUNTIME_CAPABILITY.localSessionConcurrency]: 1 },
+        socket: { close: vi.fn(), terminate: vi.fn() } as never,
+      },
+      async () => undefined,
+    );
+
+    await worker.runOnce();
+
+    expect(domain.requestDelivery).toHaveBeenCalledTimes(1);
+    await worker.stop();
+  });
+
   it("rejects admission when the agent is not active and records a bounded retry code", async () => {
     const fixture = await workerFixture(unit);
     const diagnostic = vi.fn();
@@ -2181,6 +2347,7 @@ describe("ImDeliveryWorker database workflow", () => {
           computerId: fixture.computerId,
           installationId: randomUUID(),
           instanceId: fixture.instanceId,
+          connectionId: randomUUID(),
           clientVersion: "0.1.1",
           lastHeartbeatAt: Date.now(),
           socket: { close: vi.fn(), terminate: vi.fn() } as never,
@@ -2478,6 +2645,44 @@ async function workerFixture(unit: UnitDatabase) {
   };
 }
 
+async function addSiblingDelivery(unit: UnitDatabase, fixture: Awaited<ReturnType<typeof workerFixture>>) {
+  const sessionId = randomUUID();
+  const messageId = randomUUID();
+  const deliveryId = randomUUID();
+  const now = new Date(Date.now() + 60 * 60_000);
+  await unit.database.insert(sessions).values({
+    id: sessionId,
+    imBindingId: fixture.bindingId,
+    channelId: "sibling-channel",
+    conversationKind: "channel",
+    kind: "channel",
+  });
+  await unit.database.insert(sessionPlacements).values({ sessionId, computerId: fixture.computerId, generation: 1 });
+  await unit.database.insert(imMessages).values({
+    id: messageId,
+    imBindingId: fixture.bindingId,
+    channelId: "sibling-channel",
+    externalMessageId: `message-${messageId}`,
+    providerRevisionKey: "1",
+    operation: "created",
+    direction: "inbound",
+    authorKind: "human",
+    authorExternalId: "U_FIXTURE",
+    content: { fallbackText: "sibling" },
+    providerContext: { provider: "slack", teamId: "team", channelId: "sibling-channel", messageTs: "2" },
+    occurredAt: now,
+  } as never);
+  await unit.database.insert(imMessageDeliveries).values({
+    id: deliveryId,
+    messageId,
+    sessionId,
+    attention: "direct",
+    placementGeneration: 1,
+    expiresAt: new Date(now.getTime() + 60_000),
+  });
+  return { deliveryId, sessionId };
+}
+
 async function steerFixture(unit: UnitDatabase) {
   const fixture = await workerFixture(unit);
   const rootMessageId = randomUUID();
@@ -2685,6 +2890,7 @@ function fakeDomain(
         _instanceId: string,
         request: DirectImMessageDeliveryRequest,
         onDispatched?: () => void,
+        _expectedConnectionId?: string,
       ) => {
         options.onEvent?.("delivery");
         options.onDelivery?.(request);

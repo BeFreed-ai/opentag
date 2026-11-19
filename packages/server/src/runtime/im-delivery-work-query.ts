@@ -72,6 +72,7 @@ export interface DeliveryContext {
   bindingStatus: typeof imBindings.$inferSelect.status;
   endedAt: Date | null;
   computerId: string | undefined;
+  computerInstanceId: string | undefined;
   computerKind: "local" | "cloud" | undefined;
   generation: number | undefined;
 }
@@ -101,7 +102,7 @@ export async function loadDeliveryContexts(database: DeliveryWorkQuery, sessionI
         .from(imBindings)
         .where(inArray(imBindings.id, [...new Set(sessionRows.map((row) => row.bindingId))])),
       database
-        .select({ id: computers.id, kind: computers.kind })
+        .select({ id: computers.id, kind: computers.kind, currentInstanceId: computers.currentInstanceId })
         .from(computers)
         .where(inArray(computers.id, [...new Set(placements.map((row) => row.computerId))])),
     ]);
@@ -125,6 +126,9 @@ export async function loadDeliveryContexts(database: DeliveryWorkQuery, sessionI
         bindingStatus: binding.status,
         endedAt: session.endedAt,
         computerId: placement?.computerId,
+        computerInstanceId: placement
+          ? (computerMap.get(placement.computerId)?.currentInstanceId ?? undefined)
+          : undefined,
         generation: placement?.generation,
         computerKind: placement ? computerMap.get(placement.computerId)?.kind : undefined,
       });
@@ -146,6 +150,11 @@ export interface DeliveryCustodyRow {
   reportedAt: string | null;
   turnId: string | null;
   reportOwnerInstanceId: string | null;
+}
+
+/** A negotiated Local Client can admit this many different Session turns for one Agent. */
+export interface LocalSessionConcurrencyPolicy {
+  maxConcurrent: number;
 }
 
 export function deliveryCustodyQuery() {
@@ -172,6 +181,7 @@ export async function readDeliveryCustody(database: DeliveryWorkQuery) {
 type CustodyGroups = Map<string, Map<string, DeliveryCustodyRow>>;
 export class DeliveryCustodySnapshot {
   readonly #agents: CustodyGroups = new Map();
+  readonly #cloudAgents: CustodyGroups = new Map();
   readonly #localAgents: CustodyGroups = new Map();
   readonly #sessions: CustodyGroups = new Map();
   readonly #accepted: CustodyGroups = new Map();
@@ -183,6 +193,7 @@ export class DeliveryCustodySnapshot {
       this.#put(this.#agents, context.agentId, row);
       this.#put(this.#sessions, row.sessionId, row);
       if (context.computerKind === "local") this.#put(this.#localAgents, context.agentId, row);
+      if (context.computerKind === "cloud") this.#put(this.#cloudAgents, context.agentId, row);
       if (row.state === "accepted" && row.reportedAt === null) this.#put(this.#accepted, row.sessionId, row);
     }
   }
@@ -199,14 +210,24 @@ export class DeliveryCustodySnapshot {
     for (const row of group.values()) if (row.id !== id) return row;
     return undefined;
   }
-  other(subject: { deliveryId: string; sessionId: string; agentId: string; computerKind: "local" | "cloud" }) {
-    return (
-      this.#other(this.#sessions.get(subject.sessionId), subject.deliveryId) ??
-      this.#other(
-        (subject.computerKind === "local" ? this.#agents : this.#localAgents).get(subject.agentId),
-        subject.deliveryId,
-      )
-    );
+  #others(group: Map<string, DeliveryCustodyRow> | undefined, id: string) {
+    if (!group) return [];
+    return [...group.values()].filter((row) => row.id !== id);
+  }
+  other(
+    subject: { deliveryId: string; sessionId: string; agentId: string; computerKind: "local" | "cloud" },
+    localSessionConcurrency?: LocalSessionConcurrencyPolicy,
+  ) {
+    const sameSession = this.#other(this.#sessions.get(subject.sessionId), subject.deliveryId);
+    if (sameSession) return sameSession;
+    if (subject.computerKind === "cloud") {
+      return this.#other(this.#localAgents.get(subject.agentId), subject.deliveryId);
+    }
+    if (!localSessionConcurrency) return this.#other(this.#agents.get(subject.agentId), subject.deliveryId);
+    const cloudOwner = this.#other(this.#cloudAgents.get(subject.agentId), subject.deliveryId);
+    if (cloudOwner) return cloudOwner;
+    const localOwners = this.#others(this.#localAgents.get(subject.agentId), subject.deliveryId);
+    return localOwners.length >= localSessionConcurrency.maxConcurrent ? localOwners[0] : undefined;
   }
   acceptedInSession(sessionId: string, id: string) {
     return this.#other(this.#accepted.get(sessionId), id);

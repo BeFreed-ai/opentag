@@ -221,6 +221,45 @@ const EncryptionKeyRingSchema = z
 const ServerLogLevelSchema = z.enum(["trace", "debug", "info", "warn", "error", "fatal", "silent"]).default("info");
 export type ServerLogLevel = z.infer<typeof ServerLogLevelSchema>;
 
+/**
+ * An explicit Computer allowlist for the capability-gated Local delivery rollout. The default is
+ * empty, so adding the Server code alone cannot increase any Local Agent's concurrency.
+ */
+const LocalSessionConcurrencyLimitsSchema = z
+  .string()
+  .trim()
+  .optional()
+  .transform((value, context) => {
+    if (value === undefined) return new Map<string, number>();
+    let raw: unknown;
+    try {
+      raw = JSON.parse(value);
+    } catch {
+      context.addIssue({ code: "custom", message: "Must be a JSON object mapping Computer IDs to limits" });
+      return z.NEVER;
+    }
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      context.addIssue({ code: "custom", message: "Must be a JSON object mapping Computer IDs to limits" });
+      return z.NEVER;
+    }
+    const limits = new Map<string, number>();
+    for (const [computerId, limit] of Object.entries(raw)) {
+      if (!z.string().uuid().safeParse(computerId).success) {
+        context.addIssue({ code: "custom", message: "Every Local delivery concurrency key must be a Computer UUID" });
+        continue;
+      }
+      if (!Number.isSafeInteger(limit) || limit <= 1 || limit > 8) {
+        context.addIssue({
+          code: "custom",
+          message: "Every Local delivery concurrency limit must be a safe integer greater than one and at most eight",
+        });
+        continue;
+      }
+      limits.set(computerId, limit);
+    }
+    return limits;
+  });
+
 function validateMcpGoogleClientPair(
   value: {
     OPENTAG_MCP_GOOGLE_CLIENT_ID?: string | undefined;
@@ -322,6 +361,7 @@ const ServerEnvironmentSchema = z
       .enum(["1", "2"])
       .default("1")
       .transform((value) => (value === "2" ? 2 : 1)),
+    OPENTAG_IM_DELIVERY_LOCAL_SESSION_CONCURRENCY_LIMITS: LocalSessionConcurrencyLimitsSchema,
     OPENTAG_ENV: ChannelNameSchema.default("dev"),
     OPENTAG_ENV_EXPLICIT: z.boolean(),
     OPENTAG_DEV_AUTH_BYPASS_ENABLED: booleanString("false"),
@@ -735,6 +775,8 @@ export interface ServerConfig {
   encryptionKeyRing?: { keys: ReadonlyMap<string, Uint8Array>; activeKeyId: string };
   /** IM credential material write envelope. Reads accept v1 and v2 regardless of this setting. */
   imCredentialEncryptionWriteVersion: 1 | 2;
+  /** Per-Computer Local delivery limits; an empty map preserves the legacy one-delivery rule. */
+  imDelivery: { localSessionConcurrencyLimits: ReadonlyMap<string, number> };
   channel: ChannelConfig;
   environment: ChannelName;
   devAuth?: { email: string };
@@ -918,6 +960,9 @@ export function parseServerConfig(environment: NodeJS.ProcessEnv): ServerConfig 
     OPENTAG_ENCRYPTION_KEY_RING: emptyToUndefined(environment.OPENTAG_ENCRYPTION_KEY_RING),
     OPENTAG_ENCRYPTION_ACTIVE_KEY_ID: emptyToUndefined(environment.OPENTAG_ENCRYPTION_ACTIVE_KEY_ID),
     OPENTAG_IM_CREDENTIAL_ENCRYPTION_WRITE_VERSION: environment.OPENTAG_IM_CREDENTIAL_ENCRYPTION_WRITE_VERSION,
+    OPENTAG_IM_DELIVERY_LOCAL_SESSION_CONCURRENCY_LIMITS: emptyToUndefined(
+      environment.OPENTAG_IM_DELIVERY_LOCAL_SESSION_CONCURRENCY_LIMITS,
+    ),
     OPENTAG_ENV: environment.OPENTAG_ENV,
     OPENTAG_ENV_EXPLICIT: environment.OPENTAG_ENV !== undefined,
     OPENTAG_DEV_AUTH_BYPASS_ENABLED: environment.OPENTAG_DEV_AUTH_BYPASS_ENABLED,
@@ -1006,6 +1051,7 @@ export function parseServerConfig(environment: NodeJS.ProcessEnv): ServerConfig 
         }
       : {}),
     imCredentialEncryptionWriteVersion: parsed.OPENTAG_IM_CREDENTIAL_ENCRYPTION_WRITE_VERSION,
+    imDelivery: { localSessionConcurrencyLimits: parsed.OPENTAG_IM_DELIVERY_LOCAL_SESSION_CONCURRENCY_LIMITS },
     environment: parsed.OPENTAG_ENV,
     ...(parsed.OPENTAG_DEV_AUTH_BYPASS_ENABLED && parsed.OPENTAG_DEV_AUTH_EMAIL
       ? { devAuth: { email: parsed.OPENTAG_DEV_AUTH_EMAIL } }

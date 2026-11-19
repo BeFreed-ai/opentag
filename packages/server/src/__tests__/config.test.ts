@@ -123,6 +123,29 @@ describe("parseServerConfig", () => {
     expect(parseServerConfig(required).cloudModel).toEqual({ enabled: false });
   });
 
+  it("keeps Local delivery serial unless a Computer has an explicit bounded limit", () => {
+    const computerId = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+    expect(parseServerConfig(required).imDelivery.localSessionConcurrencyLimits).toEqual(new Map());
+    expect(
+      parseServerConfig({
+        ...required,
+        OPENTAG_IM_DELIVERY_LOCAL_SESSION_CONCURRENCY_LIMITS: JSON.stringify({ [computerId]: 3 }),
+      }).imDelivery.localSessionConcurrencyLimits,
+    ).toEqual(new Map([[computerId, 3]]));
+    expect(() =>
+      parseServerConfig({
+        ...required,
+        OPENTAG_IM_DELIVERY_LOCAL_SESSION_CONCURRENCY_LIMITS: JSON.stringify({ [computerId]: 1 }),
+      }),
+    ).toThrow(/greater than one/);
+    expect(() =>
+      parseServerConfig({
+        ...required,
+        OPENTAG_IM_DELIVERY_LOCAL_SESSION_CONCURRENCY_LIMITS: "not-json",
+      }),
+    ).toThrow(/JSON object/);
+  });
+
   it("derives Cloud Runner enablement from the single overall Cloud switch and requires every coordinate", () => {
     const identities = {
       OPENTAG_CLOUD_IDENTITIES_ENABLED: "true",

@@ -40,6 +40,7 @@ contents, and machine-specific operational logs outside the repository.
 - [Agent GitHub access through MCP](verification/agent-github-mcp-only.md)
 - [GitHub OAuth cutover](verification/github-oauth-cutover.md)
 - [IM delivery claim queries](im-delivery-claim/README.md)
+- [Local Agent session concurrency](im-delivery-local-session-concurrency/README.md)
 - [IM Turn budget and recovery](im-turn-budget-recovery/README.md)
 - [Steered IM custody without terminal reports](verification/im-steer-custody.md)
 - [Provider process shutdown](verification/provider-process-custody.md)

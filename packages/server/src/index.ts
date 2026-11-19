@@ -1124,6 +1124,7 @@ export async function startServer(): Promise<void> {
       onDeliverySettled,
       onMetric: (metric) => imDeliveryLogger.info({ metric }, "IM delivery worker metric"),
       registry,
+      localSessionConcurrencyLimits: config.imDelivery.localSessionConcurrencyLimits,
       onDiagnostic: reportDiagnostic,
       supervisor: backgroundFailureSupervisor,
     });

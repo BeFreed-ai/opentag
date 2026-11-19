@@ -11,7 +11,7 @@ import {
   type SessionReconcileResult,
 } from "@opentag/shared";
 import { and, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
-import type { DatabaseClient, DatabaseTransaction } from "../db/client.js";
+import type { DatabaseClient } from "../db/client.js";
 import {
   agents,
   computers,
@@ -67,17 +67,18 @@ import {
   runImDeliveryJanitor,
   runImDeliveryRetention,
 } from "./im-delivery-janitor.js";
+import { localSessionConcurrencyFor, resolveLocalDeliveryTarget } from "./im-delivery-local-session-concurrency.js";
 import { matchPinnedDirectInputHash } from "./im-delivery-pinned-hash.js";
 import { ImDeliveryReadyWakeup, isCloudReadinessRetry } from "./im-delivery-ready-wakeup.js";
 import { cappedRetryDelayMs } from "./im-delivery-retry.js";
 import { ImDeliverySelector, lockEligibleDelivery } from "./im-delivery-selector.js";
-
 import type {
   CloudSessionAllocationPort,
   ImDeliveryWorkerInput,
   RuntimeDeliveryWorkerMetric,
   WorkerClaim,
 } from "./im-delivery-worker.types.js";
+import { frozenSteerMatches, recoverableSteerTarget, staleDispatchGeneration } from "./im-delivery-worker-state.js";
 import { KeyedTaskScheduler } from "./keyed-task-scheduler.js";
 import type { RuntimeDomainOwner } from "./runtime-domain-owner.js";
 
@@ -103,6 +104,14 @@ function positiveWorkerLimit(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive safe integer`);
   return value;
 }
+
+function hasComputerOwnerMismatch(row: {
+  agent: { createdByUserId: string };
+  computerOwnerAccountId: string;
+  delivery: { dispatchRequestId: string | null };
+}): boolean {
+  return row.computerOwnerAccountId !== row.agent.createdByUserId && row.delivery.dispatchRequestId === null;
+}
 /** A claim deferred by another occupant: Local rows are declined steers, Cloud rows are custody races. */
 function custodyDeferralCode(computerKind: "local" | "cloud"): string {
   return computerKind === "cloud" ? "IM_DELIVERY_CUSTODY_DEFERRED" : "IM_DELIVERY_STEER_DEFERRED";
@@ -117,6 +126,7 @@ export class ImDeliveryWorker {
   readonly #domain: RuntimeDomainOwner;
   readonly #assembler: Pick<EffectiveRuntimeSnapshotAssembler, "assembleForSession">;
   readonly #registry: ConnectionRegistry;
+  readonly #localSessionConcurrencyLimits: ReadonlyMap<string, number>;
   readonly #cloudDelivery?: CloudDeliveryOwner;
   readonly #cloudAllocation?: CloudSessionAllocationPort;
   readonly #cloudCoordinator: CloudDeliveryCoordinator;
@@ -143,10 +153,13 @@ export class ImDeliveryWorker {
 
   constructor(input: ImDeliveryWorkerInput) {
     this.#database = input.database;
-    this.#selector = new ImDeliverySelector(input.database);
     this.#domain = input.domain;
     this.#assembler = input.assembler;
     this.#registry = input.registry;
+    this.#localSessionConcurrencyLimits = input.localSessionConcurrencyLimits ?? new Map();
+    this.#selector = new ImDeliverySelector(input.database, (context) =>
+      localSessionConcurrencyFor(this.#registry, this.#localSessionConcurrencyLimits, context),
+    );
     this.#cloudDelivery = input.cloudDelivery;
     this.#cloudAllocation = input.cloudAllocation;
     this.#intervalMs = input.intervalMs ?? DEFAULT_INTERVAL_MS;
@@ -400,17 +413,19 @@ export class ImDeliveryWorker {
     let uncertainDeliveryId: string | undefined;
     const claim = await this.#database.transaction(async (transaction) => {
       const now = this.#clock();
-      const locked = await lockEligibleDelivery(transaction, deliveryId, expectedAgentId, now, sessionId);
+      const locked = await lockEligibleDelivery(transaction, deliveryId, expectedAgentId, now, sessionId, (context) =>
+        localSessionConcurrencyFor(this.#registry, this.#localSessionConcurrencyLimits, context),
+      );
       if (!locked) return undefined;
-      const { row, custody } = locked;
+      const { row, custody, localSessionConcurrency } = locked;
       const subject = {
         deliveryId: row.id,
         agentId: row.agentId,
         sessionId: row.sessionId,
         computerKind: row.computerKind,
       };
-      const otherCustody = row.state === "accepted" ? undefined : custody.other(subject);
-      const laneKey = occupancyScopeKey(deliveryOccupancyScope(subject));
+      const otherCustody = row.state === "accepted" ? undefined : custody.other(subject, localSessionConcurrency);
+      const laneKey = occupancyScopeKey(deliveryOccupancyScope(subject, localSessionConcurrency));
       let steerTarget: { id: string; turnId: string } | undefined;
       if (otherCustody) {
         const instanceId =
@@ -784,7 +799,7 @@ export class ImDeliveryWorker {
       await this.#recordFailure(deliveryId, "IM_DELIVERY_RUNTIME_AUTHORITY_UNAVAILABLE", claimToken);
       return;
     }
-    if (row.computerOwnerAccountId !== row.agent.createdByUserId && row.delivery.dispatchRequestId === null) {
+    if (hasComputerOwnerMismatch(row)) {
       setActiveSpanAttributes(outcomeAttrs("failed", "IM_DELIVERY_COMPUTER_OWNER_MISMATCH"));
       await this.#reject(deliveryId, "computer_owner_mismatch", claimToken);
       return;
@@ -865,19 +880,16 @@ export class ImDeliveryWorker {
     if (!runtime) return;
     // A late acceptance may commit after this delivery was claimed. Recheck at
     // the last boundary before any reconcile or delivery frame reaches runtime.
-    // The subject is Local here (the Cloud branch returned above), so this is the
-    // unchanged Agent-wide fence.
-    if (
-      await hasOtherCustody(this.#database, {
-        deliveryId,
-        agentId: row.agent.id,
-        sessionId: row.session.id,
-        computerKind: row.computer.kind,
-      })
-    ) {
-      await this.#recordFailure(deliveryId, "IM_DELIVERY_AGENT_CUSTODY_FENCED", claimToken);
-      return;
-    }
+    const reconcileTarget = await resolveLocalDeliveryTarget({
+      database: this.#database,
+      deliveryId,
+      claimToken,
+      limits: this.#localSessionConcurrencyLimits,
+      recordFailure: (id, code, token) => this.#recordFailure(id, code, token),
+      registry: this.#registry,
+      row,
+    });
+    if (!reconcileTarget) return;
     if (!(await lease.assertOwned())) return;
     try {
       const admission = {
@@ -891,7 +903,7 @@ export class ImDeliveryWorker {
         (onDispatched) =>
           this.#domain.requestReconcile(
             row.computer.id,
-            instanceId,
+            reconcileTarget.instanceId,
             {
               type: "session:reconcile",
               requestId: randomUUID(),
@@ -982,9 +994,38 @@ export class ImDeliveryWorker {
       validateFreshImRequest(request);
       if (!(await lease.assertOwned())) return;
       await this.#beforeDeliveryAdmission?.(signal);
+      // Re-read the live registration after reconciliation and every other awaited preparation.
+      const deliveryTarget = await resolveLocalDeliveryTarget({
+        database: this.#database,
+        deliveryId,
+        claimToken,
+        limits: this.#localSessionConcurrencyLimits,
+        recordFailure: (id, code, token) => this.#recordFailure(id, code, token),
+        registry: this.#registry,
+        row,
+      });
+      if (!deliveryTarget) return;
       const admittedDelivery = await this.#withActiveAgentAdmission(
         admission,
-        (onDispatched) => this.#domain.requestDelivery(row.computer.id, instanceId, request, onDispatched),
+        (onDispatched) => {
+          if (
+            deliveryTarget.expectedConnectionId &&
+            !this.#registry.isCurrentConnection(
+              row.computer.id,
+              deliveryTarget.instanceId,
+              deliveryTarget.expectedConnectionId,
+            )
+          ) {
+            throw new Error("The Local runtime connection changed before delivery dispatch");
+          }
+          return this.#domain.requestDelivery(
+            row.computer.id,
+            deliveryTarget.instanceId,
+            request,
+            onDispatched,
+            deliveryTarget.expectedConnectionId,
+          );
+        },
         signal,
       );
       if (!admittedDelivery.admitted) {
@@ -1452,57 +1493,4 @@ export class ImDeliveryWorker {
       .limit(1);
     return threadDelivery ? "observer" : undefined;
   }
-}
-
-type LockedDeliveryRow = NonNullable<Awaited<ReturnType<typeof lockEligibleDelivery>>>["row"];
-
-function staleDispatchGeneration(row: LockedDeliveryRow): boolean {
-  const parsed = DirectImMessageDeliveryRequestSchema.safeParse(row.dispatchPayload);
-  const steer = RuntimeImSteerRequestSchema.safeParse(row.dispatchPayload);
-  const generation = parsed.success
-    ? parsed.data.placementGeneration
-    : steer.success
-      ? steer.data.placementGeneration
-      : undefined;
-  return (
-    row.dispatchRequestId !== null &&
-    (row.deliveryGeneration !== row.generation || (generation !== undefined && generation !== row.generation))
-  );
-}
-
-function frozenSteerMatches(row: LockedDeliveryRow): boolean {
-  const parsed = RuntimeImSteerRequestSchema.safeParse(row.dispatchPayload);
-  if (!parsed.success) return false;
-  const request = parsed.data;
-  return (
-    row.dispatchRequestId === request.requestId &&
-    row.dispatchInputHash === computeRuntimeImSteerInputHash(request) &&
-    row.steerTargetDeliveryId === request.rootDeliveryId &&
-    row.id === request.deliveryId &&
-    row.sessionId === request.sessionId &&
-    row.agentId === request.agentId
-  );
-}
-
-async function recoverableSteerTarget(transaction: DatabaseTransaction, row: LockedDeliveryRow): Promise<boolean> {
-  if (!row.steerTargetDeliveryId) return false;
-  const [target] = await transaction
-    .select({ id: imMessageDeliveries.id })
-    .from(imMessageDeliveries)
-    .where(
-      and(
-        eq(imMessageDeliveries.id, row.steerTargetDeliveryId),
-        ne(imMessageDeliveries.id, row.id),
-        eq(imMessageDeliveries.sessionId, row.sessionId),
-        or(
-          ne(imMessageDeliveries.state, "accepted"),
-          and(
-            isNotNull(imMessageDeliveries.reportedAt),
-            sql`coalesce(${imMessageDeliveries.turnReport} ->> 'outcome', 'unknown') <> 'completed'`,
-          ),
-        ),
-      ),
-    )
-    .limit(1);
-  return target !== undefined;
 }
