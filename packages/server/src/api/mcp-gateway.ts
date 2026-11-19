@@ -159,7 +159,7 @@ function buildHandlers(
           signal,
           ...(args ? { arguments: args } : {}),
         });
-        return result;
+        return legacyToolResult(result);
       } catch (error) {
         // An abort is the caller's own doing, not something to describe back to it as a tool failure.
         const message = signal.aborted
@@ -172,6 +172,16 @@ function buildHandlers(
       }
     },
   };
+}
+
+/** Modern upstreams allow any JSON value; every revision this gateway serves requires an object. */
+function legacyToolResult(result: unknown): unknown {
+  if (result === null || typeof result !== "object" || Array.isArray(result)) return result;
+  const record = result as Record<string, unknown>;
+  if (!("structuredContent" in record)) return result;
+  const value = record.structuredContent;
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) return result;
+  return { ...record, structuredContent: { value } };
 }
 
 function sendGatewayFailure(

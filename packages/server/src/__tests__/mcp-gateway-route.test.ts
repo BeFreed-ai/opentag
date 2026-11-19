@@ -138,6 +138,58 @@ describe("protocol negotiation", () => {
   );
 });
 
+describe("modern upstream results for legacy providers", () => {
+  it.each([
+    { value: [{ name: "main" }] },
+    { value: [] },
+    { value: "text" },
+    { value: 42 },
+    { value: false },
+    { value: null },
+  ])("wraps non-object structured content without changing tool output: %j", async ({ value: structuredContent }) => {
+    const result = {
+      content: [{ type: "text", text: "original fallback" }],
+      structuredContent,
+      isError: true,
+      _meta: { trace: "retained" },
+    };
+    const callTool = vi.fn(async () => ({ result }));
+    const { app, token } = harness({ callTool });
+    try {
+      const response = await post(app, token, {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "github__list_branches" },
+      });
+      expect(response.status).toBe(200);
+      expect(response.body.result).toEqual({ ...result, structuredContent: { value: structuredContent } });
+      expect(result.structuredContent).toEqual(structuredContent);
+      expect(callTool).toHaveBeenCalledTimes(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it.each([{ content: [] }, { content: [], structuredContent: { branches: [] } }])(
+    "preserves an already compatible result: %j",
+    async (result) => {
+      const { app, token } = harness({ callTool: async () => ({ result }) });
+      try {
+        const response = await post(app, token, {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "fixture__echo" },
+        });
+        expect(response.body.result).toEqual(result);
+      } finally {
+        await app.close();
+      }
+    },
+  );
+});
+
 describe("authentication", () => {
   it("refuses a missing, malformed, empty, and unknown bearer alike", async () => {
     const { app, token } = harness();
