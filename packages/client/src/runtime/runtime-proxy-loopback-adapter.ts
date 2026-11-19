@@ -639,6 +639,9 @@ export async function generateExecutionCa(materialDir: string): Promise<RuntimeP
           "ec",
           "-pkeyopt",
           "ec_paramgen_curve:prime256v1",
+          // LibreSSL defaults to explicit EC parameters, which Go's x509 parser rejects.
+          "-pkeyopt",
+          "ec_param_enc:named_curve",
           "-nodes",
           "-days",
           "2",

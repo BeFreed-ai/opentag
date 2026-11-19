@@ -15,6 +15,11 @@ it("creates independent P-256 execution certificates trusted by TLS 1.2 and TLS 
     const x509 = new X509Certificate(certificate);
     expect(createPrivateKey(key).asymmetricKeyType).toBe("ec");
     expect(x509.publicKey.asymmetricKeyDetails?.namedCurve).toBe("prime256v1");
+    // The SPKI algorithm must encode id-ecPublicKey plus the P-256 named-curve OID.
+    // Node accepts explicit parameters too, but Go clients such as the Slack CLI reject them.
+    const namedP256Header = Buffer.from("3059301306072a8648ce3d020106082a8648ce3d030107", "hex");
+    const publicKeyInfo = x509.publicKey.export({ type: "spki", format: "der" });
+    expect(publicKeyInfo.subarray(0, namedP256Header.length)).toEqual(namedP256Header);
     expect(x509.ca).toBe(true);
     expect(x509.verify(x509.publicKey)).toBe(true);
     for (const host of [
