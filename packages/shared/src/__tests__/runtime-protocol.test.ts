@@ -42,6 +42,18 @@ describe("runtime protocol", () => {
     expect(RUNTIME_REQUIRED_CLIENT_CAPABILITIES).not.toContain(RUNTIME_CAPABILITY.approvalPresentation);
     expect(RUNTIME_REQUIRED_SERVER_CAPABILITIES).not.toContain(RUNTIME_CAPABILITY.approvalPresentation);
   });
+  it("negotiates Local Session concurrency only with supporting peers", () => {
+    expect(RUNTIME_SERVER_CAPABILITY_OFFERS[RUNTIME_CAPABILITY.localSessionConcurrency]).toEqual({ min: 1, max: 1 });
+    expect(RUNTIME_CLIENT_CAPABILITY_OFFERS[RUNTIME_CAPABILITY.localSessionConcurrency]).toEqual({ min: 1, max: 1 });
+    expect(
+      negotiateRuntimeCapabilities(
+        { [RUNTIME_CAPABILITY.localSessionConcurrency]: { min: 1, max: 1 } },
+        RUNTIME_SERVER_CAPABILITY_OFFERS,
+      ),
+    ).toEqual({ [RUNTIME_CAPABILITY.localSessionConcurrency]: 1 });
+    expect(RUNTIME_REQUIRED_CLIENT_CAPABILITIES).not.toContain(RUNTIME_CAPABILITY.localSessionConcurrency);
+    expect(RUNTIME_REQUIRED_SERVER_CAPABILITIES).not.toContain(RUNTIME_CAPABILITY.localSessionConcurrency);
+  });
   it("negotiates Slack auto setup only with approval-aware peers without requiring the capability", () => {
     const v1 = { [RUNTIME_CAPABILITY.slackAutoSetup]: { min: 1, max: 1 } };
     expect(negotiateRuntimeCapabilities(v1, RUNTIME_SERVER_CAPABILITY_OFFERS)).toEqual({});

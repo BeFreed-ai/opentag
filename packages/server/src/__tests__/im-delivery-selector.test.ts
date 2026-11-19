@@ -14,6 +14,36 @@ beforeEach(async () => unit.reset());
 afterAll(async () => unit?.close());
 
 describe("indexed delivery selection", () => {
+  it("uses the Local session policy for both scan and advisory-lock claim", async () => {
+    const fixture = await seedDeliveryQuery(unit.database);
+    await unit.database
+      .update(computers)
+      .set({ kind: "local" })
+      .where(eq(computers.id, deliveryTestId("computer", 1)));
+    await unit.database.execute(
+      sql`update sessions set im_binding_id=${deliveryTestId("binding", 1)}::uuid where id=${deliveryTestId("session", 0)}::uuid`,
+    );
+    await unit.database.execute(
+      sql`update session_placements set computer_id=${fixture.computerId}::uuid where session_id=${deliveryTestId("session", 0)}::uuid`,
+    );
+    const localSessionConcurrency = { maxConcurrent: 3 };
+    expect((await new ImDeliverySelector(unit.database).candidates(new Date()).next()).done).toBe(true);
+    const selector = new ImDeliverySelector(unit.database, () => localSessionConcurrency);
+    expect((await selector.candidates(new Date()).next()).value?.row.id).toBe(fixture.deliveryId);
+    expect(
+      await unit.database.transaction((tx) =>
+        lockEligibleDelivery(
+          tx,
+          fixture.deliveryId,
+          fixture.agentId,
+          new Date(),
+          undefined,
+          () => localSessionConcurrency,
+        ),
+      ),
+    ).toMatchObject({ row: { id: fixture.deliveryId } });
+  });
+
   it("continues after eight fully blocked pages instead of starving the independent Agent", async () => {
     const fixture = await seedDeliveryQuery(unit.database, 0, 1100);
     const selector = new ImDeliverySelector(unit.database);

@@ -447,6 +447,7 @@ export class RuntimeDomainOwner {
     instanceId: string,
     request: DirectImMessageDeliveryRequest,
     onDispatched?: () => void,
+    expectedConnectionId?: string,
   ): Promise<ImMessageDeliveryResult> {
     const attrs = runtimeAttrs({
       requestId: request.requestId,
@@ -460,7 +461,7 @@ export class RuntimeDomainOwner {
     });
     let operation: Promise<ImMessageDeliveryResult>;
     try {
-      operation = this.#requestDelivery(computerId, instanceId, request, onDispatched);
+      operation = this.#requestDelivery(computerId, instanceId, request, onDispatched, expectedConnectionId);
     } catch (error) {
       return tracePromise(
         "runtime.delivery",
@@ -553,6 +554,7 @@ export class RuntimeDomainOwner {
     instanceId: string,
     request: DirectImMessageDeliveryRequest,
     onDispatched?: () => void,
+    expectedConnectionId?: string,
   ): Promise<ImMessageDeliveryResult> {
     const inputHash = computeDirectInputHash(request);
     const requestHash = hashTuple([request.deliveryId, inputHash]);
@@ -578,10 +580,21 @@ export class RuntimeDomainOwner {
         inputHash,
         undefined,
         onDispatched,
+        undefined,
+        undefined,
+        expectedConnectionId,
       ) as Promise<ImMessageDeliveryResult>;
     }
     this.#registry.assertSnapshotCompatible(computerId, instanceId, request);
-    const promise = this.#startDelivery(computerId, instanceId, request, requestHash, inputHash, onDispatched);
+    const promise = this.#startDelivery(
+      computerId,
+      instanceId,
+      request,
+      requestHash,
+      inputHash,
+      onDispatched,
+      expectedConnectionId,
+    );
     const owner = { computerId, hash: requestHash, instanceId, promise };
     this.#startingDeliveries.set(request.requestId, owner);
     void promise.then(
@@ -604,6 +617,7 @@ export class RuntimeDomainOwner {
     requestHash: string,
     inputHash: string,
     onDispatched?: () => void,
+    expectedConnectionId?: string,
   ): Promise<ImMessageDeliveryResult> {
     const dispatch = await this.#custody.beginDeliveryDispatch(request, inputHash, {
       computerId,
@@ -624,6 +638,9 @@ export class RuntimeDomainOwner {
         inputHash,
         undefined,
         onDispatched,
+        undefined,
+        undefined,
+        expectedConnectionId,
       ) as Promise<ImMessageDeliveryResult>;
     } catch (error) {
       await this.#custody.releaseDeliveryDispatch(request, inputHash, "retry").catch(() => undefined);
@@ -820,6 +837,7 @@ export class RuntimeDomainOwner {
     onDispatched?: () => void,
     signal?: AbortSignal,
     onReconcileResult?: PreparedSessionReconcile["onResult"],
+    expectedConnectionId?: string,
   ): Promise<SessionReconcileResult | ImMessageDeliveryResult | RuntimeImSteerResult | SessionMessageDeliveryResult> {
     const existing = this.#pending.get(request.requestId);
     if (existing) {
@@ -906,7 +924,7 @@ export class RuntimeDomainOwner {
     };
     const pending = createPendingRequest(kind, base, inputHash, semanticHash, onReconcileResult);
     this.#pending.set(request.requestId, pending);
-    const dispatch = this.#registry.send(computerId, instanceId, request);
+    const dispatch = this.#registry.send(computerId, instanceId, request, expectedConnectionId);
     void dispatch
       .then(() => onDispatched?.())
       .catch((error: unknown) => {

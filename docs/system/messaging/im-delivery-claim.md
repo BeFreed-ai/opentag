@@ -24,8 +24,12 @@ Session, placement, binding, Agent, and Computer metadata is fetched in batches 
 keys, then joined in memory. The hint cache holds at most 2,048 Sessions for five seconds. Ready
 notifications and attempted claims invalidate their Session; stopping the worker clears the cache.
 Custody is loaded fresh for each scan and grouped in memory by Agent and Session. Local custody
-remains Agent-wide; Cloud custody remains Session-scoped and also respects Local custody for the
-same Agent. These snapshots can postpone eligibility, but cannot authorize a dispatch.
+remains Agent-wide unless the placed Computer has both an explicit limit in
+`OPENTAG_IM_DELIVERY_LOCAL_SESSION_CONCURRENCY_LIMITS` and a live negotiated
+`runtime.localSessionConcurrency` capability. That narrow opt-in uses a Session lane, preserves
+same-Session serialization, and limits the Local Agent to its configured active-delivery count.
+Cloud custody remains Session-scoped and also respects any Local custody for the same Agent.
+These snapshots can postpone eligibility, but cannot authorize a dispatch.
 
 For each selected candidate, a short transaction takes the Agent advisory lock, locks the delivery
 by primary key with `FOR UPDATE SKIP LOCKED`, and re-reads eligibility, metadata, and custody without
@@ -33,6 +37,12 @@ the hint cache. It checks the expected Agent identity and Cloud queue head again
 the existing claim marker or recovery lease. Each scan attempts at most eight such transactions.
 Pending ingress expiry uses the database clock, as before. The existing dispatch, steer, receipt,
 report, cancellation, retry, and timeout state transitions still apply.
+
+The rollout variable is a JSON object mapping Computer UUIDs to integer limits greater than one
+and no more than eight, for example `{ "3f2504e0-4f89-41d3-9a0c-0305e82c3301": 3 }`. Unset or
+empty means no Computer is opted in. Capability loss or instance replacement between selection and
+send immediately falls back to the Agent-wide Local fence; lowering or removing a limit stops new
+parallel admissions without interrupting existing custody.
 
 ## Accepted receipts awaiting Inbox
 

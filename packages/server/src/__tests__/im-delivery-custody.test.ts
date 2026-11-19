@@ -12,7 +12,12 @@ import {
   users,
 } from "../db/schema/index.js";
 import { dispatchClaimToken } from "../runtime/im-delivery-claim.js";
-import { deliveryOccupancyScope, findOtherCustody, occupancyScopeKey } from "../runtime/im-delivery-custody.js";
+import {
+  deliveryOccupancyScope,
+  findOtherCustody,
+  type LocalSessionConcurrencyPolicy,
+  occupancyScopeKey,
+} from "../runtime/im-delivery-custody.js";
 import { createUnitDatabase, type UnitDatabase } from "./support/unit-database.js";
 
 /**
@@ -22,6 +27,7 @@ import { createUnitDatabase, type UnitDatabase } from "./support/unit-database.j
  */
 
 let unit: UnitDatabase;
+const threeWayLocal: LocalSessionConcurrencyPolicy = { maxConcurrent: 3 };
 beforeAll(async () => {
   unit = await createUnitDatabase();
 }, 60_000);
@@ -43,6 +49,12 @@ describe("delivery occupancy scope", () => {
     expect(occupancyScopeKey({ kind: "session", agentId: "agent-1", sessionId: "session-1" })).toBe(
       "session:session-1",
     );
+  });
+
+  it("maps a capability-enabled Local delivery to its Session scheduler lane", () => {
+    expect(
+      deliveryOccupancyScope({ computerKind: "local", agentId: "agent-1", sessionId: "session-1" }, threeWayLocal),
+    ).toEqual({ kind: "session", agentId: "agent-1", sessionId: "session-1" });
   });
 
   it("lets different Cloud Sessions of one Agent own custody concurrently", async () => {
@@ -96,6 +108,89 @@ describe("delivery occupancy scope", () => {
       sessionId: fixture.secondSessionId,
       computerKind: "local",
     });
+    expect(other?.id).toBe(occupant);
+  });
+
+  it("admits three different Local Sessions before fencing the fourth when concurrency is enabled", async () => {
+    const fixture = await twoSessionFixture("local");
+    const thirdSessionId = await createSession(fixture.bindingId, fixture.computerId);
+    const fourthSessionId = await createSession(fixture.bindingId, fixture.computerId);
+    await createDelivery(fixture.firstSessionId, "occupied");
+    const secondDeliveryId = await createDelivery(fixture.secondSessionId, "occupied");
+    const thirdDeliveryId = await createDelivery(thirdSessionId, "occupied");
+    const fourthDeliveryId = await createDelivery(fourthSessionId);
+
+    expect(
+      await findOtherCustody(
+        unit.database,
+        {
+          deliveryId: secondDeliveryId,
+          agentId: fixture.agentId,
+          sessionId: fixture.secondSessionId,
+          computerKind: "local",
+        },
+        threeWayLocal,
+      ),
+    ).toBeUndefined();
+    expect(
+      await findOtherCustody(
+        unit.database,
+        {
+          deliveryId: thirdDeliveryId,
+          agentId: fixture.agentId,
+          sessionId: thirdSessionId,
+          computerKind: "local",
+        },
+        threeWayLocal,
+      ),
+    ).toBeUndefined();
+    expect(
+      await findOtherCustody(
+        unit.database,
+        {
+          deliveryId: fourthDeliveryId,
+          agentId: fixture.agentId,
+          sessionId: fourthSessionId,
+          computerKind: "local",
+        },
+        threeWayLocal,
+      ),
+    ).toBeDefined();
+  });
+
+  it("keeps the same Local Session serial when concurrency is enabled", async () => {
+    const fixture = await twoSessionFixture("local");
+    const occupant = await createDelivery(fixture.firstSessionId, "occupied");
+    const subjectDeliveryId = await createDelivery(fixture.firstSessionId);
+    const other = await findOtherCustody(
+      unit.database,
+      {
+        deliveryId: subjectDeliveryId,
+        agentId: fixture.agentId,
+        sessionId: fixture.firstSessionId,
+        computerKind: "local",
+      },
+      threeWayLocal,
+    );
+    expect(other?.id).toBe(occupant);
+  });
+
+  it("keeps Cloud custody mutually exclusive with concurrency-enabled Local custody", async () => {
+    const fixture = await twoSessionFixture("local");
+    const cloudComputerId = await createComputer(fixture.accountId, "cloud");
+    const cloudSessionId = await createSession(fixture.bindingId, cloudComputerId);
+    const occupant = await createDelivery(cloudSessionId, "occupied");
+    const subjectDeliveryId = await createDelivery(fixture.secondSessionId);
+    const other = await findOtherCustody(
+      unit.database,
+      {
+        deliveryId: subjectDeliveryId,
+        agentId: fixture.agentId,
+        sessionId: fixture.secondSessionId,
+        computerKind: "local",
+      },
+      threeWayLocal,
+    );
     expect(other?.id).toBe(occupant);
   });
 
