@@ -17,6 +17,9 @@ provider CLIs.
   Sessions, direct continuity, observer copies, and thread history.
 - **[IM delivery claim queries](im-delivery-claim.md)** — indexed delivery
   selection, eligibility hints, and transactional custody checks.
+- **[Local Agent session concurrency](local-session-concurrency.md)** —
+  capability-gated three-way Local Agent delivery, session ordering, and
+  custody safeguards.
 - **[IM content and attachment delivery](im-content-delivery.md)** — how
   provider message structure and resources become Agent input.
 - **[Internal Session collaboration](internal-session-collaboration.md)** — the

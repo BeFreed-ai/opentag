@@ -4,21 +4,21 @@
   "exceptions": [
     {
       "path": "packages/client/src/runtime/runtime-connection.ts",
-      "lines": 1073,
+      "lines": 1044,
       "owner": "@bestony",
-      "expires": "2026-10-31"
+      "expires": "2026-12-31"
     },
     {
       "path": "packages/server/src/runtime/im-delivery-worker.ts",
-      "lines": 1509,
+      "lines": 1496,
       "owner": "@bestony",
-      "expires": "2026-10-31"
+      "expires": "2026-12-31"
     },
     {
       "path": "packages/server/src/services/im-bindings/im-binding-service.ts",
-      "lines": 2096,
+      "lines": 2082,
       "owner": "@bestony",
-      "expires": "2026-10-31"
+      "expires": "2026-12-31"
     }
   ]
 }
