@@ -15,6 +15,14 @@ async function pluginToolPrefix(bridge: ClaudeCodeHostedToolBridge): Promise<str
 }
 
 describe("Claude Code hosted tool bridge", () => {
+  it("writes the memory write-lock hook script into the run directory and removes it on close", async () => {
+    const bridge = await startClaudeCodeHostedToolBridge(undefined, "run-hook", new AbortController().signal, []);
+    const path = bridge.memoryLockHookPath as string;
+    expect((await readFile(path, "utf8")).includes("memory/ is being written by another session")).toBe(true);
+    await bridge.close();
+    await expect(stat(path)).rejects.toThrow();
+  });
+
   it("exposes only selected skills through a private plugin and cleans up its wrapper", async () => {
     const home = await mkdtemp(join(tmpdir(), "opentag-claude-skills-test-"));
     const settingsRoot = join(home, ".claude");

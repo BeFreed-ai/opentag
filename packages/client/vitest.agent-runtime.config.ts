@@ -59,6 +59,7 @@ export default defineConfig({
         "src/providers/claude-code/agent-runtime.ts",
         "src/providers/claude-code/credential-probe.ts",
         "src/providers/claude-code/hosted-tool-bridge.ts",
+        "src/providers/claude-code/memory-write-lock.ts",
         "src/providers/claude-code/skill-plugin.ts",
         "src/providers/claude-code/process-wire.ts",
         "src/providers/claude-code/runtime-policy.ts",

@@ -43,6 +43,7 @@ import { createLogger } from "../../observability/logger.js";
 import { claudePermissionRules } from "../native-permissions.js";
 import { probeClaudeEnvironmentCredential } from "./credential-probe.js";
 import { type ClaudeCodeHostedToolBridge, startClaudeCodeHostedToolBridge } from "./hosted-tool-bridge.js";
+import { memoryWriteLockHooks } from "./memory-write-lock.js";
 import {
   ClaudeCodeProcess,
   type ClaudeCodeProcessClient,
@@ -336,6 +337,9 @@ export class ClaudeCodeAgentRuntime extends BaseAgentRuntime {
         ...(this.#policy.approvals === "never"
           ? {}
           : { permissions: claudePermissionRules(this.#policy.allowedCommands ?? [], this.#policy.managedCli) }),
+        ...(hostedToolBridge.memoryLockHookPath
+          ? { hooks: memoryWriteLockHooks(hostedToolBridge.memoryLockHookPath) }
+          : {}),
       }),
       ...(this.#emptyNativeToolAllowList ? ["--tools", ""] : []),
       ...(configuration?.model ? ["--model", configuration.model] : []),
