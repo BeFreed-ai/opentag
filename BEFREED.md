@@ -18,7 +18,7 @@ Every patch is small, default-off or diagnostics-only, and adds no database migr
 | C2 | Client | `packages/client/src/runtime/context-tree-command-diagnostics.ts`, `context-tree-commands.ts` (+ tests) | Log Context Tree gateway failures (diagnostics only) | on |
 | C3 | Client build | `scripts/befreed/set-fork-version.mjs`, `scripts/portable/build-portable.mjs` | Allow the `<stable>-befreed.<n>` version label | n/a |
 | C4 | CI | `.github/workflows/befreed-client-release.yml`, `befreed-upstream-sync.yml` | Fork client release; weekly "upstream has something new" PR inside the fork | manual / weekly |
-| S1 | Server build | `.github/workflows/befreed-server-image.yml` | Upstream's `docker.yml` only runs in the upstream repo; this builds the same Dockerfile (`runtime` target) and pushes to GHCR in our namespace | manual |
+| S1 | Server build | `.github/workflows/befreed-server-image.yml` | Upstream's `docker.yml` only runs in the upstream repo; this builds the same Dockerfile (`runtime` target) and pushes to our private ECR repository (until 2026-11: a private GHCR package) | manual |
 | S2 | Server | new `packages/server/src/services/schedules/operator-service.ts`, `packages/server/src/api/operator-schedules.ts`, `packages/server/src/operator-routes-config.ts`; wiring in `packages/server/src/app.ts` (+8 lines) and `packages/server/src/index.ts` (+9 lines) | Operator-only account route to create a schedule for an agent, with no inbound IM message (cron, one-time `at`, or "run in N seconds") | **off** |
 | S3 | Server tests | `packages/server/src/__tests__/operator-schedule-api.test.ts`, `operator-routes-config.test.ts`, `__tests__/integration/operator-schedules.test.ts` | Tests for S2 | n/a |
 
@@ -95,7 +95,7 @@ plain single-platform manifest. Pin by digest when you want byte-for-byte certai
 ## Deploy runbook (EC2 + docker compose) and rollback
 
 **Use BeFreed's internal server release tool and read its runbook first.** It runs the gates, takes the snapshot and the dump, swaps the image, verifies it and puts the
-old one back on failure. The hand-typed steps below are the manual fallback.
+old one back on failure. The hand-typed steps below are the manual fallback; if a command fails after `docker login`, run `docker logout <ecr registry>` anyway so no ECR login stays in `~/.docker/config.json`.
 
 Prerequisites: not during the daily SEO round (a restart cuts a running agent turn, and the Server is a single
 instance); a fresh EBS snapshot and a fresh `pg_dump` (same as the 0.1.5 upgrade); the image above exists and is
