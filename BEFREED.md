@@ -66,14 +66,14 @@ passed authentication, the operator allow-list and the ownership check. It never
 Registry: the **private ECR repository `opentag-server`** in BeFreed's AWS account (created by a CloudFormation stack that BeFreed keeps
 internally). The workflow logs in to AWS with a short-lived GitHub OIDC credential (a role trusted for exactly this repository and the
 release branch, allowed to push to that one repository only): no key or token is stored in GitHub. The one setting is the non-secret repository variable
-`OPENTAG_ECR_PUSH_ROLE_ARN`. Versions `0.1.5-befreed.1` to `.5` were published to `ghcr.io/befreed-ai/opentag` (private) and stay there.
+`OPENTAG_ECR_PUSH_ROLE_ARN`. Versions `0.1.5-befreed.1`, `.3`, `.4` and `.5` were published to `ghcr.io/befreed-ai/opentag` (private) and stay there (`.2` has a client release only, no server image).
 
 Tag format: `<upstream-version>-befreed.<n>`, for example `0.1.5-befreed.1`. The base must equal the source's upstream
 version (`apps/cli/package.json`); `n` is never reused (the run refuses when the image tag or the git tag
 `befreed-server-v<version>` exists). The git tag records the exact source SHA.
 
 ```bash
-gh workflow run "BeFreed server image" --repo BeFreed-ai/opentag \
+gh workflow run "BeFreed server image" --repo BeFreed-ai/opentag --ref befreed/release-0.1.4 \
   -f version=0.1.5-befreed.1 -f ref=<our release branch or SHA>
 gh run watch --repo BeFreed-ai/opentag
 ```
@@ -81,11 +81,13 @@ gh run watch --repo BeFreed-ai/opentag
 One-time, by an owner of the AWS account: deploy that registry stack (it needs the numeric ids of this repository and
 the release branch name; the steps are in BeFreed's internal runbook), then set the repository variable:
 `gh variable set OPENTAG_ECR_PUSH_ROLE_ARN --repo BeFreed-ai/opentag --body <PushRoleArn output>`. The server box pulls from ECR with its own
-instance role (the stack attaches a read-only policy to it), so nothing has to be logged in on the box.
+instance role (the stack attaches a read-only policy to it): no credential is stored on the box; the deploy logs it in to ECR with that role for the duration of the pull and logs it out again.
+
+**Dispatch the workflow from the release branch** (`--ref befreed/release-0.1.4`, as above). The AWS login trusts only that branch; `-f ref=` only chooses what is checked out and built, it does not change which branch the workflow runs from. Run from another branch (for example the default branch) the login fails with `Not authorized to perform sts:AssumeRoleWithWebIdentity`. Every step after the login can see the push role's short-lived credentials, including the test steps; the workflow is manual, only people with write access can run it, and the role can only push new immutable tags to one repository.
 
 **This repository and its images are public (it is a fork of a public repository).** Never commit a secret, a customer value, an internal
-identifier (account ids, instance ids, bucket names) or private code here. An audit on 2026-11-19 of the images `.1` to `.5` and of all
-90 commits of this fork found none.
+identifier (account ids, instance ids, bucket names) or private code here. An audit on 2026-11-19 of the images `.1`, `.3`, `.4` and `.5` and of every
+commit of this fork that upstream does not have found none.
 
 Platform: `linux/amd64` only (the OpenTag host is x86_64). Provenance and SBOM attestations are off so the tag is a
 plain single-platform manifest. Pin by digest when you want byte-for-byte certainty; the workflow summary prints it.
@@ -108,19 +110,21 @@ On the host (as the user that owns `/opt/opentag`), placeholders in angle bracke
 cd /opt/opentag
 cp .env ".env.bak.$(date +%Y%m%d-%H%M%S)"                 # keep it; it holds the OLD image line
 grep '^OPENTAG_IMAGE=' .env                               # write down the current value = the rollback target
-sed -i 's|^OPENTAG_IMAGE=.*|OPENTAG_IMAGE=ghcr.io/befreed-ai/opentag:<version>|' .env
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <ecr registry>   # the host's instance role; nothing is stored
+sed -i 's|^OPENTAG_IMAGE=.*|OPENTAG_IMAGE=<ecr registry>/opentag-server:<version>|' .env
 docker compose pull opentag && docker compose up -d       # service name: use the one in docker-compose.yml
+docker logout <ecr registry>
 docker compose ps                                         # opentag healthy (the image has a /healthz healthcheck)
 curl -fsS http://127.0.0.1:8000/healthz
 ```
 
-Rollback (any time before the first schedule is created through the new route; and also after, since no schema
-changed, the created schedules simply stay and keep firing):
+Rollback, when the old image and the database have the same migration count (see above; otherwise restoring the pre-change dump is part of it). The previous version is
+normally still on the host, and a private GHCR name cannot be pulled without a login, so do not pull:
 
 ```bash
 cd /opt/opentag
-sed -i 's|^OPENTAG_IMAGE=.*|OPENTAG_IMAGE=<the old value you wrote down, e.g. ghcr.io/first-tree-ai/opentag:606a58b0...>|' .env
-docker compose pull opentag && docker compose up -d
+sed -i 's|^OPENTAG_IMAGE=.*|OPENTAG_IMAGE=<the old value you wrote down, e.g. ghcr.io/befreed-ai/opentag:0.1.5-befreed.5>|' .env
+docker compose up -d --pull never
 ```
 
 Verify after a swap: `GET /healthz` is 200; the Web App loads; an existing schedule listing returns; the new route

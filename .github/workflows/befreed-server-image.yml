@@ -83,6 +83,7 @@ jobs:
           base="$(node -p "require('./apps/cli/package.json').version")"
           [ "${VERSION%%-befreed.*}" = "$base" ] || {
             echo "version base ${VERSION%%-befreed.*} does not match the source's upstream version $base"; exit 1; }
+          [ -n "$ECR_REGISTRY" ] || { echo "the ECR login step reported no registry host"; exit 1; }
           image="${ECR_REGISTRY}/opentag-server"
           tag="befreed-server-v${VERSION}"
           if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
