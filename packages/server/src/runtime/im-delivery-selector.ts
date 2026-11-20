@@ -10,11 +10,14 @@ import {
   type DeliveryCursor,
   DeliveryCustodySnapshot,
   deliveryCandidatePage,
+  type LocalSessionConcurrencyPolicy,
   loadDeliveryContexts,
   lockDeliveryCandidate,
   readDeliveryCustody,
   readPendingHead,
 } from "./im-delivery-work-query.js";
+
+export type LocalSessionConcurrencyResolver = (context: DeliveryContext) => LocalSessionConcurrencyPolicy | undefined;
 
 function readyCandidate(row: DeliveryCandidate, context: DeliveryContext) {
   return (
@@ -30,6 +33,7 @@ export function eligibleDeliveryCandidate(
   context: DeliveryContext | undefined,
   custody: DeliveryCustodySnapshot,
   targeted = false,
+  localSessionConcurrency?: LocalSessionConcurrencyPolicy,
 ): context is DeliveryContext & { computerId: string; computerKind: "local" | "cloud"; generation: number } {
   // A parked pending dispatch stays out of the work set; the scan excludes it in SQL as well.
   if (parkedDelivery(row)) return false;
@@ -51,12 +55,15 @@ export function eligibleDeliveryCandidate(
           (context.computerKind === "cloud" || row.steerTargetDeliveryId !== null)))) ||
     (row.state === "expired" && row.dispatchRequestId !== null);
   if (!dueInput) return false;
-  const other = custody.other({
-    deliveryId: row.id,
-    sessionId: row.sessionId,
-    agentId: context.agentId,
-    computerKind: context.computerKind,
-  });
+  const other = custody.other(
+    {
+      deliveryId: row.id,
+      sessionId: row.sessionId,
+      agentId: context.agentId,
+      computerKind: context.computerKind,
+    },
+    localSessionConcurrency,
+  );
   const steer = canSteerCandidate(row, custody);
   return !other || !!steer;
 }
@@ -73,7 +80,10 @@ export class ImDeliverySelector {
   #cursor: DeliveryCursor | undefined;
   #dueBefore: Date | undefined;
 
-  constructor(readonly database: DatabaseClient) {}
+  constructor(
+    readonly database: DatabaseClient,
+    readonly localSessionConcurrency?: LocalSessionConcurrencyResolver,
+  ) {}
 
   invalidate(sessionId?: string) {
     if (sessionId) this.#cache.delete(sessionId);
@@ -126,7 +136,16 @@ export class ImDeliverySelector {
     for (const row of rows) {
       if (!sessionId) this.#cursor = { time: row.cursorTime, id: row.id };
       const context = contexts.get(row.sessionId);
-      if (!eligibleDeliveryCandidate(row, context, custody, !!sessionId)) continue;
+      if (
+        !eligibleDeliveryCandidate(
+          row,
+          context,
+          custody,
+          !!sessionId,
+          context && this.localSessionConcurrency?.(context),
+        )
+      )
+        continue;
       if (row.state === "pending" && row.dispatchRequestId === null && inboundPending.has(context.agentId)) continue;
       if (await this.#ordered(row, context, heads)) yield { row, context };
     }
@@ -171,6 +190,7 @@ export async function lockEligibleDelivery(
   expectedAgentId: string,
   now: Date,
   sessionId?: string,
+  localSessionConcurrency?: LocalSessionConcurrencyResolver,
 ) {
   await lockImAgentCustody(database, expectedAgentId);
   const delivery = await lockDeliveryCandidate(database, deliveryId, now);
@@ -179,7 +199,11 @@ export async function lockEligibleDelivery(
   const contexts = await loadDeliveryContexts(database, [delivery.sessionId, ...rows.map((row) => row.sessionId)]);
   const context = contexts.get(delivery.sessionId);
   const custody = new DeliveryCustodySnapshot(rows, contexts);
-  if (!eligibleDeliveryCandidate(delivery, context, custody, !!sessionId) || context.agentId !== expectedAgentId)
+  const policy = context && localSessionConcurrency?.(context);
+  if (
+    !eligibleDeliveryCandidate(delivery, context, custody, !!sessionId, policy) ||
+    context.agentId !== expectedAgentId
+  )
     return undefined;
   if (
     delivery.state === "pending" &&
@@ -189,7 +213,7 @@ export async function lockEligibleDelivery(
     return undefined;
   if (needsPendingOrder(delivery, context) && (await readPendingHead(database, delivery.sessionId)) !== delivery.id)
     return undefined;
-  return { row: { ...delivery, ...context }, custody };
+  return { row: { ...delivery, ...context }, custody, localSessionConcurrency: policy };
 }
 
 function canSteerCandidate(row: DeliveryCandidate, custody: DeliveryCustodySnapshot): boolean {

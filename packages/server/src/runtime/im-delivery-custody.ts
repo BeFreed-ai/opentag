@@ -15,7 +15,12 @@ import type { DatabaseClient, DatabaseTransaction } from "../db/client.js";
 import { imBindings, imMessageDeliveries, imMessages, type sessions } from "../db/schema/index.js";
 import { threadRootExternalId } from "../services/im/provider-thread-context.js";
 import { deliveryMessageText, ImDeliveryInputError } from "./im-delivery-content.js";
-import { DeliveryCustodySnapshot, loadDeliveryContexts, readDeliveryCustody } from "./im-delivery-work-query.js";
+import {
+  DeliveryCustodySnapshot,
+  type LocalSessionConcurrencyPolicy,
+  loadDeliveryContexts,
+  readDeliveryCustody,
+} from "./im-delivery-work-query.js";
 import { runtimeProviderMessageRef } from "./runtime-provider-message-ref.js";
 
 /**
@@ -51,12 +56,17 @@ export interface DeliveryOccupancySubject {
   computerKind: "local" | "cloud";
 }
 
-export function deliveryOccupancyScope(subject: {
-  computerKind: "local" | "cloud";
-  agentId: string;
-  sessionId: string;
-}): DeliveryOccupancyScope {
-  return subject.computerKind === "cloud"
+export type { LocalSessionConcurrencyPolicy } from "./im-delivery-work-query.js";
+
+export function deliveryOccupancyScope(
+  subject: {
+    computerKind: "local" | "cloud";
+    agentId: string;
+    sessionId: string;
+  },
+  localSessionConcurrency?: LocalSessionConcurrencyPolicy,
+): DeliveryOccupancyScope {
+  return subject.computerKind === "cloud" || localSessionConcurrency
     ? { kind: "session", agentId: subject.agentId, sessionId: subject.sessionId }
     : { kind: "agent", agentId: subject.agentId };
 }
@@ -65,8 +75,12 @@ export function occupancyScopeKey(scope: DeliveryOccupancyScope): string {
   return scope.kind === "agent" ? `agent:${scope.agentId}` : `session:${scope.sessionId}`;
 }
 
-export async function hasOtherCustody(database: CustodyQuery, subject: DeliveryOccupancySubject): Promise<boolean> {
-  return (await findOtherCustody(database, subject)) !== undefined;
+export async function hasOtherCustody(
+  database: CustodyQuery,
+  subject: DeliveryOccupancySubject,
+  localSessionConcurrency?: LocalSessionConcurrencyPolicy,
+): Promise<boolean> {
+  return (await findOtherCustody(database, subject, localSessionConcurrency)) !== undefined;
 }
 
 /**
@@ -75,13 +89,17 @@ export async function hasOtherCustody(database: CustodyQuery, subject: DeliveryO
  * Worker has only claimed (not committed) leave no durable trace, which is why the claim itself
  * rechecks the same snapshot rule under the Agent-scoped advisory lock.
  */
-export async function findOtherCustody(database: CustodyQuery, subject: DeliveryOccupancySubject) {
+export async function findOtherCustody(
+  database: CustodyQuery,
+  subject: DeliveryOccupancySubject,
+  localSessionConcurrency?: LocalSessionConcurrencyPolicy,
+) {
   const rows = await readDeliveryCustody(database);
   const contexts = await loadDeliveryContexts(
     database,
     rows.map((row) => row.sessionId),
   );
-  return new DeliveryCustodySnapshot(rows, contexts).other(subject);
+  return new DeliveryCustodySnapshot(rows, contexts).other(subject, localSessionConcurrency);
 }
 
 /** The columns that define ingress order within one Session. */

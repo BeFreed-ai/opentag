@@ -127,6 +127,8 @@ export interface ImDeliveryWorkerInput {
   operationTimeoutMs?: number;
   maxQueueAgeMs?: number;
   maxConcurrent?: number;
+  /** Capability-gated Local delivery ceiling by Computer. Omitted Computers remain serial. */
+  localSessionConcurrencyLimits?: ReadonlyMap<string, number>;
   /** Per-lane queue bound: one lane per Local Agent or per Cloud Session. */
   maxQueuedPerAgent?: number;
   maxQueuedTotal?: number;
