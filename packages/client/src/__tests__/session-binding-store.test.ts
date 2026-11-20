@@ -391,14 +391,14 @@ describe("SessionBindingStore", () => {
       });
       await writeFile(snapshotPath(fixture.home, "agent-1", oldHashes.effectiveSnapshotHash), JSON.stringify(old));
       await writeFile(path, JSON.stringify(binding));
-      const next: EffectiveRuntimeSnapshot = {
+      const next = {
         ...old,
         ...change,
         revision: {
           agent: { sequence: 2, id: "agent-revision-2" },
           session: { sequence: 2, id: "session-revision-2" },
         },
-      };
+      } as EffectiveRuntimeSnapshot;
       const request = { ...fixture.reconcile, requestId: randomUUID(), runtime: next };
       const hashes = computeRuntimeSnapshotHashes(next);
       await fixture.store.validatePreparation(request, hashes);
