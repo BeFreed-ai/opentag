@@ -63,8 +63,10 @@ passed authentication, the operator allow-list and the ownership check. It never
 
 ## Image build and publish (S1)
 
-Registry: `ghcr.io/befreed-ai/opentag`. It uses only the workflow's default `GITHUB_TOKEN` (`packages: write`,
-`contents: write`): no new secrets, no AWS, no IAM.
+Registry: the **private ECR repository `opentag-server`** in BeFreed's AWS account (created by a CloudFormation stack that BeFreed keeps
+internally). The workflow logs in to AWS with a short-lived GitHub OIDC credential (a role trusted for exactly this repository and the
+release branch, allowed to push to that one repository only): no key or token is stored in GitHub. The one setting is the non-secret repository variable
+`OPENTAG_ECR_PUSH_ROLE_ARN`. Versions `0.1.5-befreed.1` to `.5` were published to `ghcr.io/befreed-ai/opentag` (private) and stay there.
 
 Tag format: `<upstream-version>-befreed.<n>`, for example `0.1.5-befreed.1`. The base must equal the source's upstream
 version (`apps/cli/package.json`); `n` is never reused (the run refuses when the image tag or the git tag
@@ -76,20 +78,29 @@ gh workflow run "BeFreed server image" --repo BeFreed-ai/opentag \
 gh run watch --repo BeFreed-ai/opentag
 ```
 
-One-time, by an org owner (the workflow cannot do it): the first push creates the GHCR package as **private**. Either
-make it public (GitHub -> Organization -> Packages -> `opentag` -> Package settings -> Change visibility) so the host
-can pull anonymously like it does for the upstream image today, or create a read-only token with `read:packages`
-and `docker login ghcr.io` on the host (that token is a new secret; do not put it in the repository).
+One-time, by an owner of the AWS account: deploy that registry stack (it needs the numeric ids of this repository and
+the release branch name; the steps are in BeFreed's internal runbook), then set the repository variable:
+`gh variable set OPENTAG_ECR_PUSH_ROLE_ARN --repo BeFreed-ai/opentag --body <PushRoleArn output>`. The server box pulls from ECR with its own
+instance role (the stack attaches a read-only policy to it), so nothing has to be logged in on the box.
+
+**This repository and its images are public (it is a fork of a public repository).** Never commit a secret, a customer value, an internal
+identifier (account ids, instance ids, bucket names) or private code here. An audit on 2026-11-19 of the images `.1` to `.5` and of all
+90 commits of this fork found none.
 
 Platform: `linux/amd64` only (the OpenTag host is x86_64). Provenance and SBOM attestations are off so the tag is a
 plain single-platform manifest. Pin by digest when you want byte-for-byte certainty; the workflow summary prints it.
 
 ## Deploy runbook (EC2 + docker compose) and rollback
 
+**Use BeFreed's internal server release tool and read its runbook first.** It runs the gates, takes the snapshot and the dump, swaps the image, verifies it and puts the
+old one back on failure. The hand-typed steps below are the manual fallback.
+
 Prerequisites: not during the daily SEO round (a restart cuts a running agent turn, and the Server is a single
 instance); a fresh EBS snapshot and a fresh `pg_dump` (same as the 0.1.5 upgrade); the image above exists and is
-pullable from the host. S2 adds **no migration**, so the swap is symmetric and the rollback is a one-line revert. (A
-future patch that adds a migration breaks that symmetry: upstream migrations are not rolled back with the image.)
+pullable from the host. **Count the migrations before you swap**: `0.1.5-befreed.1`, `.3` and `.4` carry 73 migration files and `0.1.5-befreed.5` carries 74
+(`0073_agent_schedules_fresh_session`), so an earlier statement here that our patches add no migration is no longer true. A swap to an image with
+the same migration count as the database is symmetric and the rollback is a one-line revert; an image with more (or a database that is ahead of the image
+you go back to) is not: upstream migrations are not rolled back with the image, and undoing one means restoring the pre-change dump.
 
 On the host (as the user that owns `/opt/opentag`), placeholders in angle brackets:
 
