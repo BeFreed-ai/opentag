@@ -10,7 +10,7 @@ Baseline: upstream tag `v0.1.5` (`606a58b05541b0c4073b157374d05771f3d6fb4e`). Th
 
 ## Our patches against upstream v0.1.5
 
-Every patch is small, default-off or diagnostics-only, and adds no database migration.
+Every patch is small, default-off or diagnostics-only. Up to `0.1.5-befreed.4` none added a database migration; **`0.1.5-befreed.5` adds one** (`0073_agent_schedules_fresh_session`), see the deploy runbook.
 
 | # | Area | Files | Why | Default |
 |---|------|-------|-----|---------|
