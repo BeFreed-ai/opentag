@@ -17,12 +17,16 @@ const NON_IDENTITY_FIELDS = [
 ] as const;
 
 export function claudeConversationContinues(
-  currentProvider: string,
-  hasRuntimeBinding: boolean,
+  current: { provider: string; runtimeBinding?: unknown },
+  legacyLayout: unknown,
   stored: unknown,
   next: EffectiveRuntimeSnapshot,
 ): boolean {
-  if (currentProvider !== "claude-code" || !hasRuntimeBinding || next.provider !== "claude-code") return false;
+  // A snapshot saved in a frozen legacy layout is compared by its own rules, never here.
+  if (legacyLayout !== undefined) return false;
+  if (current.provider !== "claude-code" || current.runtimeBinding === undefined || next.provider !== "claude-code") {
+    return false;
+  }
   const old = EffectiveRuntimeSnapshotSchema.safeParse(stored);
   if (!old.success || old.data.provider !== "claude-code") return false;
   return identity(old.data) === identity(next);

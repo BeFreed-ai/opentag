@@ -461,9 +461,9 @@ export class SessionBindingStore {
     assertSnapshotRevisions(old, runtime, oldHashes, nextHashes, layout ? "conflict" : "stale");
     const compatibleLegacy =
       layout !== undefined && nextHashes.effectiveSnapshotHash === oldHashes.effectiveSnapshotHash;
-    const sameConversation =
-      !layout && claudeConversationContinues(current.provider, current.runtimeBinding !== undefined, old, runtime);
-    return unchanged || compatibleLegacy || sameConversation ? current.runtimeBinding : undefined;
+    return unchanged || compatibleLegacy || claudeConversationContinues(current, layout, old, runtime)
+      ? current.runtimeBinding
+      : undefined;
   }
 
   async #requireBinding(agentId: string, sessionId: string): Promise<LocalSessionBinding> {
