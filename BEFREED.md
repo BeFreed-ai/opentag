@@ -10,7 +10,7 @@ Baseline: upstream tag `v0.1.5` (`606a58b05541b0c4073b157374d05771f3d6fb4e`). Th
 
 ## Our patches against upstream v0.1.5
 
-Every patch is small, default-off or diagnostics-only, and adds no database migration.
+Every patch is small, default-off or diagnostics-only. Up to `0.1.5-befreed.4` none added a database migration; **`0.1.5-befreed.5` adds one** (`0073_agent_schedules_fresh_session`), see the deploy runbook.
 
 | # | Area | Files | Why | Default |
 |---|------|-------|-----|---------|
@@ -18,7 +18,7 @@ Every patch is small, default-off or diagnostics-only, and adds no database migr
 | C2 | Client | `packages/client/src/runtime/context-tree-command-diagnostics.ts`, `context-tree-commands.ts` (+ tests) | Log Context Tree gateway failures (diagnostics only) | on |
 | C3 | Client build | `scripts/befreed/set-fork-version.mjs`, `scripts/portable/build-portable.mjs` | Allow the `<stable>-befreed.<n>` version label | n/a |
 | C4 | CI | `.github/workflows/befreed-client-release.yml`, `befreed-upstream-sync.yml` | Fork client release; weekly "upstream has something new" PR inside the fork | manual / weekly |
-| S1 | Server build | `.github/workflows/befreed-server-image.yml` | Upstream's `docker.yml` only runs in the upstream repo; this builds the same Dockerfile (`runtime` target) and pushes to GHCR in our namespace | manual |
+| S1 | Server build | `.github/workflows/befreed-server-image.yml` | Upstream's `docker.yml` only runs in the upstream repo; this builds the same Dockerfile (`runtime` target) and pushes to our private ECR repository (until 2026-11: a private GHCR package) | manual |
 | S2 | Server | new `packages/server/src/services/schedules/operator-service.ts`, `packages/server/src/api/operator-schedules.ts`, `packages/server/src/operator-routes-config.ts`; wiring in `packages/server/src/app.ts` (+8 lines) and `packages/server/src/index.ts` (+9 lines) | Operator-only account route to create a schedule for an agent, with no inbound IM message (cron, one-time `at`, or "run in N seconds") | **off** |
 | S3 | Server tests | `packages/server/src/__tests__/operator-schedule-api.test.ts`, `operator-routes-config.test.ts`, `__tests__/integration/operator-schedules.test.ts` | Tests for S2 | n/a |
 
@@ -63,33 +63,46 @@ passed authentication, the operator allow-list and the ownership check. It never
 
 ## Image build and publish (S1)
 
-Registry: `ghcr.io/befreed-ai/opentag`. It uses only the workflow's default `GITHUB_TOKEN` (`packages: write`,
-`contents: write`): no new secrets, no AWS, no IAM.
+Registry: the **private ECR repository `opentag-server`** in BeFreed's AWS account (created by a CloudFormation stack that BeFreed keeps
+internally). The workflow logs in to AWS with a short-lived GitHub OIDC credential (a role trusted for exactly this repository and the
+release branch, allowed to push to that one repository only): no key or token is stored in GitHub. The one setting is the non-secret repository variable
+`OPENTAG_ECR_PUSH_ROLE_ARN`. Versions `0.1.5-befreed.1`, `.3`, `.4` and `.5` were published to `ghcr.io/befreed-ai/opentag` (private) and stay there (`.2` has a client release only, no server image).
 
 Tag format: `<upstream-version>-befreed.<n>`, for example `0.1.5-befreed.1`. The base must equal the source's upstream
 version (`apps/cli/package.json`); `n` is never reused (the run refuses when the image tag or the git tag
 `befreed-server-v<version>` exists). The git tag records the exact source SHA.
 
 ```bash
-gh workflow run "BeFreed server image" --repo BeFreed-ai/opentag \
+gh workflow run "BeFreed server image" --repo BeFreed-ai/opentag --ref befreed/release-0.1.4 \
   -f version=0.1.5-befreed.1 -f ref=<our release branch or SHA>
 gh run watch --repo BeFreed-ai/opentag
 ```
 
-One-time, by an org owner (the workflow cannot do it): the first push creates the GHCR package as **private**. Either
-make it public (GitHub -> Organization -> Packages -> `opentag` -> Package settings -> Change visibility) so the host
-can pull anonymously like it does for the upstream image today, or create a read-only token with `read:packages`
-and `docker login ghcr.io` on the host (that token is a new secret; do not put it in the repository).
+One-time, by an owner of the AWS account: deploy that registry stack (it needs the numeric ids of this repository and
+the release branch name; the steps are in BeFreed's internal runbook), then set the repository variable:
+`gh variable set OPENTAG_ECR_PUSH_ROLE_ARN --repo BeFreed-ai/opentag --body <PushRoleArn output>`. The server box pulls from ECR with its own
+instance role (the stack attaches a read-only policy to it): no credential is stored on the box; the deploy logs it in to ECR with that role for the duration of the pull and logs it out again.
+
+**Dispatch the workflow from the release branch** (`--ref befreed/release-0.1.4`, as above). The AWS login trusts only that branch; `-f ref=` only chooses what is checked out and built, it does not change which branch the workflow runs from. Run from another branch (for example the default branch) the login fails with `Not authorized to perform sts:AssumeRoleWithWebIdentity`. Every step after the login can see the push role's short-lived credentials, including the test steps; the workflow is manual, only people with write access can run it, and the role can only push new immutable tags to one repository.
+
+**This repository and its images are public (it is a fork of a public repository).** Never commit a secret, a customer value, an internal
+identifier (account ids, instance ids, bucket names) or private code here. An audit on 2026-11-19 of the images `.1`, `.3`, `.4` and `.5` and of every
+commit of this fork that upstream does not have found none.
 
 Platform: `linux/amd64` only (the OpenTag host is x86_64). Provenance and SBOM attestations are off so the tag is a
 plain single-platform manifest. Pin by digest when you want byte-for-byte certainty; the workflow summary prints it.
 
 ## Deploy runbook (EC2 + docker compose) and rollback
 
+**Use BeFreed's internal server release tool and read its runbook first.** It runs the gates, takes the snapshot and the dump, swaps the image, verifies it and puts the
+old one back on failure. The hand-typed steps below are the manual fallback; if a command fails after `docker login`, run `docker logout <ecr registry>` anyway so no ECR login stays in `~/.docker/config.json`.
+
 Prerequisites: not during the daily SEO round (a restart cuts a running agent turn, and the Server is a single
 instance); a fresh EBS snapshot and a fresh `pg_dump` (same as the 0.1.5 upgrade); the image above exists and is
-pullable from the host. S2 adds **no migration**, so the swap is symmetric and the rollback is a one-line revert. (A
-future patch that adds a migration breaks that symmetry: upstream migrations are not rolled back with the image.)
+pullable from the host. **Count the migrations before you swap**: `0.1.5-befreed.1`, `.3` and `.4` carry 73 migration files and `0.1.5-befreed.5` carries 74
+(`0073_agent_schedules_fresh_session`), so an earlier statement here that our patches add no migration is no longer true. A swap to an image with
+the same migration count as the database is symmetric and the rollback is a one-line revert; an image with more (or a database that is ahead of the image
+you go back to) is not: upstream migrations are not rolled back with the image, and undoing one means restoring the pre-change dump.
 
 On the host (as the user that owns `/opt/opentag`), placeholders in angle brackets:
 
@@ -97,19 +110,21 @@ On the host (as the user that owns `/opt/opentag`), placeholders in angle bracke
 cd /opt/opentag
 cp .env ".env.bak.$(date +%Y%m%d-%H%M%S)"                 # keep it; it holds the OLD image line
 grep '^OPENTAG_IMAGE=' .env                               # write down the current value = the rollback target
-sed -i 's|^OPENTAG_IMAGE=.*|OPENTAG_IMAGE=ghcr.io/befreed-ai/opentag:<version>|' .env
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <ecr registry>   # the host's instance role; nothing is stored
+sed -i 's|^OPENTAG_IMAGE=.*|OPENTAG_IMAGE=<ecr registry>/opentag-server:<version>|' .env
 docker compose pull opentag && docker compose up -d       # service name: use the one in docker-compose.yml
+docker logout <ecr registry>
 docker compose ps                                         # opentag healthy (the image has a /healthz healthcheck)
 curl -fsS http://127.0.0.1:8000/healthz
 ```
 
-Rollback (any time before the first schedule is created through the new route; and also after, since no schema
-changed, the created schedules simply stay and keep firing):
+Rollback, when the old image and the database have the same migration count (see above; otherwise restoring the pre-change dump is part of it). The previous version is
+normally still on the host, and a private GHCR name cannot be pulled without a login, so do not pull:
 
 ```bash
 cd /opt/opentag
-sed -i 's|^OPENTAG_IMAGE=.*|OPENTAG_IMAGE=<the old value you wrote down, e.g. ghcr.io/first-tree-ai/opentag:606a58b0...>|' .env
-docker compose pull opentag && docker compose up -d
+sed -i 's|^OPENTAG_IMAGE=.*|OPENTAG_IMAGE=<the old value you wrote down, e.g. ghcr.io/befreed-ai/opentag:0.1.5-befreed.5>|' .env
+docker compose up -d --pull never
 ```
 
 Verify after a swap: `GET /healthz` is 200; the Web App loads; an existing schedule listing returns; the new route

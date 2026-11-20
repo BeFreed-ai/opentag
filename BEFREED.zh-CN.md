@@ -1,7 +1,7 @@
 # OpenTag 的 BeFreed 分叉
 
 > Canonical source: [BEFREED.md](./BEFREED.md)
-> Last synced with: 2026-11-08
+> Last synced with: 2026-11-19
 
 本仓库是 `BeFreed-ai/opentag`，即 `first-tree-ai/opentag`（Apache-2.0）的分叉。它**不是**上游正式发布版，也不得以上游产品的名义呈现（见 `NOTICE`）。我们的工作绝不在上游仓库开 PR、issue 或评论；所有改动先落在本仓库。
 
@@ -9,7 +9,7 @@
 
 ## 我们相对上游 v0.1.5 的补丁
 
-每个补丁都很小，默认关闭或仅做诊断，且不新增数据库迁移。
+每个补丁都很小，默认关闭或仅做诊断。到 `0.1.5-befreed.4` 为止都没有新增数据库迁移；**`0.1.5-befreed.5` 新增了一个**（`0073_agent_schedules_fresh_session`），见部署手册。
 
 | # | 范围 | 文件 | 目的 | 默认 |
 |---|------|------|------|------|
@@ -17,7 +17,7 @@
 | C2 | 客户端 | `packages/client/src/runtime/context-tree-command-diagnostics.ts`、`context-tree-commands.ts`（含测试） | 记录 Context Tree 网关失败（仅诊断） | 开 |
 | C3 | 客户端构建 | `scripts/befreed/set-fork-version.mjs`、`scripts/portable/build-portable.mjs` | 允许 `<稳定版>-befreed.<n>` 版本标签 | 不适用 |
 | C4 | CI | `.github/workflows/befreed-client-release.yml`、`befreed-upstream-sync.yml` | 分叉客户端发布；每周在分叉内开"上游有新内容"的提醒 PR | 手动 / 每周 |
-| S1 | 服务器构建 | `.github/workflows/befreed-server-image.yml` | 上游 `docker.yml` 只在上游仓库运行；本流水线用同一个 Dockerfile（`runtime` 目标）构建并推到我们自己命名空间下的 GHCR | 手动 |
+| S1 | 服务器构建 | `.github/workflows/befreed-server-image.yml` | 上游 `docker.yml` 只在上游仓库运行；本流水线用同一个 Dockerfile（`runtime` 目标）构建并推到我们自己的私有 ECR 仓库（2026-11 之前是私有 GHCR 包） | 手动 |
 | S2 | 服务器 | 新增 `packages/server/src/services/schedules/operator-service.ts`、`packages/server/src/api/operator-schedules.ts`、`packages/server/src/operator-routes-config.ts`；接线在 `packages/server/src/app.ts`（+8 行）和 `packages/server/src/index.ts`（+9 行） | 运营专用的账号级路由：为 agent 创建定时任务，无需入站 IM 消息（cron、一次性 `at`、或"N 秒后运行"） | **关** |
 | S3 | 服务器测试 | `packages/server/src/__tests__/operator-schedule-api.test.ts`、`operator-routes-config.test.ts`、`__tests__/integration/operator-schedules.test.ts` | S2 的测试 | 不适用 |
 
@@ -37,23 +37,29 @@ S2 复用上游代码处理所有规则：`ScheduleService.createForAgent` 校�
 
 ## 镜像构建与发布（S1）
 
-镜像仓库：`ghcr.io/befreed-ai/opentag`。只用工作流默认的 `GITHUB_TOKEN`（`packages: write`、`contents: write`）：不需要新密钥、不涉及 AWS 和 IAM。
+镜像仓库：BeFreed 的 AWS 账号里的**私有 ECR 仓库 `opentag-server`**（由 BeFreed 内部维护的一个 CloudFormation 栈创建）。工作流用 GitHub 的短期 OIDC 凭据登录 AWS（一个只信任本仓库和发布分支、只能往这一个仓库推镜像的角色）：GitHub 里不存任何密钥或令牌。唯一的设置是不含机密的仓库变量 `OPENTAG_ECR_PUSH_ROLE_ARN`。版本 `0.1.5-befreed.1`、`.3`、`.4`、`.5` 发布在 `ghcr.io/befreed-ai/opentag`（私有），留在原处（`.2` 只有客户端发布，没有服务器镜像）。
 
 标签格式：`<上游版本>-befreed.<n>`，例如 `0.1.5-befreed.1`。基础版本必须等于源码的上游版本（`apps/cli/package.json`）；`n` 绝不重用（镜像标签或 git 标签 `befreed-server-v<version>` 已存在时运行会拒绝）。git 标签记录确切的源码 SHA。
 
 ```bash
-gh workflow run "BeFreed server image" --repo BeFreed-ai/opentag \
+gh workflow run "BeFreed server image" --repo BeFreed-ai/opentag --ref befreed/release-0.1.4 \
   -f version=0.1.5-befreed.1 -f ref=<我们的发布分支或 SHA>
 gh run watch --repo BeFreed-ai/opentag
 ```
 
-一次性操作，由组织所有者完成（工作流做不到）：首次推送会把 GHCR 包创建为**私有**。要么把它改成公开（GitHub -> 组织 -> Packages -> `opentag` -> Package settings -> Change visibility），让主机像现在拉上游镜像一样匿名拉取；要么创建一个只读（`read:packages`）令牌并在主机上 `docker login ghcr.io`（该令牌是新密钥，不要放进仓库）。
+一次性操作，由 AWS 账号的所有者完成：部署那个镜像仓库栈（需要本仓库和发布分支的数字 ID，步骤在 BeFreed 的内部手册里），然后设置仓库变量：`gh variable set OPENTAG_ECR_PUSH_ROLE_ARN --repo BeFreed-ai/opentag --body <PushRoleArn 输出>`。服务器用自己的实例角色从 ECR 拉取（栈会给它附加一条只读策略）：机器上不存任何凭据；部署时用该角色在拉取期间临时登录 ECR，随后登出。
+
+**必须从发布分支派发这个工作流**（`--ref befreed/release-0.1.4`，如上）。AWS 登录只信任该分支；`-f ref=` 只决定检出和构建什么，不会改变工作流从哪个分支运行。从别的分支（例如默认分支）运行，登录会以 `Not authorized to perform sts:AssumeRoleWithWebIdentity` 失败。登录之后的每个步骤（包括测试步骤）都能看到推送角色的短期凭据；这个工作流是手动的，只有有写权限的人能运行，而该角色只能往一个仓库推送新的、不可改写的标签。
+
+**本仓库及其镜像是公开的（它是公开仓库的分叉）。** 不得在这里提交密钥、客户数据、内部标识（账号 ID、实例 ID、桶名）或私有代码。2026-11-19 对镜像 `.1`、`.3`、`.4`、`.5` 以及本分叉里上游没有的每个提交做过审计，没有发现。
 
 平台：只构建 `linux/amd64`（OpenTag 主机是 x86_64）。关闭了 provenance 和 SBOM 证明，使标签是单平台的普通清单。需要逐字节确定时按摘要（digest）固定；工作流摘要里会打印它。
 
 ## 部署手册（EC2 + docker compose）与回滚
 
-前提：不要在每日 SEO 整轮期间做（重启会切断正在运行的 agent 回合，且服务器是单实例）；先做新的 EBS 快照和新的 `pg_dump`（与 0.1.5 升级时相同）；上面的镜像已存在且主机能拉取。S2 **不新增迁移**，所以换镜像是对称的，回滚就是改回一行。（以后任何带迁移的补丁都会打破这种对称：上游迁移不会随镜像回滚。）
+**请使用 BeFreed 的内部服务器发布工具，并先读它的手册。** 它会跑检查闸门、做快照和备份、换镜像、验证，失败时把旧镜像放回去。下面手敲的步骤是手动备用方案；如果在 `docker login` 之后某条命令失败，也请执行 `docker logout <ecr registry>`，避免 ECR 登录留在 `~/.docker/config.json` 里。
+
+前提：不要在每日 SEO 整轮期间做（重启会切断正在运行的 agent 回合，且服务器是单实例）；先做新的 EBS 快照和新的 `pg_dump`（与 0.1.5 升级时相同）；上面的镜像已存在且主机能拉取。**换之前先数迁移**：`0.1.5-befreed.1`、`.3`、`.4` 有 73 个迁移文件，`0.1.5-befreed.5` 有 74 个（`0073_agent_schedules_fresh_session`），所以这里以前说的“我们的补丁不新增迁移”已经不成立。换到迁移数与数据库相同的镜像是对称的，回滚就是改回一行；镜像迁移更多（或者数据库比要回到的镜像更新）则不对称：上游迁移不会随镜像回滚，撤销一次迁移意味着恢复变更前的备份。
 
 在主机上（以拥有 `/opt/opentag` 的用户），尖括号为占位符：
 
@@ -61,18 +67,20 @@ gh run watch --repo BeFreed-ai/opentag
 cd /opt/opentag
 cp .env ".env.bak.$(date +%Y%m%d-%H%M%S)"                 # 留好；里面有旧的镜像行
 grep '^OPENTAG_IMAGE=' .env                               # 记下当前值 = 回滚目标
-sed -i 's|^OPENTAG_IMAGE=.*|OPENTAG_IMAGE=ghcr.io/befreed-ai/opentag:<version>|' .env
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <ecr registry>   # 主机的实例角色；不存任何凭据
+sed -i 's|^OPENTAG_IMAGE=.*|OPENTAG_IMAGE=<ecr registry>/opentag-server:<version>|' .env
 docker compose pull opentag && docker compose up -d       # 服务名以 docker-compose.yml 中的为准
+docker logout <ecr registry>
 docker compose ps                                         # opentag 健康（镜像带 /healthz 健康检查）
 curl -fsS http://127.0.0.1:8000/healthz
 ```
 
-回滚（任何时候都可以；即使已经通过新路由创建了定时任务也可以，因为表结构没变，已创建的任务会留着并继续触发）：
+回滚，前提是旧镜像和数据库的迁移数相同（见上；否则恢复变更前的备份也是回滚的一部分）。上一个版本通常还留在主机上，而私有的 GHCR 名字没有登录就拉不下来，所以不要拉取：
 
 ```bash
 cd /opt/opentag
-sed -i 's|^OPENTAG_IMAGE=.*|OPENTAG_IMAGE=<你记下的旧值，例如 ghcr.io/first-tree-ai/opentag:606a58b0...>|' .env
-docker compose pull opentag && docker compose up -d
+sed -i 's|^OPENTAG_IMAGE=.*|OPENTAG_IMAGE=<你记下的旧值，例如 ghcr.io/befreed-ai/opentag:0.1.5-befreed.5>|' .env
+docker compose up -d --pull never
 ```
 
 换镜像后验证：`GET /healthz` 为 200；Web 应用能打开；现有定时任务列表能返回；在启用之前新路由仍然不存在（404）。
