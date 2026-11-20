@@ -42,6 +42,7 @@ describe("ClaudeCodeAgentRuntime", () => {
       expect(argumentAfter(processes[0]?.args ?? [], "--plugin-dir")).toMatch(/opentag$/);
       expect(processes[0]?.args).not.toContain("--bare");
       expect(JSON.parse(argumentAfter(processes[0]?.args ?? [], "--settings") as string)).toEqual({
+        hooks: expect.any(Object),
         permissions: {
           allow: expect.arrayContaining([
             "Bash(lark-cli im +messages-reply *)",
@@ -191,7 +192,9 @@ describe("ClaudeCodeAgentRuntime", () => {
     expect(mcpConfig).toContain("opentag-claude-mcp-");
     await expect(readFile(mcpConfig ?? "", "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     expect(processes[0]?.args).not.toContain("--allowedTools");
-    expect(JSON.parse(argumentAfter(processes[0]?.args ?? [], "--settings") as string)).toEqual({});
+    expect(JSON.parse(argumentAfter(processes[0]?.args ?? [], "--settings") as string)).toEqual({
+      hooks: expect.any(Object),
+    });
     await runtime.close();
   });
 

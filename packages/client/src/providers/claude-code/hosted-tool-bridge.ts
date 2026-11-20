@@ -6,6 +6,7 @@ import { join } from "node:path";
 import type { AgentHostedTools, JsonValue } from "../../agent-runtime/types.js";
 import { assertJsonValue } from "../../agent-runtime/validation.js";
 import { createLogger } from "../../observability/logger.js";
+import { MEMORY_WRITE_LOCK_HOOK_SOURCE } from "./memory-write-lock.js";
 import { linkClaudeSkills } from "./skill-plugin.js";
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -21,6 +22,8 @@ export interface ClaudeCodeMcpGatewayEndpoint {
 export interface ClaudeCodeHostedToolBridge {
   readonly allowedTools: readonly string[];
   readonly configPath: string;
+  /** The memory write-lock hook script for this run; absent for bridges that do not provide it. */
+  readonly memoryLockHookPath?: string;
   readonly pluginPath: string;
   close(): Promise<void>;
 }
@@ -47,6 +50,7 @@ export async function startClaudeCodeHostedToolBridge(
   const gatewayServerName = `g${serverId}`;
   // Keep the gateway prefix no longer than the original 11-character server name.
   const configPath = join(directory, "mcp.json");
+  const memoryLockHookPath = join(directory, "memory-write-lock-hook.mjs");
   let server: Server | undefined;
   try {
     await linkClaudeSkills(pluginPath, skillPaths, cwd);
@@ -101,6 +105,7 @@ export async function startClaudeCodeHostedToolBridge(
       };
     }
     await writeFile(configPath, `${JSON.stringify({ mcpServers })}\n`, { encoding: "utf8", mode: 0o600 });
+    await writeFile(memoryLockHookPath, MEMORY_WRITE_LOCK_HOOK_SOURCE, { encoding: "utf8", mode: 0o600 });
     /* v8 ignore start -- deterministic setup tests cannot induce an owned 0600 temp-file write failure. */
   } catch (error) {
     logger.debug(
@@ -128,6 +133,7 @@ export async function startClaudeCodeHostedToolBridge(
       ...(mcpGateway ? [`mcp__${gatewayServerName}`] : []),
     ],
     configPath,
+    memoryLockHookPath,
     pluginPath,
     close() {
       closePromise ??= Promise.allSettled([

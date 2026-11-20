@@ -552,7 +552,7 @@ describe("ClaudeCodeAgentRuntime exhaustive behavior", () => {
         request: withPolicy({ fileSystem: "unrestricted", network: "enabled" }),
         expected: (args) => {
           expect(argumentAfter(args, "--permission-mode")).toBe("bypassPermissions");
-          expect(JSON.parse(argumentAfter(args, "--settings") as string)).toEqual({});
+          expect(JSON.parse(argumentAfter(args, "--settings") as string)).toEqual({ hooks: expect.any(Object) });
           expect(args).not.toContain("--tools");
         },
       },
@@ -562,6 +562,7 @@ describe("ClaudeCodeAgentRuntime exhaustive behavior", () => {
           expect(argumentAfter(args, "--permission-mode")).toBe("acceptEdits");
           expect(argumentAfter(args, "--permission-prompt-tool")).toBe("stdio");
           expect(JSON.parse(argumentAfter(args, "--settings") as string)).toEqual({
+            hooks: expect.any(Object),
             permissions: {
               allow: expect.arrayContaining(["Bash(git status *)"]),
             },
@@ -572,7 +573,7 @@ describe("ClaudeCodeAgentRuntime exhaustive behavior", () => {
         request: withPolicy({ tools: { mode: "allow-list", names: [] } }),
         expected: (args) => {
           expect(argumentAfter(args, "--tools")).toBe("");
-          expect(JSON.parse(argumentAfter(args, "--settings") as string)).toEqual({});
+          expect(JSON.parse(argumentAfter(args, "--settings") as string)).toEqual({ hooks: expect.any(Object) });
         },
       },
       {
@@ -619,6 +620,31 @@ describe("ClaudeCodeAgentRuntime exhaustive behavior", () => {
       item.expected(process.args);
       await runtime.close();
     }
+  });
+
+  it("passes the memory write-lock hook to every turn when the bridge provides the script", async () => {
+    const process = new ManualClaudeCodeProcess([successResult()]);
+    const runtime = await new ClaudeCodeAgentRuntimeFactory({
+      createSessionId: () => SESSION_ID,
+      createProcess: (_cwd, args) => {
+        process.args = args;
+        return process;
+      },
+      startHostedToolBridge: (async () => ({
+        allowedTools: [] as readonly string[],
+        configPath: "/tmp/mcp.json",
+        memoryLockHookPath: "/tmp/run/memory-write-lock-hook.mjs",
+        pluginPath: "/tmp/opentag",
+        close: async () => undefined,
+      })) as never,
+    }).create(createRequest(() => undefined));
+    await runtime.prompt({ runId: "run-memory-lock", input: input("x") });
+    const settings = JSON.parse(argumentAfter(process.args, "--settings") as string);
+    expect(settings.hooks.PreToolUse[0].matcher).toBe("Write|Edit|MultiEdit|NotebookEdit");
+    expect(settings.hooks.PreToolUse[0].hooks[0].command).toContain("/tmp/run/memory-write-lock-hook.mjs");
+    expect(settings.hooks.PreToolUse[0].hooks[0].command).toMatch(/ pre$/);
+    expect(settings.hooks.PostToolUse[0].hooks[0].command).toMatch(/ post$/);
+    await runtime.close();
   });
 
   it("forwards every supported Claude Code effort to the controlled process", async () => {
