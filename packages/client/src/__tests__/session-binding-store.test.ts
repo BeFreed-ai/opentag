@@ -316,6 +316,97 @@ describe("SessionBindingStore", () => {
     },
   );
 
+  it.each([
+    ["an older placement", 1, true],
+    ["the same placement", 2, true],
+    ["a future placement", 3, false],
+  ] as const)("reads a recorded Turn Report from %s", async (_name, reportGeneration, readable) => {
+    const fixture = await bindingFixture();
+    const path = sessionBindingPath(fixture.home, "agent-1", "session-1");
+    const binding = JSON.parse(await readFile(path, "utf8"));
+    const request = { ...delivery(fixture.runtime, 7), placementGeneration: reportGeneration };
+    const report = turnReport(request, "recorded-turn");
+    Object.assign(binding, {
+      placementGeneration: 2,
+      recentRecordedInputs: [
+        {
+          kind: "turn",
+          deliveryId: report.deliveryId,
+          turnId: report.turnId,
+          inputHash: "a".repeat(64),
+          resultHash: report.resultHash,
+          report,
+        },
+      ],
+    });
+    await writeFile(path, JSON.stringify(binding));
+    if (readable) {
+      await expect(fixture.store.read("agent-1", "session-1")).resolves.toMatchObject({ placementGeneration: 2 });
+    } else {
+      await expect(fixture.store.read("agent-1", "session-1")).rejects.toThrow();
+    }
+  });
+
+  it.each([
+    [
+      "instructions and revisions change",
+      "claude-code",
+      { instructions: { platform: "p", agent: "new agent", session: "s2" } },
+      true,
+    ],
+    ["the model changes", "claude-code", { model: "claude-opus-5-5" }, true],
+    ["the reasoning effort changes", "claude-code", { reasoningEffort: "high" }, true],
+    ["self-configuration is enabled", "claude-code", { selfConfigurationEnabled: true }, true],
+    [
+      "the context trees change",
+      "claude-code",
+      { contextTrees: [{ kind: "git", repository: "acme/memory", path: ".", ref: "main" }] },
+      false,
+    ],
+    [
+      "the execution policy changes",
+      "claude-code",
+      { execution: { approvalPolicy: "never", networkAccess: true } },
+      false,
+    ],
+    [
+      "instructions change on another provider",
+      "codex",
+      { instructions: { platform: "p", agent: "new agent", session: "s2" } },
+      false,
+    ],
+  ] as const)(
+    "resumes the native conversation only when it should (%s, %s)",
+    async (_name, provider, change, resumes) => {
+      const fixture = await bindingFixture();
+      const path = sessionBindingPath(fixture.home, "agent-1", "session-1");
+      const binding = JSON.parse(await readFile(path, "utf8"));
+      const old: EffectiveRuntimeSnapshot = { ...fixture.runtime, provider };
+      const oldHashes = computeRuntimeSnapshotHashes(old);
+      Object.assign(binding, {
+        provider,
+        sessionConfigHash: oldHashes.sessionConfigHash,
+        lastEffectiveSnapshotHash: oldHashes.effectiveSnapshotHash,
+        runtimeBinding: { providerId: provider, schemaVersion: 1, payload: { sessionId: "native-session" } },
+      });
+      await writeFile(snapshotPath(fixture.home, "agent-1", oldHashes.effectiveSnapshotHash), JSON.stringify(old));
+      await writeFile(path, JSON.stringify(binding));
+      const next = {
+        ...old,
+        ...change,
+        revision: {
+          agent: { sequence: 2, id: "agent-revision-2" },
+          session: { sequence: 2, id: "session-revision-2" },
+        },
+      } as EffectiveRuntimeSnapshot;
+      const request = { ...fixture.reconcile, requestId: randomUUID(), runtime: next };
+      const hashes = computeRuntimeSnapshotHashes(next);
+      await fixture.store.validatePreparation(request, hashes);
+      const prepared = await fixture.store.prepare(request, hashes);
+      expect(prepared.binding.runtimeBinding).toEqual(resumes ? binding.runtimeBinding : undefined);
+    },
+  );
+
   it("covers custody duplicate, steer receipt, runtime binding, and result guard paths", async () => {
     expect(
       () =>

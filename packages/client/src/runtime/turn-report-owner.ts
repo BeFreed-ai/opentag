@@ -122,6 +122,17 @@ export class TurnReportOwner {
     return this.#pending.size;
   }
 
+  /**
+   * Reports still waiting for the Server's terminal answer. Reports the Server already settled as a terminal failure
+   * stay in `pendingCount` (their fence is retained until a re-arm) but must not use up the submit limit: with 99 such
+   * reports every new report was refused and the client looked alive while doing no work.
+   */
+  get awaitingServerCount(): number {
+    let count = 0;
+    for (const pending of this.#pending.values()) if (!pending.serverStatus) count += 1;
+    return count;
+  }
+
   ready(): Promise<void> {
     return this.#readyPromise;
   }
@@ -163,7 +174,7 @@ export class TurnReportOwner {
     }
     const stored = this.#records.get(report.turnId);
     if (stored?.status === "succeeded") return Promise.resolve();
-    if (this.#pending.size >= this.#maxPending) {
+    if (this.awaitingServerCount >= this.#maxPending) {
       return Promise.reject(new Error("The Turn Report owner reached its pending limit"));
     }
     return this.#createPending(report, confirm, options, stored);

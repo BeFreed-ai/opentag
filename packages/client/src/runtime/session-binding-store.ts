@@ -25,6 +25,7 @@ import {
   validatePrivateDirectory,
   writeDurableJson,
 } from "../storage/durable-file.js";
+import { claudeConversationContinues } from "./claude-session-continuity.js";
 import { agentRuntimePaths, sessionBindingPath, snapshotPath } from "./runtime-paths.js";
 import {
   computeStoredRuntimeSnapshotHashes,
@@ -460,7 +461,9 @@ export class SessionBindingStore {
     assertSnapshotRevisions(old, runtime, oldHashes, nextHashes, layout ? "conflict" : "stale");
     const compatibleLegacy =
       layout !== undefined && nextHashes.effectiveSnapshotHash === oldHashes.effectiveSnapshotHash;
-    return unchanged || compatibleLegacy ? current.runtimeBinding : undefined;
+    return unchanged || compatibleLegacy || claudeConversationContinues(current, layout, old, runtime)
+      ? current.runtimeBinding
+      : undefined;
   }
 
   async #requireBinding(agentId: string, sessionId: string): Promise<LocalSessionBinding> {
@@ -720,7 +723,9 @@ function parseRecordedInput(
       report.turnId !== value.turnId ||
       report.sessionId !== sessionId ||
       report.agentId !== agentId ||
-      report.placementGeneration !== placementGeneration ||
+      // A report recorded under an older placement stays valid after the placement moves on; one from a
+      // future placement does not.
+      report.placementGeneration > placementGeneration ||
       report.resultHash !== value.resultHash)
   ) {
     throw new RuntimeStorageError("invalid", "Recorded Turn Report identity is invalid");
