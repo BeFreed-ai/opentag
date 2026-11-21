@@ -91,6 +91,13 @@ export const SLACK_OPERATIONS: readonly ProviderOperation[] = [
   read("reactions.get", { rewriteResponseJson: rewriteSlackProtectedUrls }),
   read("reactions.list"),
   read("files.info", { rewriteResponseJson: rewriteSlackProtectedUrls }),
+  read("files.list", { rewriteResponseJson: rewriteSlackProtectedUrls }),
+  read("chat.getPermalink"),
+  read("users.conversations"),
+  // Slack answers these two for a user token only; with a bot token it returns not_allowed_token_type. They stay
+  // callable so an agent sees Slack's own answer instead of a proxy refusal (the official server passes them too).
+  read("search.messages", { rewriteResponseJson: rewriteSlackProtectedUrls }),
+  read("search.files", { rewriteResponseJson: rewriteSlackProtectedUrls }),
   read("chat.scheduledMessages.list", { rewriteResponseJson: rewriteSlackProtectedUrls }),
   write("chat.postMessage", { rewriteResponseJson: rewriteSlackProtectedUrls }),
   write("chat.update", { rewriteResponseJson: rewriteSlackProtectedUrls }),
@@ -101,6 +108,7 @@ export const SLACK_OPERATIONS: readonly ProviderOperation[] = [
   write("conversations.open"),
   write("reactions.add"),
   write("reactions.remove"),
+  write("files.delete"),
   write("files.getUploadURLExternal", { rewriteResponseJson: rewriteSlackProtectedUrls }),
   write("files.completeUploadExternal", { rewriteResponseJson: rewriteSlackProtectedUrls }),
 ];
