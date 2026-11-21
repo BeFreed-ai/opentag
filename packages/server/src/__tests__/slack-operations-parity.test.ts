@@ -6,14 +6,35 @@ import { SLACK_OPERATIONS } from "../runtime-credentials/slack-operations.js";
 // history, 2026-11-21). The proxy answers a method outside its table with HTTP 503, which an agent cannot tell
 // from an outage, so a method an agent really uses must stay in the table.
 const METHODS_AGENTS_USE = [
-  "chat.postMessage", "chat.update", "chat.delete", "chat.getPermalink", "chat.scheduleMessage",
-  "chat.scheduledMessages.list", "chat.deleteScheduledMessage",
-  "conversations.history", "conversations.replies", "conversations.list", "conversations.info",
-  "conversations.members", "conversations.open", "conversations.join",
-  "files.info", "files.list", "files.delete", "files.getUploadURLExternal", "files.completeUploadExternal",
-  "reactions.add", "reactions.remove", "reactions.get",
-  "users.info", "users.list", "users.conversations",
-  "team.info", "auth.test", "search.messages", "search.files",
+  "chat.postMessage",
+  "chat.update",
+  "chat.delete",
+  "chat.getPermalink",
+  "chat.scheduleMessage",
+  "chat.scheduledMessages.list",
+  "chat.deleteScheduledMessage",
+  "conversations.history",
+  "conversations.replies",
+  "conversations.list",
+  "conversations.info",
+  "conversations.members",
+  "conversations.open",
+  "conversations.join",
+  "files.info",
+  "files.list",
+  "files.delete",
+  "files.getUploadURLExternal",
+  "files.completeUploadExternal",
+  "reactions.add",
+  "reactions.remove",
+  "reactions.get",
+  "users.info",
+  "users.list",
+  "users.conversations",
+  "team.info",
+  "auth.test",
+  "search.messages",
+  "search.files",
 ];
 
 describe("Slack operation table", () => {
@@ -25,7 +46,13 @@ describe("Slack operation table", () => {
 
   it("keeps one entry per method and still refuses admin, OAuth and app-management methods", () => {
     expect(ids.size).toBe(SLACK_OPERATIONS.length);
-    for (const method of ["admin.users.list", "oauth.v2.access", "apps.manifest.update", "auth.revoke", "users.admin.invite"]) {
+    for (const method of [
+      "admin.users.list",
+      "oauth.v2.access",
+      "apps.manifest.update",
+      "auth.revoke",
+      "users.admin.invite",
+    ]) {
       expect(ids.has(method)).toBe(false);
     }
     expect(() => new ProviderOperationRegistry(SLACK_OPERATIONS)).not.toThrow();
