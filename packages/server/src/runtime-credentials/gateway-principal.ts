@@ -26,7 +26,7 @@
  */
 
 import { createHmac, randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray, or } from "drizzle-orm";
 import type { DatabaseClient } from "../db/client.js";
 import { imBindings, imMessageDeliveries, imMessages, sessionMessages } from "../db/schema/index.js";
 import { MCP_ERROR_CODES, McpServiceError } from "../services/mcp/errors.js";
@@ -74,6 +74,7 @@ export interface GatewayPrincipal {
   user: string | null;
   channel: string | null;
   shared_channel: boolean | null;
+  attention: "direct" | "ambient" | null;
   schedule_id: string | null;
   via_session: string | null;
   creator: GatewayPrincipalIdentity | null;
@@ -87,6 +88,7 @@ function emptyPrincipal(kind: GatewayPrincipalKind): GatewayPrincipal {
     user: null,
     channel: null,
     shared_channel: null,
+    attention: null,
     schedule_id: null,
     via_session: null,
     creator: null,
@@ -103,14 +105,15 @@ interface DeliveryAuthor {
   provider: GatewayPrincipalProvider;
   team: string | null;
   user: string;
-  channel: string;
-  sharedChannel: boolean | null;
 }
 
 /**
- * The human who authored the IM message a delivery belongs to, or `undefined` when there is no such
+ * The human who authored the one IM message a delivery belongs to, or `undefined` when there is no such
  * row, the author is not a human (bot, system), or the provider is not one the contract names.
  * `sessionId` pins the delivery to the Session the caller says it belongs to.
+ *
+ * Used only for a schedule's `creator`, which is one recorded message (the source delivery's own author),
+ * not a turn: the turn rule below does not apply to it.
  */
 async function loadDeliveryAuthor(
   database: DatabaseClient,
@@ -121,8 +124,6 @@ async function loadDeliveryAuthor(
     .select({
       authorKind: imMessages.authorKind,
       authorExternalId: imMessages.authorExternalId,
-      channelId: imMessages.channelId,
-      providerContext: imMessages.providerContext,
       provider: imBindings.provider,
       teamId: imBindings.externalTeamId,
     })
@@ -134,16 +135,98 @@ async function loadDeliveryAuthor(
   if (row?.authorKind !== "human" || !row.authorExternalId) return undefined;
   const provider = knownProvider(row.provider);
   if (!provider) return undefined;
+  return { provider, team: row.teamId ?? null, user: row.authorExternalId };
+}
+
+const TURN_COLUMNS = {
+  id: imMessageDeliveries.id,
+  attention: imMessageDeliveries.attention,
+  authorKind: imMessages.authorKind,
+  authorExternalId: imMessages.authorExternalId,
+  channelId: imMessages.channelId,
+  providerContext: imMessages.providerContext,
+  bindingId: imBindings.id,
+  provider: imBindings.provider,
+  teamId: imBindings.externalTeamId,
+};
+
+/**
+ * Every delivery that drives the turn of `rootDeliveryId`, as of now: the root itself plus each delivery in
+ * the same Session whose steer target is the root (batch members and later steers). A batch member is
+ * stamped with its target before the model can act on it, and while a batch is still being settled it
+ * points at the steer delivery that in turn points at the root, so that second hop is followed too.
+ * (A second accepted delivery with the same `turnId` cannot exist: `turn_id` is unique.)
+ */
+async function loadTurn(database: DatabaseClient, rootDeliveryId: string, sessionId: string) {
+  const inSession = eq(imMessageDeliveries.sessionId, sessionId);
+  const direct = await database
+    .select({ id: imMessageDeliveries.id })
+    .from(imMessageDeliveries)
+    .where(and(inSession, eq(imMessageDeliveries.steerTargetDeliveryId, rootDeliveryId)));
+  const firstHop = direct.map((row) => row.id);
+  const ids = [rootDeliveryId, ...firstHop];
+  return database
+    .select(TURN_COLUMNS)
+    .from(imMessageDeliveries)
+    .innerJoin(imMessages, eq(imMessages.id, imMessageDeliveries.messageId))
+    .innerJoin(imBindings, eq(imBindings.id, imMessages.imBindingId))
+    .where(
+      and(
+        inSession,
+        or(
+          inArray(imMessageDeliveries.id, ids),
+          firstHop.length > 0 ? inArray(imMessageDeliveries.steerTargetDeliveryId, firstHop) : undefined,
+        ),
+      ),
+    );
+}
+
+function sharedChannelOf(context: { provider?: string; isExtSharedChannel?: boolean } | null): boolean | null {
+  return context?.provider === "slack" && typeof context.isExtSharedChannel === "boolean"
+    ? context.isExtSharedChannel
+    : null;
+}
+
+/** `true` if any message says true; else `null` if any says nothing; else `false`. */
+function aggregateSharedChannel(values: readonly (boolean | null)[]): boolean | null {
+  if (values.some((value) => value === true)) return true;
+  return values.some((value) => value === null) ? null : false;
+}
+
+/**
+ * The principal of a delivery-sourced execution, over the whole turn. `human` only when every message of
+ * the turn is by a human, all the same author id on the same binding; any second author, bot or system
+ * author, or missing root row is `unknown` (user and team null).
+ */
+async function deriveTurnPrincipal(
+  database: DatabaseClient,
+  rootDeliveryId: string,
+  sessionId: string,
+): Promise<GatewayPrincipal> {
+  const rows = await loadTurn(database, rootDeliveryId, sessionId);
+  const root = rows.find((row) => row.id === rootDeliveryId);
+  if (!root) return UNKNOWN_PRINCIPAL;
+  const common = {
+    channel: root.channelId,
+    shared_channel: aggregateSharedChannel(rows.map((row) => sharedChannelOf(row.providerContext))),
+    attention: rows.some((row) => row.attention === "ambient") ? ("ambient" as const) : ("direct" as const),
+  };
+  const provider = knownProvider(root.provider);
+  const oneHuman =
+    provider !== undefined &&
+    rows.every(
+      (row) =>
+        row.authorKind === "human" &&
+        row.authorExternalId === root.authorExternalId &&
+        row.bindingId === root.bindingId,
+    );
+  if (!oneHuman || !provider) return { ...emptyPrincipal("unknown"), ...common };
   return {
+    ...emptyPrincipal("human"),
+    ...common,
     provider,
-    team: row.teamId ?? null,
-    user: row.authorExternalId,
-    channel: row.channelId,
-    // true / false only when Slack's envelope said so; `null` (not known) for Feishu and older messages.
-    sharedChannel:
-      row.providerContext?.provider === "slack" && typeof row.providerContext.isExtSharedChannel === "boolean"
-        ? row.providerContext.isExtSharedChannel
-        : null,
+    team: root.teamId ?? null,
+    user: root.authorExternalId,
   };
 }
 
@@ -153,18 +236,7 @@ async function derive(
 ): Promise<GatewayPrincipal> {
   const { source, sessionId } = execution;
   if (source.kind === "validation") return emptyPrincipal("system");
-  if (source.kind === "delivery") {
-    const author = await loadDeliveryAuthor(database, source.deliveryId, sessionId);
-    if (!author) return UNKNOWN_PRINCIPAL;
-    return {
-      ...emptyPrincipal("human"),
-      provider: author.provider,
-      team: author.team,
-      user: author.user,
-      channel: author.channel,
-      shared_channel: author.sharedChannel,
-    };
-  }
+  if (source.kind === "delivery") return deriveTurnPrincipal(database, source.deliveryId, sessionId);
   if (source.kind === "session-message") {
     const [message] = await database
       .select({

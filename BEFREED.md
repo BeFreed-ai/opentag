@@ -80,8 +80,13 @@ For a marked server, each `tools/call` request carries four headers (`X-Opentag-
 retry is a different body and is signed again with its own `call` id. Only `tools/call` is signed (not `initialize`,
 notifications, `tools/list` or probes).
 
-The `principal` is derived from the execution record and existing tables only (`derivePrincipal`): a delivery maps to the
-human who authored its message (a bot or system author is `unknown`), a scheduled session message to `scheduled` with the
+The `principal` is derived from the execution record and existing tables only (`derivePrincipal`), on every `tools/call`
+(contract v1.1). A delivery is judged over the whole turn: the root delivery plus every delivery in the same session whose steer
+target is that root (batch members and later steers, including a member still pointing at a steer that points at the root).
+It is `human` only if every message of the turn is by a human with the same author id on the same IM binding; a second
+author, a bot or system author or a missing row is `unknown` with `user` and `team` null. `shared_channel` is true if any
+message says true, else null if any says nothing, else false; `attention` is `ambient` if any delivery of the turn is
+ambient, else `direct`. A scheduled session message maps to `scheduled` with the
 creator resolved from its recorded task source, an agent-sent session message to `agent`, a validation run to `system`,
 anything else or any failed lookup to `unknown`. It never throws.
 
@@ -94,6 +99,19 @@ sent unsigned. A half-set or malformed pair stops the Server at startup. Rotate 
 Every gateway `tools/call` writes one structured line (`MCP_GATEWAY_TOOL_CALL`): account, agent, execution, call id, server
 name, tool name, outcome, duration, principal kind and whether it was signed. Never headers, secrets, tool arguments or the
 principal's user, team or channel ids.
+
+Release notes for operators (S4, S5):
+
+- Mixed versions and rollback: stored inbound work and stored message contexts now carry `isExtSharedChannel`. An image older
+  than this patch rejects them (strict schemas in `services/im/inbound-work.ts` and the old `runtime-provider-message-ref.ts`),
+  so rolling back after a deploy breaks queued work and deliveries for messages stored by the new version. A rolling deploy
+  must not run old and new instances together.
+- The gateway cannot guarantee that the marker is present: an agent-level `extraHeadersOverride` replaces the headers and can
+  remove it. The upstream verifier must therefore reject unsigned calls to protected tools.
+- Only `tools/call` is signed (not `initialize`, notifications, `tools/list` or probes).
+- `team` is the IM binding's workspace, not the author's own workspace.
+- `shared_channel: null` means not known; the verifier must treat it as unsafe, like `true`. `attention` of `ambient` or null
+  must not authorise a write.
 
 S5 adds one optional boolean to the Slack variant of the inbound provider context. It is set only when the Events API
 envelope carries `is_ext_shared_channel` (true or false); absent means "not known", never "false", and the principal

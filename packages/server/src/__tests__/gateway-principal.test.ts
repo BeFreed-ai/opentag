@@ -93,13 +93,17 @@ async function seedDelivery(
     author?: string;
     channel?: string;
     providerContext?: Record<string, unknown>;
+    attention?: "direct" | "ambient";
+    /** Make this delivery a batch member / steer of the given root, as the worker stamps it. */
+    steerTarget?: string;
+    bindingId?: string;
   } = {},
 ) {
   const messageId = randomUUID();
   const deliveryId = randomUUID();
   await db.database.insert(imMessages).values({
     id: messageId,
-    imBindingId: ws.bindingId,
+    imBindingId: options.bindingId ?? ws.bindingId,
     channelId: options.channel ?? "C-MESSAGE",
     externalMessageId: `m-${messageId}`,
     providerRevisionKey: "1",
@@ -115,9 +119,10 @@ async function seedDelivery(
     id: deliveryId,
     messageId,
     sessionId: ws.sessionId,
-    attention: "direct",
+    attention: options.attention ?? "direct",
     placementGeneration: 1,
     expiresAt: new Date(Date.now() + 60_000),
+    ...(options.steerTarget ? { steerTargetDeliveryId: options.steerTarget } : {}),
   });
   return { deliveryId, messageId };
 }
@@ -141,6 +146,7 @@ describe("derivePrincipal", () => {
       user: "U-ALICE",
       channel: "C-ROOM",
       shared_channel: null,
+      attention: "direct",
       schedule_id: null,
       via_session: null,
       creator: null,
@@ -181,7 +187,7 @@ describe("derivePrincipal", () => {
     });
     expect(principal.kind).toBe("unknown");
     expect(principal.user).toBeNull();
-    expect(principal.channel).toBeNull();
+    expect(principal.team).toBeNull();
   });
 
   it("does not treat a system-authored message as a human", async () => {
@@ -262,6 +268,7 @@ describe("derivePrincipal", () => {
       user: null,
       channel: null,
       shared_channel: null,
+      attention: null,
       schedule_id: scheduleId,
       via_session: null,
       creator: { provider: "slack", team: "T-TEAM-1", user: "U-CREATOR" },
@@ -321,6 +328,7 @@ describe("derivePrincipal", () => {
       user: null,
       channel: null,
       shared_channel: null,
+      attention: null,
       schedule_id: null,
       via_session: sourceSessionId,
       creator: null,
@@ -353,6 +361,166 @@ describe("derivePrincipal", () => {
   });
 });
 
+/* ------------------------------------------------------------------ turn rule */
+
+/** A second IM binding (of another agent) in the same workspace, for "same author id, different binding". */
+async function seedOtherBinding(): Promise<string> {
+  const [agent] = await db.database.select().from(agents).limit(1);
+  const otherAgentId = randomUUID();
+  const bindingId = randomUUID();
+  await db.database.insert(agents).values({
+    id: otherAgentId,
+    createdByUserId: (agent as { createdByUserId: string }).createdByUserId,
+    computerId: (agent as { computerId: string }).computerId,
+    name: "other",
+    displayName: "Other",
+    runtimeProvider: "codex",
+  });
+  await db.database.insert(imBindings).values({
+    id: bindingId,
+    agentId: otherAgentId,
+    provider: "slack",
+    status: "provisioning",
+    externalAppId: `app-${randomUUID()}`,
+    externalTeamId: "T-TEAM-1",
+    externalBotId: "bot-2",
+  });
+  return bindingId;
+}
+
+describe("derivePrincipal over the whole turn", () => {
+  const principalOf = (ws: { sessionId: string }, rootId: string) =>
+    derivePrincipal(db.database, { sessionId: ws.sessionId, source: deliverySource(rootId) });
+
+  it("a batch member by another author makes the turn unknown", async () => {
+    const ws = await seedWorkspace();
+    const root = await seedDelivery(ws, { author: "U-A" });
+    await seedDelivery(ws, { author: "U-B", steerTarget: root.deliveryId });
+    const principal = await principalOf(ws, root.deliveryId);
+    expect(principal.kind).toBe("unknown");
+    expect(principal.user).toBeNull();
+    expect(principal.team).toBeNull();
+  });
+
+  it("a steer by another author makes the turn unknown; a steer by the same author keeps it human", async () => {
+    const ws = await seedWorkspace();
+    const root = await seedDelivery(ws, { author: "U-A" });
+    await seedDelivery(ws, { author: "U-A", steerTarget: root.deliveryId });
+    expect(await principalOf(ws, root.deliveryId)).toMatchObject({ kind: "human", user: "U-A" });
+    await seedDelivery(ws, { author: "U-B", steerTarget: root.deliveryId });
+    expect((await principalOf(ws, root.deliveryId)).kind).toBe("unknown");
+  });
+
+  it("a steer arriving between two tool calls flips the second call to unknown", async () => {
+    const ws = await seedWorkspace();
+    const root = await seedDelivery(ws, { author: "U-A" });
+    const first = await principalOf(ws, root.deliveryId);
+    await seedDelivery(ws, { author: "U-B", steerTarget: root.deliveryId });
+    const second = await principalOf(ws, root.deliveryId);
+    expect([first.kind, second.kind]).toEqual(["human", "unknown"]);
+  });
+
+  it("a member that is a bot or system makes the turn unknown", async () => {
+    for (const authorKind of ["bot", "system"] as const) {
+      const ws = await seedWorkspace();
+      const root = await seedDelivery(ws, { author: "U-A" });
+      await seedDelivery(ws, { authorKind, author: "U-A", steerTarget: root.deliveryId });
+      expect((await principalOf(ws, root.deliveryId)).kind).toBe("unknown");
+    }
+  });
+
+  it("the same author id on a different binding is not the same author", async () => {
+    const ws = await seedWorkspace();
+    const root = await seedDelivery(ws, { author: "U-A" });
+    const otherBinding = await seedOtherBinding();
+    await seedDelivery(ws, { author: "U-A", steerTarget: root.deliveryId, bindingId: otherBinding });
+    expect((await principalOf(ws, root.deliveryId)).kind).toBe("unknown");
+  });
+
+  it("follows a member still pointing at a steer delivery that points at the root", async () => {
+    const ws = await seedWorkspace();
+    const root = await seedDelivery(ws, { author: "U-A" });
+    const steer = await seedDelivery(ws, { author: "U-A", steerTarget: root.deliveryId });
+    await seedDelivery(ws, { author: "U-B", steerTarget: steer.deliveryId });
+    expect((await principalOf(ws, root.deliveryId)).kind).toBe("unknown");
+  });
+
+  it("ignores deliveries of other turns and other sessions", async () => {
+    const ws = await seedWorkspace();
+    const root = await seedDelivery(ws, { author: "U-A" });
+    await seedDelivery(ws, { author: "U-B" });
+    const other = await seedWorkspace();
+    await seedDelivery(other, { author: "U-B", steerTarget: root.deliveryId });
+    expect(await principalOf(ws, root.deliveryId)).toMatchObject({ kind: "human", user: "U-A" });
+  });
+
+  it("shared_channel: true on a member only is true; a member without the flag is null; all false is false", async () => {
+    const ws = await seedWorkspace();
+    const root = await seedDelivery(ws, {
+      author: "U-A",
+      providerContext: { provider: "slack", isExtSharedChannel: false },
+    });
+    expect((await principalOf(ws, root.deliveryId)).shared_channel).toBe(false);
+    await seedDelivery(ws, { author: "U-A", steerTarget: root.deliveryId, providerContext: { provider: "slack" } });
+    expect((await principalOf(ws, root.deliveryId)).shared_channel).toBeNull();
+    await seedDelivery(ws, {
+      author: "U-A",
+      steerTarget: root.deliveryId,
+      providerContext: { provider: "slack", isExtSharedChannel: true },
+    });
+    expect((await principalOf(ws, root.deliveryId)).shared_channel).toBe(true);
+  });
+
+  it("attention: any ambient delivery makes the turn ambient; all direct is direct", async () => {
+    const ws = await seedWorkspace();
+    const root = await seedDelivery(ws, { author: "U-A" });
+    expect((await principalOf(ws, root.deliveryId)).attention).toBe("direct");
+    await seedDelivery(ws, { author: "U-A", steerTarget: root.deliveryId, attention: "ambient" });
+    const principal = await principalOf(ws, root.deliveryId);
+    expect(principal).toMatchObject({ kind: "human", attention: "ambient" });
+  });
+
+  it("an ambient root alone is ambient", async () => {
+    const ws = await seedWorkspace();
+    const root = await seedDelivery(ws, { author: "U-A", attention: "ambient" });
+    expect((await principalOf(ws, root.deliveryId)).attention).toBe("ambient");
+  });
+});
+
+describe("derivePrincipal: session pin on session messages", () => {
+  it("a scheduled message that targets a different session than the execution's is unknown", async () => {
+    const ws = await seedWorkspace();
+    const otherSessionId = randomUUID();
+    await db.database.insert(sessions).values({
+      id: otherSessionId,
+      imBindingId: ws.bindingId,
+      channelId: "C-ELSEWHERE",
+      conversationKind: "channel",
+      kind: "thread",
+      threadKey: "t-other",
+    });
+    const id = randomUUID();
+    await db.database.insert(sessionMessages).values({
+      id,
+      targetSessionId: otherSessionId,
+      content: "do it",
+      contentHash: createHash("sha256").update("do it").digest("hex"),
+      scheduledOrigin: {
+        scheduleId: randomUUID(),
+        scheduledFor: "2026-11-27T01:00:00.000Z",
+        timezone: "UTC",
+        name: "daily",
+      },
+    });
+    const principal = await derivePrincipal(db.database, {
+      sessionId: ws.sessionId,
+      source: { kind: "session-message", messageId: id },
+    });
+    expect(principal.kind).toBe("unknown");
+    expect(principal.schedule_id).toBeNull();
+  });
+});
+
 /* ------------------------------------------------------------------ signing */
 
 const SECRET_A = "a".repeat(40);
@@ -366,6 +534,7 @@ const PRINCIPAL: GatewayPrincipal = {
   user: "U-ALICE",
   channel: "C-ROOM",
   shared_channel: false,
+  attention: null,
   schedule_id: null,
   via_session: null,
   creator: null,

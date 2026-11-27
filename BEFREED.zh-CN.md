@@ -43,11 +43,19 @@ S2 复用上游代码处理所有规则：`ScheduleService.createForAgent` 校�
 
 对标记过的服务器，每个 `tools/call` 请求带四个请求头（`X-Opentag-Principal`、`-Key`、`-Timestamp`、`-Signature`）：base64url 的 JSON 声明（account、agent、execution、每次新生成的 `call` uuid、tool、`iat` 和 `principal`）、密钥 id、时间戳，以及 `v1=` 加上对 `keyId.timestamp.principalB64.sha256(请求体原始字节)` 的小写十六进制 HMAC-SHA256。哈希在传输层（`mcp-transport.ts` 的 `applyBodySignature`）对交给 fetcher 的那个字符串计算，所以就是线上实际发送的字节；协议版本重试的请求体不同，会用自己的 `call` id 重新签名。只签 `tools/call`（不签 `initialize`、通知、`tools/list` 和探测）。
 
-`principal` 只由执行记录和现有数据表推导（`derivePrincipal`）：delivery 对应写下该消息的真人（作者是机器人或系统则为 `unknown`），定时的 session 消息对应 `scheduled`，创建者从它记录的任务来源里解析，agent 发来的 session 消息对应 `agent`，validation 对应 `system`，其余情况或任何查询失败都是 `unknown`。它从不抛错。
+`principal` 只由执行记录和现有数据表推导（`derivePrincipal`），每次 `tools/call` 都重新推导（契约 v1.1）。delivery 按整个回合判断：根 delivery 加上同一 session 里所有 steer 目标是该根的 delivery（批量成员和之后的 steer，也包括仍指向"指向根的那条 steer"的成员）。只有回合内每条消息都是真人、作者 id 相同且在同一个 IM 绑定上才是 `human`；出现第二个作者、机器人或系统作者、或缺行，就是 `unknown`，且 `user` 和 `team` 为 null。`shared_channel`：任一消息为 true 则 true，否则任一消息没说则 null，否则 false；`attention`：回合内任一 delivery 为 ambient 则 `ambient`，否则 `direct`。定时的 session 消息对应 `scheduled`，创建者从它记录的任务来源里解析，agent 发来的 session 消息对应 `agent`，validation 对应 `system`，其余情况或任何查询失败都是 `unknown`。它从不抛错。
 
 密钥：`OPENTAG_GATEWAY_PRINCIPAL_KEYS`（JSON 对象，密钥 id 对应密钥；每个密钥至少 32 字节，按其 UTF-8 字节使用；密钥 id 为 1-64 个 `A-Za-z0-9_-` 字符）和 `OPENTAG_GATEWAY_PRINCIPAL_KEY_ID`（用哪个 id 签名）。两个都不设表示没有密钥：服务器照常启动，对标记服务器的每次调用都以固定错误失败（失败即关闭），不会向上游发任何东西，也绝不会不签名发送。只设了一半或格式错误会让服务器在启动时停止。轮换方式：两边都加上新密钥，切换 `KEY_ID`，再在验证方删除旧密钥。
 
 每次网关 `tools/call` 写一行结构化日志（`MCP_GATEWAY_TOOL_CALL`）：account、agent、execution、call id、服务器名、工具名、结果、耗时、主体类型、是否已签名。绝不含请求头、密钥、工具参数，也不含主体的用户、团队或频道 id。
+
+运维发布说明（S4、S5）：
+
+- 混合版本与回滚：已存储的入站任务和已存储的消息上下文现在带有 `isExtSharedChannel`。早于本补丁的镜像会拒绝它们（`services/im/inbound-work.ts` 和旧的 `runtime-provider-message-ref.ts` 的严格 schema），所以部署后回滚会让排队中的任务、以及新版本存下的消息的投递失败。滚动部署时不能让新旧实例同时运行。
+- 网关无法保证标记一定存在：agent 级的 `extraHeadersOverride` 会替换请求头，可能把它去掉。所以上游验证方必须拒绝对受保护工具的未签名调用。
+- 只签 `tools/call`（不签 `initialize`、通知、`tools/list` 和探测）。
+- `team` 是 IM 绑定所在的工作区，不是作者自己的工作区。
+- `shared_channel: null` 表示不知道，验证方必须按不安全处理（与 `true` 相同）。`attention` 为 `ambient` 或 null 不得授权写操作。
 
 S5 给入站 provider 上下文的 Slack 变体增加一个可选布尔值。只有 Events API 信封带了 `is_ext_shared_channel`（true 或 false）才会设置；不存在表示"不知道"，绝不等于"false"，此时主体报告 `shared_channel: null`。没有该字段的旧消息和旧的持久入站任务仍能解析；本版本写入的任务旧版服务器镜像读不了（它的入站任务 schema 是严格的），这只在回滚期间、事件停留在持久队列的那几秒里有影响。该字段在构造 provider 消息引用之前会被去掉，因为运行时引用的 schema 是严格的。
 

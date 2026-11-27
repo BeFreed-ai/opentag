@@ -37,6 +37,7 @@ const PRINCIPAL: GatewayPrincipal = {
   user: "U-SECRET-USER",
   channel: "C-SECRET-CHANNEL",
   shared_channel: false,
+  attention: "direct",
   schedule_id: null,
   via_session: null,
   creator: null,
@@ -342,6 +343,20 @@ describe("failing closed", () => {
 
   it("sends nothing upstream on a legacy peer either: not even the handshake", async () => {
     const { callTool, sent } = harness({ extraHeaders: MARKED, era: "legacy", signer: null });
+    await expect(callTool()).rejects.toBeInstanceOf(GatewayPrincipalUnavailableError);
+    expect(sent).toHaveLength(0);
+  });
+
+  it("sends nothing on a legacy peer when signing throws: the dry-run sign stops it before the handshake", async () => {
+    const { callTool, sent } = harness({
+      extraHeaders: MARKED,
+      era: "legacy",
+      signer: {
+        sign: () => {
+          throw new Error("hsm unavailable");
+        },
+      } as unknown as GatewayPrincipalSigner,
+    });
     await expect(callTool()).rejects.toBeInstanceOf(GatewayPrincipalUnavailableError);
     expect(sent).toHaveLength(0);
   });
