@@ -5,7 +5,16 @@ import {
   MCPToolSnapshotSchema,
 } from "@opentag/shared";
 import { z } from "zod";
+import type { ServiceLogger } from "../../observability/service-logger.js";
+import {
+  GATEWAY_PRINCIPAL_UNAVAILABLE,
+  type GatewayPrincipal,
+  type GatewayPrincipalSource,
+  GatewayPrincipalUnavailableError,
+} from "../../runtime-credentials/gateway-principal.js";
+import type { RuntimeExecutionRecord } from "../../runtime-credentials/types.js";
 import { MCP_ERROR_CODES, McpServiceError } from "./errors.js";
+import { MCP_PRINCIPAL_MARKER_HEADER } from "./mcp-auth-headers.js";
 import type { McpAuthorizationService } from "./mcp-authorization-service.js";
 import type { McpUpstreamCaller } from "./mcp-gateway-upstream.js";
 import { parseMcpParameterHeaders } from "./mcp-parameter-headers.js";
@@ -48,6 +57,13 @@ export interface McpGatewayServiceOptions {
   upstream: McpUpstreamCaller;
   /** Bound on the published catalogue; overridable so a test can reach it cheaply. */
   maxTools?: number;
+  /**
+   * BeFreed fork (patch S4): signs the triggering principal for servers marked as requiring it. Absent
+   * means no key and no derivation, so a call to a marked server fails closed.
+   */
+  principals?: GatewayPrincipalSource;
+  /** Receives one structured line per `tools/call`, success or failure. */
+  logger?: ServiceLogger;
 }
 
 /** A mount that is actually usable right now, with its composed tool names resolved. */
@@ -62,12 +78,16 @@ export class McpGatewayService {
   readonly #authorizations: McpAuthorizationService;
   readonly #upstream: McpUpstreamCaller;
   readonly #maxTools: number;
+  readonly #principals: GatewayPrincipalSource | undefined;
+  readonly #logger: ServiceLogger | undefined;
 
   constructor(options: McpGatewayServiceOptions) {
     this.#servers = options.servers;
     this.#authorizations = options.authorizations;
     this.#upstream = options.upstream;
     this.#maxTools = options.maxTools ?? MCP_GATEWAY_MAX_TOOLS;
+    this.#principals = options.principals;
+    this.#logger = options.logger;
   }
 
   /**
@@ -122,13 +142,42 @@ export class McpGatewayService {
    * also means the resolution set is exactly what this Agent is allowed to call, so a name borrowed
    * from another Agent resolves to nothing rather than to someone else's Server.
    */
-  async callTool(input: {
-    accountId: string;
-    agentId: string;
-    name: string;
-    arguments?: Record<string, unknown>;
-    signal?: AbortSignal;
-  }): Promise<McpGatewayToolCallResult> {
+  async callTool(input: CallToolInput): Promise<McpGatewayToolCallResult> {
+    const started = Date.now();
+    const audit: CallAudit = { server: null, tool: null, principalKind: null, signed: false, callId: null, sends: 0 };
+    try {
+      const result = await this.#callTool(input, audit);
+      this.#logCall(input, audit, started, undefined);
+      return result;
+    } catch (error) {
+      this.#logCall(input, audit, started, error);
+      throw error;
+    }
+  }
+
+  /** One line per call: identifiers and outcome only, never headers, secrets, arguments or user ids. */
+  #logCall(input: CallToolInput, audit: CallAudit, started: number, error: unknown): void {
+    const failed = error !== undefined;
+    const bindings = {
+      code: "MCP_GATEWAY_TOOL_CALL",
+      accountId: input.accountId,
+      agentId: input.agentId,
+      executionId: input.execution?.executionId ?? null,
+      callId: audit.callId,
+      sends: audit.sends,
+      server: audit.server,
+      tool: audit.tool,
+      outcome: failed ? "failure" : "success",
+      ...(failed ? { failure: failureCode(error) } : {}),
+      durationMs: Date.now() - started,
+      principalKind: audit.principalKind,
+      signed: audit.signed,
+    };
+    if (failed) this.#logger?.warn(bindings, "MCP gateway tool call finished");
+    else this.#logger?.info(bindings, "MCP gateway tool call finished");
+  }
+
+  async #callTool(input: CallToolInput, audit: CallAudit): Promise<McpGatewayToolCallResult> {
     const bindings = await this.#servers.listAgentBindings(input.accountId, input.agentId);
     const target = resolveTool(bindings, input.name);
     if (!target) {
@@ -137,6 +186,8 @@ export class McpGatewayService {
         `No MCP tool named "${input.name}" is available to this Agent`,
       );
     }
+    audit.server = target.serverName;
+    audit.tool = target.upstreamName;
     const mcpServerId = target.joined.server.id;
     const resolved = await this.#authorizations.resolveActiveCredential(input.accountId, input.agentId, mcpServerId);
     if (!resolved) {
@@ -153,6 +204,8 @@ export class McpGatewayService {
         `No MCP tool named "${input.name}" is available to this Agent`,
       );
     }
+    // Before any header is built or anything is sent: a marked server is never called unsigned.
+    const signBody = await this.#principalSigner(input, effective.extraHeaders, target.upstreamName, audit);
     const headers = this.#authorizations.buildHeadersFor(resolved);
     const inputSchema = readToolSnapshot(resolved.authorization.tools).find(
       (tool) => tool.name === target.upstreamName,
@@ -168,9 +221,97 @@ export class McpGatewayService {
       cachedEra: resolved.authorization.protocolEra,
       cachedVersion: resolved.authorization.protocolVersion,
       ...(input.signal ? { signal: input.signal } : {}),
+      ...(signBody ? { signBody } : {}),
     });
     return { result: call.result };
   }
+
+  /**
+   * The per-request signer for a marked server, or `undefined` for an unmarked one (whose request is
+   * then identical to what it was before this patch).
+   *
+   * Everything that can fail does so here, before the upstream is dialled: no key, no execution to
+   * derive from, a derivation that throws, a marker with any value other than `required`, and a dry-run
+   * signature that throws. Each is the same fixed error. The returned function signs one request body per
+   * call and gives every request actually sent its own `call` id.
+   */
+  async #principalSigner(
+    input: CallToolInput,
+    extraHeaders: Record<string, string> | undefined,
+    tool: string,
+    audit: CallAudit,
+  ): Promise<((bodySha256: string) => Record<string, string>) | undefined> {
+    const marker = principalMarker(extraHeaders);
+    if (marker === "absent") return undefined;
+    try {
+      const signer = this.#principals?.signer;
+      if (marker === "invalid" || !signer || !this.#principals || !input.execution) {
+        throw new GatewayPrincipalUnavailableError();
+      }
+      const execution = input.execution;
+      const principal: GatewayPrincipal = await this.#principals.derive(execution);
+      audit.principalKind = principal.kind;
+      const context = {
+        account: input.accountId,
+        agent: input.agentId,
+        execution: execution.executionId,
+        tool,
+        principal,
+      };
+      signer.sign(context, "0".repeat(64));
+      return (bodySha256) => {
+        try {
+          const signed = signer.sign(context, bodySha256);
+          audit.callId = signed.call;
+          audit.sends += 1;
+          audit.signed = true;
+          return signed.headers;
+        } catch {
+          throw new GatewayPrincipalUnavailableError();
+        }
+      };
+    } catch {
+      throw new GatewayPrincipalUnavailableError();
+    }
+  }
+}
+
+interface CallToolInput {
+  accountId: string;
+  agentId: string;
+  name: string;
+  arguments?: Record<string, unknown>;
+  signal?: AbortSignal;
+  /** The authorized execution making the call; required to sign a principal (patch S4). */
+  execution?: RuntimeExecutionRecord;
+}
+
+interface CallAudit {
+  server: string | null;
+  tool: string | null;
+  principalKind: string | null;
+  signed: boolean;
+  callId: string | null;
+  sends: number;
+}
+
+/** A bounded, secret-free label for why a call failed. */
+function failureCode(error: unknown): string {
+  if (error instanceof GatewayPrincipalUnavailableError) return GATEWAY_PRINCIPAL_UNAVAILABLE;
+  if (error instanceof McpServiceError) return error.code;
+  return "error";
+}
+
+/**
+ * Whether the server asks for the signed principal: exactly `x-opentag-principal: required`, the name
+ * compared case-insensitively. A marker with any other value is `invalid` rather than ignored, because a
+ * typo must not silently turn the protection off.
+ */
+function principalMarker(extraHeaders: Record<string, string> | undefined): "absent" | "required" | "invalid" {
+  if (!extraHeaders) return "absent";
+  const entry = Object.entries(extraHeaders).find(([key]) => key.toLowerCase() === MCP_PRINCIPAL_MARKER_HEADER);
+  if (!entry) return "absent";
+  return entry[1] === "required" ? "required" : "invalid";
 }
 
 /**

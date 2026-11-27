@@ -10,6 +10,7 @@ import type { createServiceLoggerPort } from "../observability/index.js";
 import { createMcpGatewayAuthPreHandler } from "../plugins/mcp-gateway-auth.js";
 import { McpGatewayError, type McpGatewayExecutionAuthorizer } from "../runtime-credentials/mcp-gateway-execution.js";
 import type { RuntimeMcpGatewayTokenStore } from "../runtime-credentials/mcp-gateway-token-store.js";
+import type { RuntimeExecutionRecord } from "../runtime-credentials/types.js";
 import { McpServiceError } from "../services/mcp/errors.js";
 import type { McpGatewayService } from "../services/mcp/mcp-gateway-service.js";
 import {
@@ -122,7 +123,7 @@ async function handleGatewayRequest(
     return sendGatewayFailure(reply, id, error, options);
   }
 
-  const handlers = buildHandlers(options, execution.accountId, execution.agentId, aborted.signal);
+  const handlers = buildHandlers(options, execution, aborted.signal);
   try {
     const outcome = await dispatchInboundRequest(rpc, handlers);
     if (outcome.kind === "accepted") return reply.status(202).send();
@@ -142,10 +143,10 @@ async function handleGatewayRequest(
  */
 function buildHandlers(
   options: McpGatewayRoutesOptions,
-  accountId: string,
-  agentId: string,
+  execution: RuntimeExecutionRecord,
   signal: AbortSignal,
 ): McpInboundHandlers {
+  const { accountId, agentId } = execution;
   return {
     serverInfo: GATEWAY_SERVER_INFO,
     supportedVersions: MCP_LEGACY_PROTOCOL_VERSIONS,
@@ -157,6 +158,7 @@ function buildHandlers(
           agentId,
           name,
           signal,
+          execution,
           ...(args ? { arguments: args } : {}),
         });
         return legacyToolResult(result);

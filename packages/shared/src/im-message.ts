@@ -24,6 +24,11 @@ export const ProviderInboundContextSchema = z.discriminatedUnion("provider", [
       provider: z.literal("slack"),
       channelType: z.string().min(1).max(160).optional(),
       threadTs: z.string().min(1).max(512).optional(),
+      /**
+       * BeFreed fork (patch S5): Slack's envelope-level `is_ext_shared_channel`. Present only when the
+       * envelope carried the field (true or false); absent means "not known", never "false".
+       */
+      isExtSharedChannel: z.boolean().optional(),
     })
     .strict(),
 ]);

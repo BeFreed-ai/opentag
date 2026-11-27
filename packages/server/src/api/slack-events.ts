@@ -192,6 +192,9 @@ export function registerSlackEventsRoute(app: FastifyInstance, options: SlackEve
           botId: installation.botId,
           event: envelope.event,
           eventTime: envelope.event_time,
+          ...(typeof envelope.is_ext_shared_channel === "boolean"
+            ? { isExtSharedChannel: envelope.is_ext_shared_channel }
+            : {}),
         },
         (reason) => {
           const invalid = reason === "malformed_supported_event";

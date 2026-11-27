@@ -1,7 +1,7 @@
 # OpenTag 的 BeFreed 分叉
 
 > Canonical source: [BEFREED.md](./BEFREED.md)
-> Last synced with: 2026-11-19
+> Last synced with: 2026-11-27
 
 本仓库是 `BeFreed-ai/opentag`，即 `first-tree-ai/opentag`（Apache-2.0）的分叉。它**不是**上游正式发布版，也不得以上游产品的名义呈现（见 `NOTICE`）。我们的工作绝不在上游仓库开 PR、issue 或评论；所有改动先落在本仓库。
 
@@ -20,6 +20,8 @@
 | S1 | 服务器构建 | `.github/workflows/befreed-server-image.yml` | 上游 `docker.yml` 只在上游仓库运行；本流水线用同一个 Dockerfile（`runtime` 目标）构建并推到我们自己的私有 ECR 仓库（2026-11 之前是私有 GHCR 包） | 手动 |
 | S2 | 服务器 | 新增 `packages/server/src/services/schedules/operator-service.ts`、`packages/server/src/api/operator-schedules.ts`、`packages/server/src/operator-routes-config.ts`；接线在 `packages/server/src/app.ts`（+8 行）和 `packages/server/src/index.ts`（+9 行） | 运营专用的账号级路由：为 agent 创建定时任务，无需入站 IM 消息（cron、一次性 `at`、或"N 秒后运行"） | **关** |
 | S3 | 服务器测试 | `packages/server/src/__tests__/operator-schedule-api.test.ts`、`operator-routes-config.test.ts`、`__tests__/integration/operator-schedules.test.ts` | S2 的测试 | 不适用 |
+| S4 | 服务器 | 新增 `packages/server/src/runtime-credentials/gateway-principal.ts`；在 `services/mcp/mcp-gateway-service.ts`、`mcp-gateway-upstream.ts`、`mcp-transport.ts`、`mcp-auth-headers.ts`、`api/mcp-gateway.ts` 和 `index.ts`（+5 行）里加少量接线（含测试） | 对标记为"需要主体"的 MCP 服务器，在网关发出的 `tools/call` 请求上签名"是谁触发了这次执行"（真人 / 定时任务 / agent / 系统），让对方服务器能验证调用方，而不是信任网络。同时为每次网关工具调用写一行结构化日志 | **关**（只有额外请求头含 `x-opentag-principal: required` 的服务器才生效） |
+| S5 | 共享包 + 服务器 | `packages/shared/src/im-message.ts`（一个可选字段）、`services/im-bindings/slack/adapter.ts`、`inbound-work.ts`、`services/im/inbound-work.ts`、`api/slack-events.ts`、`runtime/runtime-provider-message-ref.ts`（含测试） | 把 Slack 信封里的 `is_ext_shared_channel` 记为入站消息的 `providerContext.isExtSharedChannel`（jsonb 列，无迁移），让 S4 的签名主体能说明触发消息是否来自外部共享频道 | 开（只是数据；Slack 没发时该字段不存在） |
 
 S2 复用上游代码处理所有规则：`ScheduleService.createForAgent` 校验 cron 语法、时区、未来触发时间、提示词大小（16 KiB）并写入记录、版本号和审计事件；`SessionService.ensureChatSession` 查找或创建目标会话，并要求 agent 处于活跃状态且已绑定机器。S2 只是在调用方通过鉴权、运营白名单和归属检查之后，构造上游通常从 agent 的会话证明里推导出的"范围"。它从不读取或伪造会话证明。
 
@@ -34,6 +36,28 @@ S2 复用上游代码处理所有规则：`ScheduleService.createForAgent` 校�
 - 代某位 Slack 真人创建（可选 `onBehalfOf: {"slackUserId": "U..."}`）：服务器为任务记录来源，使定时任务的运行能取得 GitHub 凭证和 Context Tree 同步。调用方不能自己传 delivery id；服务器自己在该 agent 绑定的这个频道会话里，查找该 Slack 用户最近一条已被接受的真人入站消息，并把它记为来源。找不到、是机器人、是该 agent 自己的机器人、或不是 Slack 绑定，一律 409 `SCHEDULE_ON_BEHALF_NOT_VERIFIED`，绝不降级为无来源。证明依据是"该用户在此频道发过话且被接受"，不是实时的 Slack 成员查询（已退出频道的人仍可通过；从没发过话的成员会 409）。不带 `onBehalfOf` 时行为不变（无来源）。日志行同时带 `onBehalfOfSlackUserId`。凭证作用域不变（仅该 agent 已绑定的仓库）。
 - 已知限制：规则校验失败的请求（例如 cron 写错）可能留下一个空的频道会话（无害，下次同频道调用会复用）。`enabled:false` 是两步（先创建再暂停），所以马上到点的任务理论上可能运行一次；不要把它和马上触发的 `at` 一起用。
 - 拒绝 cookie 会话是防御性的第二道检查；见 PR 中的"未验证"一节。
+
+### S4：网关工具调用上的签名主体
+
+**按 MCP 服务器逐个开启**：在服务器定义（或某个 agent 的覆盖）里加一个额外请求头 `x-opentag-principal: required`（名字不区分大小写，值必须正好是 `required`）。这个标记是配置，不是要发出去的东西：它会从所有出站请求头里删掉（探测请求也一样），然后由签名器设置一个同名请求头，里面是签名后的声明。标记的值如果是别的（例如 `true`），调用会直接失败（失败即关闭），而不是被忽略，免得一个笔误悄悄把保护关掉。没有标记的服务器收到的请求与以前逐字节相同。
+
+对标记过的服务器，每个 `tools/call` 请求带四个请求头（`X-Opentag-Principal`、`-Key`、`-Timestamp`、`-Signature`）：base64url 的 JSON 声明（account、agent、execution、每次新生成的 `call` uuid、tool、`iat` 和 `principal`）、密钥 id、时间戳，以及 `v1=` 加上对 `keyId.timestamp.principalB64.sha256(请求体原始字节)` 的小写十六进制 HMAC-SHA256。哈希在传输层（`mcp-transport.ts` 的 `applyBodySignature`）对交给 fetcher 的那个字符串计算，所以就是线上实际发送的字节；协议版本重试的请求体不同，会用自己的 `call` id 重新签名。只签 `tools/call`（不签 `initialize`、通知、`tools/list` 和探测）。
+
+`principal` 只由执行记录和现有数据表推导（`derivePrincipal`），每次 `tools/call` 都重新推导（契约 v1.1）。delivery 按整个回合判断：根 delivery 加上同一 session 里所有 steer 目标是该根的 delivery（批量成员和之后的 steer，也包括仍指向"指向根的那条 steer"的成员）。只有回合内每条消息都是真人、作者 id 相同且在同一个 IM 绑定上才是 `human`；出现第二个作者、机器人或系统作者、或缺行，就是 `unknown`，且 `user` 和 `team` 为 null。`shared_channel`：任一消息为 true 则 true，否则任一消息没说则 null，否则 false；`attention`：回合内任一 delivery 为 ambient 则 `ambient`，否则 `direct`。定时的 session 消息对应 `scheduled`，创建者从它记录的任务来源里解析，agent 发来的 session 消息对应 `agent`，validation 对应 `system`，其余情况或任何查询失败都是 `unknown`。它从不抛错。
+
+密钥：`OPENTAG_GATEWAY_PRINCIPAL_KEYS`（JSON 对象，密钥 id 对应密钥；每个密钥至少 32 字节，按其 UTF-8 字节使用；密钥 id 为 1-64 个 `A-Za-z0-9_-` 字符）和 `OPENTAG_GATEWAY_PRINCIPAL_KEY_ID`（用哪个 id 签名）。两个都不设表示没有密钥：服务器照常启动，对标记服务器的每次调用都以固定错误失败（失败即关闭），不会向上游发任何东西，也绝不会不签名发送。只设了一半或格式错误会让服务器在启动时停止。轮换方式：两边都加上新密钥，切换 `KEY_ID`，再在验证方删除旧密钥。
+
+每次网关 `tools/call` 写一行结构化日志（`MCP_GATEWAY_TOOL_CALL`）：account、agent、execution、call id、服务器名、工具名、结果、耗时、主体类型、是否已签名。绝不含请求头、密钥、工具参数，也不含主体的用户、团队或频道 id。
+
+运维发布说明（S4、S5）：
+
+- 混合版本与回滚：已存储的入站任务和已存储的消息上下文现在带有 `isExtSharedChannel`。早于本补丁的镜像会拒绝它们（`services/im/inbound-work.ts` 和旧的 `runtime-provider-message-ref.ts` 的严格 schema），所以部署后回滚会让排队中的任务、以及新版本存下的消息的投递失败。滚动部署时不能让新旧实例同时运行。
+- 网关无法保证标记一定存在：agent 级的 `extraHeadersOverride` 会替换请求头，可能把它去掉。所以上游验证方必须拒绝对受保护工具的未签名调用。
+- 只签 `tools/call`（不签 `initialize`、通知、`tools/list` 和探测）。
+- `team` 是 IM 绑定所在的工作区，不是作者自己的工作区。
+- `shared_channel: null` 表示不知道，验证方必须按不安全处理（与 `true` 相同）。`attention` 为 `ambient` 或 null 不得授权写操作。
+
+S5 给入站 provider 上下文的 Slack 变体增加一个可选布尔值。只有 Events API 信封带了 `is_ext_shared_channel`（true 或 false）才会设置；不存在表示"不知道"，绝不等于"false"，此时主体报告 `shared_channel: null`。没有该字段的旧消息和旧的持久入站任务仍能解析；本版本写入的任务旧版服务器镜像读不了（它的入站任务 schema 是严格的），这只在回滚期间、事件停留在持久队列的那几秒里有影响。该字段在构造 provider 消息引用之前会被去掉，因为运行时引用的 schema 是严格的。
 
 ## 镜像构建与发布（S1）
 

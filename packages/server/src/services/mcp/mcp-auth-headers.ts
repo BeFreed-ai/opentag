@@ -32,6 +32,13 @@ export const MCP_OAUTH_AUTHORIZATION_HEADER = "authorization";
 /** Feishu's hosted MCP endpoint requires user OAuth access tokens in `X-Lark-MCP-UAT`. */
 export const MCP_FEISHU_OAUTH_UAT_HEADER = "x-lark-mcp-uat";
 
+/**
+ * BeFreed fork (patch S4): the extra header that marks a server as requiring the signed principal. It is
+ * configuration for this gateway, never something to send: the gateway removes it from every outbound
+ * header set (the principal header of the same name is added by the signer, with a different value).
+ */
+export const MCP_PRINCIPAL_MARKER_HEADER = "x-opentag-principal";
+
 function invalid(message: string): McpServiceError {
   return new McpServiceError(MCP_ERROR_CODES.AUTH_HEADER_INVALID, message);
 }
@@ -85,7 +92,9 @@ export function buildMcpAuthHeaders(input: McpAuthHeaderInput): Record<string, s
       throw invalid("An extra header may not repeat the authorization header name");
     }
   }
-  for (const [name, value] of Object.entries(extraHeaders)) headers[name] = value;
+  for (const [name, value] of Object.entries(extraHeaders)) {
+    if (name.toLowerCase() !== MCP_PRINCIPAL_MARKER_HEADER) headers[name] = value;
+  }
   return headers;
 }
 

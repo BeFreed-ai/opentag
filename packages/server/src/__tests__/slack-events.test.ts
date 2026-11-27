@@ -888,3 +888,61 @@ describe("Slack Events API ingress", () => {
     expect(logs).not.toContain("xoxb-sensitive");
   });
 });
+
+describe("externally shared Slack channels (BeFreed fork, patch S5)", () => {
+  const cases: [string, boolean | undefined][] = [
+    ["true", true],
+    ["false", false],
+    ["absent", undefined],
+  ];
+
+  function sharedChannelEnvelope(flag: boolean | undefined, eventId: string) {
+    return {
+      type: "event_callback",
+      api_app_id: "A1",
+      team_id: "T1",
+      authorizations: matchingBotAuthorization(),
+      event_id: eventId,
+      ...(flag === undefined ? {} : { is_ext_shared_channel: flag }),
+      event: { type: "app_mention", channel: "C1", channel_type: "channel", user: "U2", text: "hello", ts: "1.0" },
+    };
+  }
+
+  function ingestedContext(inbox: { ingest: { mock: { calls: unknown[][] } } }) {
+    const ingested = inbox.ingest.mock.calls[0]?.[2] as { providerContext: Record<string, unknown> } | undefined;
+    return ingested?.providerContext ?? {};
+  }
+
+  it.each(cases)(
+    "records the envelope flag (%s) in the provider context of the stored message",
+    async (_label, flag) => {
+      const { app, inbox } = createServices({}, undefined, { realAdapter: true });
+      expect((await app.inject(signedRequest(sharedChannelEnvelope(flag, `Ev-shared-${_label}`)))).statusCode).toBe(
+        200,
+      );
+      expect(inbox.ingest).toHaveBeenCalledTimes(1);
+      const context = ingestedContext(inbox);
+      expect(context).toMatchObject({ provider: "slack", channelType: "channel" });
+      if (flag === undefined) expect("isExtSharedChannel" in context).toBe(false);
+      else expect(context.isExtSharedChannel).toBe(flag);
+    },
+  );
+
+  it.each(cases)("carries the flag (%s) through the durable inbound work and its replay", async (_label, flag) => {
+    const receipts = {
+      claim: vi.fn().mockResolvedValue({ accepted: true, duplicate: false, receiptId: `receipt-${_label}` }),
+      markProcessed: vi.fn().mockResolvedValue(undefined),
+      markFailed: vi.fn(),
+    };
+    const { app, inbox } = createServices({ receipts: receipts as never }, undefined, { realAdapter: true });
+    expect((await app.inject(signedRequest(sharedChannelEnvelope(flag, `Ev-durable-${_label}`)))).statusCode).toBe(200);
+    await vi.waitFor(() => expect(inbox.ingest).toHaveBeenCalledTimes(1));
+    const context = ingestedContext(inbox);
+    if (flag === undefined) expect("isExtSharedChannel" in context).toBe(false);
+    else expect(context.isExtSharedChannel).toBe(flag);
+    // The stored work payload itself, as it would be read back after a restart.
+    const claimed = receipts.claim.mock.calls[0]?.[0] as { work: Record<string, unknown> };
+    if (flag === undefined) expect("isExtSharedChannel" in claimed.work).toBe(false);
+    else expect(claimed.work.isExtSharedChannel).toBe(flag);
+  });
+});
