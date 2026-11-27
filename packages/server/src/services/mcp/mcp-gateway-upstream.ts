@@ -39,6 +39,12 @@ export interface McpUpstreamCallInput {
   cachedEra: "modern" | "legacy" | null;
   cachedVersion: string | null;
   signal?: AbortSignal;
+  /**
+   * BeFreed fork (patch S4): sign each request actually sent for this call; see `McpCallOptions.signBody`.
+   * Applied to the `tools/call` request only (never to `initialize` or notifications), and invoked again
+   * for the single protocol-version retry, whose body differs.
+   */
+  signBody?: (bodySha256: string) => Record<string, string>;
 }
 
 export interface McpUpstreamCallResult {
@@ -107,6 +113,7 @@ export class McpUpstreamCaller {
       ...(input.name === undefined ? {} : { name: input.name }),
       ...(input.inputSchema === undefined ? {} : { inputSchema: input.inputSchema }),
       ...(input.signal ? { signal: input.signal } : {}),
+      ...(input.signBody ? { signBody: input.signBody } : {}),
     });
   }
 
@@ -158,6 +165,7 @@ export class McpUpstreamCaller {
         ...(sessionId ? { headers: { "mcp-session-id": sessionId } } : {}),
         ...(negotiatedVersion ? { negotiatedVersion } : {}),
         ...(input.signal ? { signal: input.signal } : {}),
+        ...(input.signBody ? { signBody: input.signBody } : {}),
       },
     );
     return { result };

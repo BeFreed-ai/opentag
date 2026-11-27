@@ -21,6 +21,7 @@ Every patch is small, default-off or diagnostics-only. Up to `0.1.5-befreed.4` n
 | S1 | Server build | `.github/workflows/befreed-server-image.yml` | Upstream's `docker.yml` only runs in the upstream repo; this builds the same Dockerfile (`runtime` target) and pushes to our private ECR repository (until 2026-11: a private GHCR package) | manual |
 | S2 | Server | new `packages/server/src/services/schedules/operator-service.ts`, `packages/server/src/api/operator-schedules.ts`, `packages/server/src/operator-routes-config.ts`; wiring in `packages/server/src/app.ts` (+8 lines) and `packages/server/src/index.ts` (+9 lines) | Operator-only account route to create a schedule for an agent, with no inbound IM message (cron, one-time `at`, or "run in N seconds") | **off** |
 | S3 | Server tests | `packages/server/src/__tests__/operator-schedule-api.test.ts`, `operator-routes-config.test.ts`, `__tests__/integration/operator-schedules.test.ts` | Tests for S2 | n/a |
+| S4 | Server | new `packages/server/src/runtime-credentials/gateway-principal.ts`; small hooks in `services/mcp/mcp-gateway-service.ts`, `mcp-gateway-upstream.ts`, `mcp-transport.ts`, `mcp-auth-headers.ts`, `api/mcp-gateway.ts` and `index.ts` (+5 lines) (+ tests) | Sign *who triggered the execution* (human / schedule / agent / system) on gateway `tools/call` requests to an MCP server that is marked as requiring it, so that server can verify the caller instead of trusting the network. Also one structured log line per gateway tool call | **off** (only a server whose extra headers contain `x-opentag-principal: required`) |
 
 S2 reuses upstream code for every rule: `ScheduleService.createForAgent` validates the cron grammar, timezone,
 future occurrence, prompt size (16 KiB), and writes the row, the revision and the audit event;
@@ -60,6 +61,38 @@ passed authentication, the operator allow-list and the ownership check. It never
   pause), so a schedule due within milliseconds could in theory run once; do not combine it with an imminent `at`.
 - The cookie-session refusal is a defensive second check; the unit tests cannot reach it because the test auth
   stub only produces Bearer sessions (see "Not verified" in the PR).
+
+### S4: the signed principal on gateway tool calls
+
+A server **opts in per MCP server**, by an extra header on the server definition (or on an agent's override):
+`x-opentag-principal: required` (name compared case-insensitively, value exactly `required`). The marker is configuration,
+not something to send: it is removed from every outbound header set (probes included), and the signer then sets a header
+of the same name that carries the signed statement. Any other value of the marker (for example `true`) fails the call
+closed rather than being ignored, so a typo cannot silently switch the protection off. A server without the marker gets
+byte-for-byte the same request as before.
+
+For a marked server, each `tools/call` request carries four headers (`X-Opentag-Principal`, `-Key`, `-Timestamp`,
+`-Signature`): a base64url JSON statement (account, agent, execution, a fresh `call` uuid, tool, `iat`, and the
+`principal`), the key id, the timestamp, and `v1=` plus the lowercase hex HMAC-SHA256 of
+`keyId.timestamp.principalB64.sha256(exact body bytes)`. The hash is computed in the transport (`mcp-transport.ts`,
+`applyBodySignature`) over the very string passed to the fetcher, so it is the bytes on the wire; the protocol-version
+retry is a different body and is signed again with its own `call` id. Only `tools/call` is signed (not `initialize`,
+notifications, `tools/list` or probes).
+
+The `principal` is derived from the execution record and existing tables only (`derivePrincipal`): a delivery maps to the
+human who authored its message (a bot or system author is `unknown`), a scheduled session message to `scheduled` with the
+creator resolved from its recorded task source, an agent-sent session message to `agent`, a validation run to `system`,
+anything else or any failed lookup to `unknown`. It never throws.
+
+Keys: `OPENTAG_GATEWAY_PRINCIPAL_KEYS` (JSON object, key id to secret; each secret at least 32 bytes, used as its UTF-8 bytes;
+key ids are 1-64 of `A-Za-z0-9_-`) and `OPENTAG_GATEWAY_PRINCIPAL_KEY_ID` (the id to sign with). Both unset means no key: the
+Server starts and every call to a marked server fails closed with a fixed error, nothing is sent upstream, and it is never
+sent unsigned. A half-set or malformed pair stops the Server at startup. Rotate by adding the new key to both sides, switching
+`KEY_ID`, then removing the old one at the verifier.
+
+Every gateway `tools/call` writes one structured line (`MCP_GATEWAY_TOOL_CALL`): account, agent, execution, call id, server
+name, tool name, outcome, duration, principal kind and whether it was signed. Never headers, secrets, tool arguments or the
+principal's user, team or channel ids.
 
 ## Image build and publish (S1)
 

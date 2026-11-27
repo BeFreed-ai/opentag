@@ -129,6 +129,8 @@ describe("protocol negotiation", () => {
             agentId: AGENT,
             name: tool.name,
             arguments: { message: "hello" },
+            // The authorized execution record travels with the call, so a marked server's principal can be derived.
+            execution: expect.objectContaining({ accountId: ACCOUNT, agentId: AGENT, purpose: "execution" }),
           }),
         );
       } finally {

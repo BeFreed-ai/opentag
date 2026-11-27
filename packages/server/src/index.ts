@@ -65,6 +65,7 @@ import { PostgresRuntimeCustodyStore } from "./runtime/runtime-custody-store.js"
 import { RuntimeDomainOwner } from "./runtime/runtime-domain-owner.js";
 import { PostgresRuntimeDurableWorkStore } from "./runtime/runtime-durable-work-store.js";
 import { SlackAutoSetupOwner } from "./runtime/slack-auto-setup-owner.js";
+import { createGatewayPrincipalSource, parseGatewayPrincipalConfig } from "./runtime-credentials/gateway-principal.js";
 import { AgentRuntimeOptionsService } from "./services/agents/agent-runtime-options-service.js";
 import { AgentSlackProvisionService } from "./services/agents/agent-slack-provision-service.js";
 import { ContextTreeOperationService } from "./services/agents/context-tree-operation-service.js";
@@ -648,6 +649,8 @@ export async function startServer(): Promise<void> {
     const config = parseServerConfig(process.env);
     // BeFreed fork: default off; a bad value or an empty allow-list stops startup rather than guessing.
     const operatorRoutes = parseOperatorRoutesConfig(process.env);
+    // BeFreed fork (patch S4): signing keys for the gateway principal; unset means marked servers fail closed.
+    const gatewayPrincipalSigner = parseGatewayPrincipalConfig(process.env);
     knownSecrets.push(...cipherKeySecrets(config));
     const perfLogger = serverPerformanceLogger(config, () => app?.log);
     const instanceId = randomUUID();
@@ -1231,6 +1234,8 @@ export async function startServer(): Promise<void> {
       servers: mcpServers,
       authorizations: mcpAuthorization,
       upstream: new McpUpstreamCaller({ fetcher: mcpRuntimeFetcher }),
+      principals: createGatewayPrincipalSource(database, gatewayPrincipalSigner),
+      logger: serviceLogger("mcp-gateway"),
     });
     const mcpRefreshWorker = new McpRefreshWorker({
       authorization: mcpAuthorization,

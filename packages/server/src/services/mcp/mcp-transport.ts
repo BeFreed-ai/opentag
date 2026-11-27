@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   MCP_AUTH_REJECTION_SUMMARY,
   MCP_LEGACY_PROTOCOL_VERSIONS,
@@ -121,6 +121,32 @@ export interface McpCallOptions {
    */
   negotiatedVersion?: string;
   signal?: AbortSignal;
+  /**
+   * BeFreed fork (patch S4): authenticate this exact request. Called once per request actually sent,
+   * with the lowercase hex SHA-256 of the very string handed to the fetcher as the body; the returned
+   * headers replace any same-named (case-insensitive) header already present. It runs before anything
+   * is sent, so a throw means nothing went out.
+   */
+  signBody?: (bodySha256: string) => Record<string, string>;
+}
+
+/**
+ * Apply a request signature to `headers`, computed over the exact body string that will be sent.
+ * Same-named headers (any case) are removed first: two spellings of one field would be merged by the
+ * HTTP client into a single comma-joined value that no verifier could parse.
+ */
+function applyBodySignature(
+  headers: Record<string, string>,
+  body: string,
+  signBody: ((bodySha256: string) => Record<string, string>) | undefined,
+): void {
+  if (!signBody) return;
+  const signed = signBody(createHash("sha256").update(body, "utf8").digest("hex"));
+  const names = new Set(Object.keys(signed).map((name) => name.toLowerCase()));
+  for (const existing of Object.keys(headers)) {
+    if (names.has(existing.toLowerCase())) delete headers[existing];
+  }
+  Object.assign(headers, signed);
 }
 
 /**
@@ -246,6 +272,7 @@ export class McpTransport {
             },
           }),
     });
+    applyBodySignature(headers, body, options.signBody);
 
     const response = await this.#fetcher.fetchOutbound(accountId, url, {
       method: "POST",
@@ -285,10 +312,12 @@ export class McpTransport {
       ...legacyVersionHeaders(options.negotiatedVersion),
     };
     for (const [key, value] of Object.entries(options.headers ?? {})) headers[key] = value;
+    const body = JSON.stringify({ jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) });
+    applyBodySignature(headers, body, options.signBody);
     const response = await this.#fetcher.fetchOutbound(accountId, url, {
       method: "POST",
       headers,
-      body: JSON.stringify({ jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) }),
+      body,
       ...(options.signal ? { signal: options.signal } : {}),
     });
     return this.#interpret(accountId, url, method, id, response);
