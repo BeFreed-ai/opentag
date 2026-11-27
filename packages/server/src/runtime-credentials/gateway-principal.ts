@@ -122,6 +122,7 @@ async function loadDeliveryAuthor(
       authorKind: imMessages.authorKind,
       authorExternalId: imMessages.authorExternalId,
       channelId: imMessages.channelId,
+      providerContext: imMessages.providerContext,
       provider: imBindings.provider,
       teamId: imBindings.externalTeamId,
     })
@@ -138,8 +139,11 @@ async function loadDeliveryAuthor(
     team: row.teamId ?? null,
     user: row.authorExternalId,
     channel: row.channelId,
-    // Filled from the triggering message's provider context once that records it.
-    sharedChannel: null,
+    // true / false only when Slack's envelope said so; `null` (not known) for Feishu and older messages.
+    sharedChannel:
+      row.providerContext?.provider === "slack" && typeof row.providerContext.isExtSharedChannel === "boolean"
+        ? row.providerContext.isExtSharedChannel
+        : null,
   };
 }
 

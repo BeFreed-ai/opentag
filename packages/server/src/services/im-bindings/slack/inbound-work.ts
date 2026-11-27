@@ -6,6 +6,8 @@ export interface SlackEventEnvelope {
   team_id?: string;
   event_id?: string;
   event_time?: number;
+  /** Set by Slack on events from externally shared (Slack Connect) channels; BeFreed fork, patch S5. */
+  is_ext_shared_channel?: boolean;
   challenge?: string;
   authorizations?: Array<{ team_id?: string; user_id?: string; is_bot?: boolean }>;
   event?: { type?: string; tokens?: { oauth?: string[]; bot?: string[] } } & Record<string, unknown>;
@@ -50,6 +52,9 @@ export function createSlackInboundWork(
     ...(typeof envelope.event_time === "number" && Number.isFinite(envelope.event_time)
       ? { eventTime: envelope.event_time }
       : {}),
+    ...(typeof envelope.is_ext_shared_channel === "boolean"
+      ? { isExtSharedChannel: envelope.is_ext_shared_channel }
+      : {}),
     identityClosed: hasSlackBotAuthorization(installation, envelope),
     revokesBot:
       envelope.event?.type === "tokens_revoked" &&
@@ -67,6 +72,7 @@ export function recoveredSlackEnvelope(work: SlackInboundWork): SlackEventEnvelo
     team_id: work.teamId,
     event_id: work.eventId,
     ...(work.eventTime === undefined ? {} : { event_time: work.eventTime }),
+    ...(work.isExtSharedChannel === undefined ? {} : { is_ext_shared_channel: work.isExtSharedChannel }),
     authorizations: work.identityClosed ? [{ is_bot: true, team_id: work.teamId, user_id: work.botUserId }] : [],
     event: work.revokesBot
       ? { type: "tokens_revoked", tokens: { bot: [work.botUserId] } }

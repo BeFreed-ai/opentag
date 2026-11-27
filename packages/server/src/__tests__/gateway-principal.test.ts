@@ -147,6 +147,31 @@ describe("derivePrincipal", () => {
     });
   });
 
+  it.each([
+    ["true", { provider: "slack", isExtSharedChannel: true }, true],
+    ["false", { provider: "slack", isExtSharedChannel: false }, false],
+    ["absent", { provider: "slack" }, null],
+  ])("shared_channel reflects the message's recorded flag (%s)", async (_label, providerContext, expected) => {
+    const ws = await seedWorkspace();
+    const { deliveryId } = await seedDelivery(ws, { providerContext });
+    const principal = await derivePrincipal(db.database, {
+      sessionId: ws.sessionId,
+      source: deliverySource(deliveryId),
+    });
+    expect(principal.kind).toBe("human");
+    expect(principal.shared_channel).toBe(expected);
+  });
+
+  it("shared_channel is null for Feishu, whatever the context holds", async () => {
+    const ws = await seedWorkspace("feishu");
+    const { deliveryId } = await seedDelivery(ws, { providerContext: { provider: "feishu", chatType: "group" } });
+    const principal = await derivePrincipal(db.database, {
+      sessionId: ws.sessionId,
+      source: deliverySource(deliveryId),
+    });
+    expect(principal).toMatchObject({ kind: "human", provider: "feishu", team: null, shared_channel: null });
+  });
+
   it("does not treat a bot-authored message as a human", async () => {
     const ws = await seedWorkspace();
     const { deliveryId } = await seedDelivery(ws, { authorKind: "bot", author: "B-OTHER" });

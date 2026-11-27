@@ -22,6 +22,7 @@ Every patch is small, default-off or diagnostics-only. Up to `0.1.5-befreed.4` n
 | S2 | Server | new `packages/server/src/services/schedules/operator-service.ts`, `packages/server/src/api/operator-schedules.ts`, `packages/server/src/operator-routes-config.ts`; wiring in `packages/server/src/app.ts` (+8 lines) and `packages/server/src/index.ts` (+9 lines) | Operator-only account route to create a schedule for an agent, with no inbound IM message (cron, one-time `at`, or "run in N seconds") | **off** |
 | S3 | Server tests | `packages/server/src/__tests__/operator-schedule-api.test.ts`, `operator-routes-config.test.ts`, `__tests__/integration/operator-schedules.test.ts` | Tests for S2 | n/a |
 | S4 | Server | new `packages/server/src/runtime-credentials/gateway-principal.ts`; small hooks in `services/mcp/mcp-gateway-service.ts`, `mcp-gateway-upstream.ts`, `mcp-transport.ts`, `mcp-auth-headers.ts`, `api/mcp-gateway.ts` and `index.ts` (+5 lines) (+ tests) | Sign *who triggered the execution* (human / schedule / agent / system) on gateway `tools/call` requests to an MCP server that is marked as requiring it, so that server can verify the caller instead of trusting the network. Also one structured log line per gateway tool call | **off** (only a server whose extra headers contain `x-opentag-principal: required`) |
+| S5 | Shared + server | `packages/shared/src/im-message.ts` (one optional field), `services/im-bindings/slack/adapter.ts`, `inbound-work.ts`, `services/im/inbound-work.ts`, `api/slack-events.ts`, `runtime/runtime-provider-message-ref.ts` (+ tests) | Record Slack's envelope `is_ext_shared_channel` as `providerContext.isExtSharedChannel` on inbound messages (jsonb column, no migration), so the signed principal of S4 can say whether the triggering message came from an externally shared channel | on (data only; absent when Slack did not send it) |
 
 S2 reuses upstream code for every rule: `ScheduleService.createForAgent` validates the cron grammar, timezone,
 future occurrence, prompt size (16 KiB), and writes the row, the revision and the audit event;
@@ -93,6 +94,13 @@ sent unsigned. A half-set or malformed pair stops the Server at startup. Rotate 
 Every gateway `tools/call` writes one structured line (`MCP_GATEWAY_TOOL_CALL`): account, agent, execution, call id, server
 name, tool name, outcome, duration, principal kind and whether it was signed. Never headers, secrets, tool arguments or the
 principal's user, team or channel ids.
+
+S5 adds one optional boolean to the Slack variant of the inbound provider context. It is set only when the Events API
+envelope carries `is_ext_shared_channel` (true or false); absent means "not known", never "false", and the principal
+then reports `shared_channel: null`. Older stored messages and older durable inbound work (without the field) still
+parse; work written by this version is not readable by an older server image (its inbound-work schema is strict), which
+only matters for the seconds an event spends in the durable queue across a rollback. The field is stripped before the
+provider message ref is built, because the runtime ref schema is strict.
 
 ## Image build and publish (S1)
 

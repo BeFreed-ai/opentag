@@ -21,6 +21,7 @@
 | S2 | 服务器 | 新增 `packages/server/src/services/schedules/operator-service.ts`、`packages/server/src/api/operator-schedules.ts`、`packages/server/src/operator-routes-config.ts`；接线在 `packages/server/src/app.ts`（+8 行）和 `packages/server/src/index.ts`（+9 行） | 运营专用的账号级路由：为 agent 创建定时任务，无需入站 IM 消息（cron、一次性 `at`、或"N 秒后运行"） | **关** |
 | S3 | 服务器测试 | `packages/server/src/__tests__/operator-schedule-api.test.ts`、`operator-routes-config.test.ts`、`__tests__/integration/operator-schedules.test.ts` | S2 的测试 | 不适用 |
 | S4 | 服务器 | 新增 `packages/server/src/runtime-credentials/gateway-principal.ts`；在 `services/mcp/mcp-gateway-service.ts`、`mcp-gateway-upstream.ts`、`mcp-transport.ts`、`mcp-auth-headers.ts`、`api/mcp-gateway.ts` 和 `index.ts`（+5 行）里加少量接线（含测试） | 对标记为"需要主体"的 MCP 服务器，在网关发出的 `tools/call` 请求上签名"是谁触发了这次执行"（真人 / 定时任务 / agent / 系统），让对方服务器能验证调用方，而不是信任网络。同时为每次网关工具调用写一行结构化日志 | **关**（只有额外请求头含 `x-opentag-principal: required` 的服务器才生效） |
+| S5 | 共享包 + 服务器 | `packages/shared/src/im-message.ts`（一个可选字段）、`services/im-bindings/slack/adapter.ts`、`inbound-work.ts`、`services/im/inbound-work.ts`、`api/slack-events.ts`、`runtime/runtime-provider-message-ref.ts`（含测试） | 把 Slack 信封里的 `is_ext_shared_channel` 记为入站消息的 `providerContext.isExtSharedChannel`（jsonb 列，无迁移），让 S4 的签名主体能说明触发消息是否来自外部共享频道 | 开（只是数据；Slack 没发时该字段不存在） |
 
 S2 复用上游代码处理所有规则：`ScheduleService.createForAgent` 校验 cron 语法、时区、未来触发时间、提示词大小（16 KiB）并写入记录、版本号和审计事件；`SessionService.ensureChatSession` 查找或创建目标会话，并要求 agent 处于活跃状态且已绑定机器。S2 只是在调用方通过鉴权、运营白名单和归属检查之后，构造上游通常从 agent 的会话证明里推导出的"范围"。它从不读取或伪造会话证明。
 
@@ -47,6 +48,8 @@ S2 复用上游代码处理所有规则：`ScheduleService.createForAgent` 校�
 密钥：`OPENTAG_GATEWAY_PRINCIPAL_KEYS`（JSON 对象，密钥 id 对应密钥；每个密钥至少 32 字节，按其 UTF-8 字节使用；密钥 id 为 1-64 个 `A-Za-z0-9_-` 字符）和 `OPENTAG_GATEWAY_PRINCIPAL_KEY_ID`（用哪个 id 签名）。两个都不设表示没有密钥：服务器照常启动，对标记服务器的每次调用都以固定错误失败（失败即关闭），不会向上游发任何东西，也绝不会不签名发送。只设了一半或格式错误会让服务器在启动时停止。轮换方式：两边都加上新密钥，切换 `KEY_ID`，再在验证方删除旧密钥。
 
 每次网关 `tools/call` 写一行结构化日志（`MCP_GATEWAY_TOOL_CALL`）：account、agent、execution、call id、服务器名、工具名、结果、耗时、主体类型、是否已签名。绝不含请求头、密钥、工具参数，也不含主体的用户、团队或频道 id。
+
+S5 给入站 provider 上下文的 Slack 变体增加一个可选布尔值。只有 Events API 信封带了 `is_ext_shared_channel`（true 或 false）才会设置；不存在表示"不知道"，绝不等于"false"，此时主体报告 `shared_channel: null`。没有该字段的旧消息和旧的持久入站任务仍能解析；本版本写入的任务旧版服务器镜像读不了（它的入站任务 schema 是严格的），这只在回滚期间、事件停留在持久队列的那几秒里有影响。该字段在构造 provider 消息引用之前会被去掉，因为运行时引用的 schema 是严格的。
 
 ## 镜像构建与发布（S1）
 

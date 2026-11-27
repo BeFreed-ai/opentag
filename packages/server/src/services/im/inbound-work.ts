@@ -16,6 +16,8 @@ const SlackInboundWorkSchema = z
     botId: z.string().min(1).max(255),
     eventId: z.string().min(1).max(255),
     eventTime: z.number().finite().optional(),
+    /** Optional so work stored before this field existed still parses (BeFreed fork, patch S5). */
+    isExtSharedChannel: z.boolean().optional(),
     identityClosed: z.boolean(),
     revokesBot: z.boolean(),
     event: z.unknown().transform((value) => slackWorkEvent(value)),

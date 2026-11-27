@@ -59,6 +59,8 @@ export interface VerifiedSlackEnvelope {
   botId: string;
   event: unknown;
   eventTime?: number;
+  /** The envelope's `is_ext_shared_channel`, when it carried one (BeFreed fork, patch S5). */
+  isExtSharedChannel?: boolean;
 }
 
 export interface SlackOAuthAccessResult {
@@ -114,6 +116,20 @@ function boundedText(value: string): { text: string; truncated: boolean } {
   return { text, truncated: text !== value };
 }
 
+/** The stored per-message Slack context; `isExtSharedChannel` only when the envelope carried it (patch S5). */
+function slackProviderContext(
+  channelType: string | undefined,
+  threadTs: string | undefined,
+  isExtSharedChannel: boolean | undefined,
+) {
+  return {
+    provider: "slack" as const,
+    ...(channelType ? { channelType } : {}),
+    ...(threadTs ? { threadTs } : {}),
+    ...(typeof isExtSharedChannel === "boolean" ? { isExtSharedChannel } : {}),
+  };
+}
+
 type SlackNormalizationRejection = "malformed_supported_event" | "unsupported_event_type" | "unsupported_subtype";
 type OnSlackNormalizationRejected = (reason: SlackNormalizationRejection) => void;
 
@@ -164,11 +180,7 @@ export function normalizeSlackEnvelope(
       providerEventId: envelope.eventId,
       externalAppId: envelope.appId,
       externalTeamId: envelope.teamId,
-      providerContext: {
-        provider: "slack",
-        ...(event.channel_type ? { channelType: event.channel_type } : {}),
-        ...(canonical.thread_ts ? { threadTs: canonical.thread_ts } : {}),
-      },
+      providerContext: slackProviderContext(event.channel_type, canonical.thread_ts, envelope.isExtSharedChannel),
       conversation: { externalId: event.channel, kind: conversationKind(event.channel_type) },
       message: {
         externalId: messageId,

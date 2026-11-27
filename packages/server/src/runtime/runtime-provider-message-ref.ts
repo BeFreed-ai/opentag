@@ -29,7 +29,8 @@ export function runtimeProviderMessageRef(
     };
   }
   if (!binding.externalTeamId) throw new Error("IM_BINDING_IDENTITY_INCOMPLETE");
-  const { provider: _provider, ...context } = message.providerContext;
+  // `isExtSharedChannel` is Server-side context for the gateway principal; the runtime ref schema is strict.
+  const { provider: _provider, isExtSharedChannel: _isExtSharedChannel, ...context } = message.providerContext;
   const authorUserId = slackHumanAuthorUserId(message, binding);
   return {
     provider: "slack",
